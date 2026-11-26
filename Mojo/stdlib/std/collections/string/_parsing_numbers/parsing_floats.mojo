@@ -27,6 +27,7 @@ from std.collections import Array
 import std.bit
 import std.memory
 from std.sys import Endian
+from std.utils.numerics import FPUtils
 
 
 from std.builtin.globals import global_constant
@@ -705,6 +706,16 @@ struct _BigUInt(Movable):
         if factor != 1:
             self.multiply_add(factor, 0)
 
+    def divide_small(mut self, divisor: UInt32) -> UInt32:
+        var remainder: UInt64 = 0
+        for i in range(self._length - 1, -1, -1):
+            var dividend = (remainder << 32) | UInt64(self._limbs[i])
+            self._limbs[i] = UInt32(dividend // UInt64(divisor))
+            remainder = dividend % UInt64(divisor)
+        while self._length > 0 and self._limbs[self._length - 1] == 0:
+            self._length -= 1
+        return UInt32(remainder)
+
     def shift_left(mut self, bits: Int):
         var limb_shift = bits // 32
         var bit_shift = bits % 32
@@ -792,6 +803,209 @@ def _round_exactly(
     if order < 0:
         return low
     return low if (m & 1) == 0 else high
+
+
+@inline(.always)
+def _round_ratio_to_even(numerator: UInt128, denominator: UInt128) -> UInt128:
+    var quotient = numerator // denominator
+    var remainder = numerator % denominator
+    var complement = denominator - remainder
+    if remainder > complement or (
+        remainder == complement and quotient % 2 != 0
+    ):
+        quotient += 1
+    return quotient
+
+
+def _try_round_float64_small_ndigits(
+    significand: UInt64,
+    binary_exponent: Int,
+    sign: Bool,
+    ndigits: Int,
+) -> Tuple[Bool, Float64]:
+    if ndigits < -18 or ndigits > 18:
+        return (False, 0)
+
+    var power5: UInt128 = 1
+    for _ in range(abs(ndigits)):
+        power5 *= 5
+
+    var rounded_integer: UInt128
+    var decimal_exponent: Int
+    if ndigits >= 0:
+        var numerator = UInt128(significand) * power5
+        var shift = -(binary_exponent + ndigits)
+        if shift <= 0:
+            return (False, 0)
+        if shift >= 97:
+            rounded_integer = 0
+        else:
+            var quotient = numerator >> UInt128(shift)
+            var remainder = numerator - (quotient << UInt128(shift))
+            var halfway = UInt128(1) << UInt128(shift - 1)
+            if remainder > halfway or (
+                remainder == halfway and quotient % 2 != 0
+            ):
+                quotient += 1
+            rounded_integer = quotient
+        decimal_exponent = -ndigits
+    else:
+        var decimal_places = -ndigits
+        var numerator = UInt128(significand)
+        var denominator = power5
+        if binary_exponent >= decimal_places:
+            numerator <<= UInt128(binary_exponent - decimal_places)
+        else:
+            var shift = decimal_places - binary_exponent
+            if shift >= 64:
+                var zero: Float64 = 0
+                return (True, -zero if sign else zero)
+            denominator <<= UInt128(shift)
+        rounded_integer = _round_ratio_to_even(numerator, denominator)
+        decimal_exponent = decimal_places
+
+    if rounded_integer == 0:
+        var zero: Float64 = 0
+        return (True, -zero if sign else zero)
+
+    while rounded_integer % 10 == 0:
+        rounded_integer //= 10
+        decimal_exponent += 1
+
+    if rounded_integer > (UInt128(1) << UInt128(63)):
+        return (False, 0)
+
+    var rounded: Float64
+    if (
+        rounded_integer <= (UInt128(1) << UInt128(53))
+        and abs(decimal_exponent) <= 22
+    ):
+        var mantissa = Float64(UInt64(rounded_integer))
+        var power10 = global_constant[POWERS_OF_10]()[abs(decimal_exponent)]
+        if decimal_exponent >= 0:
+            rounded = mantissa * power10
+        else:
+            rounded = mantissa / power10
+    else:
+        rounded = short_decimal_to_float64(
+            UInt64(rounded_integer), decimal_exponent
+        )
+    return (True, -rounded if sign else rounded)
+
+
+def _round_float64_to_ndigits(value: Float64, ndigits: Int) -> Float64:
+    """Rounds a finite float to decimal digits using its exact binary value."""
+    comptime mantissa_width = FPUtils[.float64].mantissa_width()
+    comptime exponent_bias = FPUtils[.float64].exponent_bias()
+    comptime exponent_field_max = (
+        1 << FPUtils[.float64].exponent_width()
+    ) - 1
+    var sign = FPUtils[.float64].get_sign(value)
+    var exponent_field = FPUtils[.float64].get_exponent_biased(value)
+    if exponent_field == exponent_field_max:
+        return value
+
+    var significand = UInt64(FPUtils[.float64].get_mantissa(value))
+    var binary_exponent: Int
+    if exponent_field == 0:
+        if significand == 0:
+            return value
+        binary_exponent = 1 - exponent_bias - mantissa_width
+    else:
+        significand |= UInt64(1) << UInt64(mantissa_width)
+        binary_exponent = exponent_field - exponent_bias - mantissa_width
+
+    if ndigits > 323:
+        return value
+    # When e + ndigits is nonnegative, value * 10**ndigits is integral.
+    if ndigits >= 0 and binary_exponent + ndigits >= 0:
+        return value
+    if ndigits < -308:
+        var zero: Float64 = 0
+        return -zero if sign else zero
+    # These conservative bounds keep the decimal rounding error below half an
+    # ulp, so converting the result back to Float64 returns the input.
+    if ndigits > 0 and 3 * ndigits > 1 - binary_exponent:
+        return value
+    if ndigits < 0 and 4 * -ndigits < binary_exponent - 1:
+        return value
+
+    var fast_result = _try_round_float64_small_ndigits(
+        significand, binary_exponent, sign, ndigits
+    )
+    if fast_result[0]:
+        return fast_result[1]
+
+    # Convert the binary rational to an exact decimal coefficient before
+    # discarding digits, so halfway decisions use the exact value.
+    var coefficient = _BigUInt(significand)
+    var decimal_scale = 0
+    if binary_exponent >= 0:
+        coefficient.shift_left(binary_exponent)
+    else:
+        decimal_scale = -binary_exponent
+        for _ in range(decimal_scale):
+            coefficient.multiply_add(5, 0)
+
+    var reversed_digits = Array[Byte, _MAX_EXACT_DIGITS](fill=0)
+    var digit_count = 0
+    while not coefficient.is_zero():
+        reversed_digits[digit_count] = Byte(
+            Int(coefficient.divide_small(10))
+        )
+        digit_count += 1
+
+    var digits_to_drop = decimal_scale - ndigits
+    if digits_to_drop <= 0:
+        return value
+
+    var first_discarded: Byte = 0
+    var discarded_tail_nonzero = False
+    if digits_to_drop <= digit_count:
+        first_discarded = reversed_digits[digits_to_drop - 1]
+        for i in range(digits_to_drop - 1):
+            discarded_tail_nonzero = (
+                discarded_tail_nonzero or reversed_digits[i] != 0
+            )
+
+    var retained_count = max(digit_count - digits_to_drop, 0)
+    var retained_is_odd = False
+    if retained_count > 0:
+        retained_is_odd = reversed_digits[digits_to_drop] % 2 != 0
+    var round_up = first_discarded > 5 or (
+        first_discarded == 5 and (discarded_tail_nonzero or retained_is_odd)
+    )
+
+    var rounded_reversed = Array[Byte, _MAX_EXACT_DIGITS](fill=0)
+    for i in range(retained_count):
+        rounded_reversed[i] = reversed_digits[digits_to_drop + i]
+    if round_up:
+        var i = 0
+        while i < retained_count and rounded_reversed[i] == 9:
+            rounded_reversed[i] = 0
+            i += 1
+        if i == retained_count:
+            rounded_reversed[retained_count] = 1
+            retained_count += 1
+        else:
+            rounded_reversed[i] += 1
+
+    if retained_count == 0:
+        rounded_reversed[0] = 0
+        retained_count = 1
+
+    var decimal_digits = Array[Byte, _MAX_EXACT_DIGITS](fill=0)
+    comptime ord_0 = Byte(ord("0"))
+    var parts = DecimalParts()
+    for i in range(retained_count):
+        var digit = rounded_reversed[retained_count - i - 1]
+        decimal_digits[i] = ord_0 + digit
+        parts.push_digit(digit, False)
+
+    var rounded = decimal_to_float64(
+        parts, -ndigits, decimal_digits[0:retained_count]
+    )
+    return -rounded if sign else rounded
 
 
 comptime _ascii_lower: Byte = Byte(ord("A") ^ ord("a"))

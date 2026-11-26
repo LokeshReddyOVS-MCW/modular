@@ -768,6 +768,31 @@ def test_round() raises:
     comptime F = SIMD[.float32, 4]
     assert_equal(F.__round__(F(1.5, 2.5, -2.5, -3.5)), F(2.0, 2.0, -2.0, -4.0))
 
+    assert_equal(Float64(97468.3).__round__(-5), Float64(100000.0))
+    assert_equal(Float64(87677.75).__round__(15), Float64(87677.75))
+    assert_equal(Float64(6864.9).__round__(20), Float64(6864.9))
+    assert_equal(Float64(1e300).__round__(10), Float64(1e300))
+    assert_equal(Float64(1.5).__round__(400), Float64(1.5))
+    assert_equal(Float64(8386.55).__round__(1), Float64(8386.5))
+    assert_equal(Float64(1.25).__round__(1), Float64(1.2))
+    assert_equal(Float64(-2.5).__round__(0), Float64(-2.0))
+    assert_equal(Float32(1.25).__round__(1), Float32(1.2))
+    assert_equal(Float64(250).__round__(-2), Float64(200))
+    assert_equal(Float64(350).__round__(-2), Float64(400))
+    assert_equal(Float64(5e-324).__round__(323), Float64(0))
+
+    comptime F32 = SIMD[.float32, 4]
+    assert_equal(
+        F32(1.25, -1.25, 8386.55, -8386.55).__round__(1),
+        F32(1.2, -1.2, 8386.5, -8386.5),
+    )
+
+    comptime F64 = SIMD[.float64, 4]
+    assert_equal(
+        F64(97468.3, 8386.55, 1e300, -87677.75).__round__(-5),
+        F64(100000.0, 0.0, 1e300, -100000.0),
+    )
+
     assert_equal(Int32.__round__(1342, 0), 1342)
     assert_equal(Int32.__round__(1342, -1), 1340)
     assert_equal(Int32.__round__(1342, -2), 1300)

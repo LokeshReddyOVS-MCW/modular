@@ -48,6 +48,9 @@ from std.collections.string.string import (
     _calc_initial_buffer_size_int64,
     _calc_initial_buffer_size,
 )
+from std.collections.string._parsing_numbers.parsing_floats import (
+    _round_float64_to_ndigits,
+)
 from std.hash.hasher import Hasher
 from std.math import Ceilable, CeilDivable, Floorable, Truncable
 from std.math.math import trunc
@@ -2308,8 +2311,15 @@ struct SIMD[dtype: DType, length: SIMDLength](
                 return self
             return self - (self % Self(10) ** -(ndigits))
 
-        var exp = Self(10) ** ndigits
-        return (self * exp).__round__() / exp
+        if ndigits == 0:
+            return self.__round__()
+
+        var result = Self()
+        comptime for i in range(Self.length):
+            result[i] = _round_float64_to_ndigits(
+                self[i].cast[DType.float64](), ndigits
+            ).cast[Self.dtype]()
+        return result
 
     @stable(since="1.3")
     def __hash__[H: Hasher](self, mut hasher: H):
