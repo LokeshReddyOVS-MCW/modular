@@ -169,15 +169,6 @@ struct RowBoundsPtr(RowBound):
     ):
         encoder.encode_fields[Self](self, target)
 
-    @staticmethod
-    def get_type_name() -> String:
-        """Returns the type name for runtime diagnostics.
-
-        Returns:
-            Always `"RowBoundsPtr"`.
-        """
-        return "RowBoundsPtr"
-
 
 # ===----------------------------------------------------------------------=== #
 # Compile-time constants
@@ -2035,7 +2026,7 @@ def _histsel_topk_impl[
                                 ph, rc, slo, shi, clo, chi, t_phi
                             ):
                                 _ = Atomic[UInt32, scope=BLOCK_SCOPE].fetch_add[
-                                    ordering=Ordering.RELAXED
+                                    ordering=.relaxed
                                 ](
                                     hist.unsafe_offset(
                                         _hsel_digit[half, w_out, nbins](ph, rc)
@@ -2082,9 +2073,7 @@ def _histsel_topk_impl[
                                         var slot = Int(
                                             Atomic[
                                                 UInt32, scope=BLOCK_SCOPE
-                                            ].fetch_add[
-                                                ordering=Ordering.RELAXED
-                                            ](
+                                            ].fetch_add[ordering=.relaxed](
                                                 wcur_p, UInt32(1)
                                             )
                                         )
@@ -2097,9 +2086,7 @@ def _histsel_topk_impl[
                                         if ph[j] <= shi:
                                             _ = Atomic[
                                                 UInt32, scope=BLOCK_SCOPE
-                                            ].fetch_add[
-                                                ordering=Ordering.RELAXED
-                                            ](
+                                            ].fetch_add[ordering=.relaxed](
                                                 hist.unsafe_offset(
                                                     _hsel_digit[
                                                         half, w_out, nbins
@@ -2115,7 +2102,7 @@ def _histsel_topk_impl[
                                     ):
                                         _ = Atomic[
                                             UInt32, scope=BLOCK_SCOPE
-                                        ].fetch_add[ordering=Ordering.RELAXED](
+                                        ].fetch_add[ordering=.relaxed](
                                             hist.unsafe_offset(
                                                 _hsel_digit[half, w_out, nbins](
                                                     ph[j], rc
@@ -2196,7 +2183,7 @@ def _histsel_topk_impl[
                         wn = Int(wcur[Int(warp_id())])
                         if wn > _HSEL_WARP_CAP:
                             _ = Atomic[UInt32, scope=BLOCK_SCOPE].fetch_add[
-                                ordering=Ordering.RELAXED
+                                ordering=.relaxed
                             ](ctl.unsafe_offset(4), UInt32(1))
                     # The next round's zeroing must not race the reads above.
                     barrier()
@@ -2244,7 +2231,7 @@ def _histsel_topk_impl[
             if _hsel_selected(ph, rc, t_phi, t_rcol):
                 var pos = Int(
                     Atomic[UInt32, scope=BLOCK_SCOPE].fetch_add[
-                        ordering=Ordering.RELAXED
+                        ordering=.relaxed
                     ](ctl.unsafe_offset(3), UInt32(1))
                 )
                 if pos < sel_cap:
@@ -2275,7 +2262,7 @@ def _histsel_topk_impl[
                     # buffer.
                     var pos = Int(
                         Atomic[UInt32, scope=BLOCK_SCOPE].fetch_add[
-                            ordering=Ordering.RELAXED
+                            ordering=.relaxed
                         ](ctl.unsafe_offset(3), UInt32(1))
                     )
                     if pos < sel_cap:
@@ -2695,9 +2682,9 @@ def _hsel_rank_write[
 
     comptime for i in range(items):
         if p0 + i < M:
-            _ = Atomic[UInt32, scope=BLOCK_SCOPE].fetch_add[
-                ordering=Ordering.RELAXED
-            ](hist.unsafe_offset(Int(dig[i])), UInt32(1))
+            _ = Atomic[UInt32, scope=BLOCK_SCOPE].fetch_add[ordering=.relaxed](
+                hist.unsafe_offset(Int(dig[i])), UInt32(1)
+            )
     barrier()
 
     comptime if enable_trace:
@@ -2740,9 +2727,9 @@ def _hsel_rank_write[
     comptime for i in range(items):
         if p0 + i < M:
             var p = Int(
-                Atomic[UInt32, scope=BLOCK_SCOPE].fetch_add[
-                    ordering=Ordering.RELAXED
-                ](cur.unsafe_offset(Int(dig[i])), UInt32(1))
+                Atomic[UInt32, scope=BLOCK_SCOPE].fetch_add[ordering=.relaxed](
+                    cur.unsafe_offset(Int(dig[i])), UInt32(1)
+                )
             )
             sel_k[p] = mine[i]
     barrier()
@@ -3232,7 +3219,7 @@ def _histsel_resident_impl[
                     )
                 if live:
                     _ = Atomic[UInt32, scope=BLOCK_SCOPE].fetch_add[
-                        ordering=Ordering.RELAXED
+                        ordering=.relaxed
                     ](hist.unsafe_offset(Int(d)), UInt32(1))
             barrier()
             comptime if enable_trace:
@@ -3318,7 +3305,7 @@ def _histsel_resident_impl[
                         qmax = p if p > qmax else qmax
                         qmin = p if p < qmin else qmin
                         _ = Atomic[UInt32, scope=BLOCK_SCOPE].fetch_add[
-                            ordering=Ordering.RELAXED
+                            ordering=.relaxed
                         ](
                             hist.unsafe_offset(Int((p - nlo) >> UInt32(s))),
                             UInt32(1),
@@ -3326,12 +3313,12 @@ def _histsel_resident_impl[
                 var vmax = warp.max(qmax)
                 var vmin = warp.min(qmin)
                 if lane == 0:
-                    Atomic[UInt32, scope=BLOCK_SCOPE].max[
-                        ordering=Ordering.RELAXED
-                    ](ctl.unsafe_offset(6), vmax)
-                    Atomic[UInt32, scope=BLOCK_SCOPE].min[
-                        ordering=Ordering.RELAXED
-                    ](ctl.unsafe_offset(7), vmin)
+                    Atomic[UInt32, scope=BLOCK_SCOPE].max[ordering=.relaxed](
+                        ctl.unsafe_offset(6), vmax
+                    )
+                    Atomic[UInt32, scope=BLOCK_SCOPE].min[ordering=.relaxed](
+                        ctl.unsafe_offset(7), vmin
+                    )
                 barrier()
 
                 # A bracket holding one distinct key is answered: that key is
@@ -3475,7 +3462,7 @@ def _histsel_resident_impl[
                                     if pw < pmin:
                                         pmin = pw
                                 _ = Atomic[UInt32, scope=BLOCK_SCOPE].fetch_add[
-                                    ordering=Ordering.RELAXED
+                                    ordering=.relaxed
                                 ](
                                     hist.unsafe_offset(
                                         _hsel_digit[half, w_out, nbins](p, rc)
@@ -3489,10 +3476,10 @@ def _histsel_resident_impl[
                         var wmin = warp.min(pmin)
                         if lane_id() == 0:
                             Atomic[UInt32, scope=BLOCK_SCOPE].max[
-                                ordering=Ordering.RELAXED
+                                ordering=.relaxed
                             ](ctl.unsafe_offset(6), wmax)
                             Atomic[UInt32, scope=BLOCK_SCOPE].min[
-                                ordering=Ordering.RELAXED
+                                ordering=.relaxed
                             ](ctl.unsafe_offset(7), wmin)
                     barrier()
 
@@ -3720,7 +3707,7 @@ def _histsel_resident_impl[
                 var wb = UInt32(0)
                 if lane_id() == WARP_SIZE - 1:
                     wb = Atomic[UInt32, scope=BLOCK_SCOPE].fetch_add[
-                        ordering=Ordering.RELAXED
+                        ordering=.relaxed
                     ](ctl.unsafe_offset(3), pre + gc)
                 var gp = Int(warp.shuffle_idx(wb, UInt32(WARP_SIZE - 1)) + pre)
                 comptime for j in range(_PTOPK_ITEMS):
@@ -3746,7 +3733,7 @@ def _histsel_resident_impl[
             var ewb = UInt32(0)
             if lane_id() == WARP_SIZE - 1:
                 ewb = Atomic[UInt32, scope=BLOCK_SCOPE].fetch_add[
-                    ordering=Ordering.RELAXED
+                    ordering=.relaxed
                 ](ctl.unsafe_offset(3), epre + ec_all)
             var ep = Int(warp.shuffle_idx(ewb, UInt32(WARP_SIZE - 1)) + epre)
             comptime for v in range(res_vecs):
@@ -3888,7 +3875,7 @@ def _histsel_resident_impl[
             if take:
                 var pos = Int(
                     Atomic[UInt32, scope=BLOCK_SCOPE].fetch_add[
-                        ordering=Ordering.RELAXED
+                        ordering=.relaxed
                     ](ctl.unsafe_offset(3), UInt32(1))
                 )
                 if pos < sel_cap:
@@ -5181,6 +5168,7 @@ def persistent_topk_block_split[
         # wider the payload the more that is true, which is why the width below is
         # chosen by `N` rather than fixed at the widest that fits.
         @inline(.always)
+        @__allow_legacy_any_origin_fields
         def launch_resident[res_vecs: Int]() raises {imm}:
             comptime if not ordered:
                 # With no rank to feed there is no reason to hand over a superset

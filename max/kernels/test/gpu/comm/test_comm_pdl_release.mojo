@@ -170,11 +170,12 @@ def _flag_diff(
     var stride = grid_dim.x * block_dim.x
     for i in range(tid, Int(n), stride):
         if bitcast[DType.uint16](a[i]) != bitcast[DType.uint16](b[i]):
-            Atomic[Scalar[DType.uint32]].store[ordering=Ordering.RELAXED](
+            Atomic[Scalar[DType.uint32]].store[ordering=.relaxed](
                 flag, UInt32(1)
             )
 
 
+@__allow_legacy_any_origin_fields
 def _launch_collective[
     kind: Int, ngpus: Int, pdl_level: PDLLevel
 ](

@@ -140,13 +140,91 @@ modular_py_test(
     name = "model_config_tests_cpu",
     srcs = ["test_model_config.py"],
     deps = [
+        "//max/python/max:tensor",
         "//max/python/max/driver",
         "//max/python/max/dtype",
         "//max/python/max/graph",
+        "//max/python/max/nn:core",
         "//max/python/max/nn/kv_cache",
         "//max/python/max/pipelines/architectures/kimi_k3_modulev3",
         "//max/python/max/pipelines/lib",
         "//max/python/max/pipelines/speculative",
+    ],
+)
+
+# Compiles the preprocessing graph on CPU: its alpha lookup tables can each
+# be right while their composition diverges from host processing.
+modular_py_test(
+    name = "preprocess_graph_tests_cpu",
+    srcs = ["test_preprocess_graph.py"],
+    deps = [
+        requirement("numpy"),
+        requirement("pillow"),
+        "//max/python/max:tensor",
+        "//max/python/max/driver",
+        "//max/python/max/dtype",
+        "//max/python/max/engine",
+        "//max/python/max/nn/legacy",
+        "//max/python/max/pipelines/architectures/kimi_k3_modulev3",
+        "//max/python/max/pipelines/lib",
+        "//max/tests/integration/test_common:vision_preprocess_parity",
+    ],
+)
+
+# hf_config_shims.py is shared by many models, so this catches a shim edit
+# that changes how a text-only K3 config reads its vision section.
+modular_py_test(
+    name = "vision_config_tests_cpu",
+    srcs = ["test_vision_config.py"],
+    deps = [
+        "//max/python/max/driver",
+        "//max/python/max/dtype",
+        "//max/python/max/graph",
+        "//max/python/max/pipelines/architectures",
+        "//max/python/max/pipelines/architectures/kimi_k3_modulev3",
+    ],
+)
+
+modular_py_test(
+    name = "resolution_tests_cpu",
+    srcs = ["test_resolution.py"],
+    deps = [
+        "//max/python/max/pipelines/architectures",
+        "//max/python/max/pipelines/architectures/kimi_k3_modulev3",
+        "//max/python/max/pipelines/lib",
+    ],
+)
+
+modular_py_test(
+    name = "vision_batching_tests_cpu",
+    srcs = ["test_vision_batching.py"],
+    tags = ["manual"],
+    deps = [
+        requirement("numpy"),
+        "//max/python/max/pipelines/architectures/kimi_k3_modulev3",
+        "//max/python/max/pipelines/context",
+    ],
+)
+
+modular_py_test(
+    name = "vision_processor_tests_cpu",
+    srcs = ["test_vision_processor.py"],
+    deps = [
+        requirement("numpy"),
+        requirement("pillow"),
+        "//max/python/max/pipelines/architectures/kimi_k3_modulev3",
+        "//max/python/max/pipelines/context",
+    ],
+)
+
+# The selection is arithmetic over the config and the host's architecture
+# name; the kernels it selects are graded by the GPU tests beside this one.
+modular_py_test(
+    name = "amd_w4a8_validation_tests_cpu",
+    srcs = ["test_amd_w4a8_validation.py"],
+    deps = [
+        "//max/python/max/dtype",
+        "//max/python/max/pipelines/architectures/kimi_k3_modulev3",
     ],
 )
 
@@ -166,6 +244,7 @@ modular_py_test(
         "//max/python/max/graph",
         "//max/python/max/nn:core",
         "//max/python/max/pipelines/architectures/kimi_k3_modulev3",
+        "//max/python/max/pipelines/lib",
         "//max/python/max/support",
     ],
 )
@@ -424,7 +503,6 @@ modular_eager_py_test(
         "//max/python/max/nn",
         "//max/python/max/nn/kv_cache",
         "//max/python/max/pipelines/architectures/kimi_k3_modulev3",
-        "//max/python/max/pipelines/architectures/kimi_k3_modulev3/dspark",
         "//max/python/max/pipelines/kv_cache",
         "//max/python/max/support",
     ],
@@ -552,7 +630,6 @@ modular_eager_py_test(
         "//max/python/max/nn",
         "//max/python/max/nn/kv_cache",
         "//max/python/max/pipelines/architectures/kimi_k3_modulev3",
-        "//max/python/max/pipelines/architectures/kimi_k3_modulev3/dspark",
         "//max/python/max/pipelines/kv_cache",
         "//max/python/max/support",
     ],
@@ -596,7 +673,6 @@ modular_eager_py_test(
         "//max/python/max/nn",
         "//max/python/max/nn/kv_cache",
         "//max/python/max/pipelines/architectures/kimi_k3_modulev3",
-        "//max/python/max/pipelines/architectures/kimi_k3_modulev3/dspark",
         "//max/python/max/pipelines/kv_cache",
         "//max/python/max/support",
     ],
@@ -678,7 +754,6 @@ modular_eager_py_test(
         "//max/python/max/nn",
         "//max/python/max/nn/kv_cache",
         "//max/python/max/pipelines/architectures/kimi_k3_modulev3",
-        "//max/python/max/pipelines/architectures/kimi_k3_modulev3/dspark",
         "//max/python/max/pipelines/kv_cache",
         "//max/python/max/support",
     ],
@@ -775,6 +850,21 @@ modular_eager_py_test(
         "//max/python/max/nn",
         "//max/python/max/nn/kv_cache",
         "//max/python/max/pipelines/architectures/kimi_k3_modulev3",
+    ],
+)
+
+modular_py_library(
+    name = "ep_test_utils",
+    testonly = True,
+    srcs = ["_ep_test_utils.py"],
+    imports = ["."],
+    deps = [
+        "//max/python/max:tensor",
+        "//max/python/max/driver",
+        "//max/python/max/engine",
+        "//max/python/max/graph",
+        "//max/python/max/nn",
+        "//max/python/max/nn:core",
     ],
 )
 
@@ -935,6 +1025,55 @@ modular_eager_py_test(
 # docstring: running both gate arms in one pytest process produced a
 # spurious failure in whichever ran second, traced to the experimental
 # Tensor runtime's compiled-graph caching, not a real divergence.
+# One KDA row against itself, packed alone and packed beside another row:
+# the recurrence must not see a batch neighbour. Runs on any accelerator.
+modular_eager_py_test(
+    name = "kda_batch_invariance_tests_gpu",
+    size = "large",
+    srcs = ["test_kda_batch_invariance.py"],
+    exec_properties = {
+        "test.resources:gpu-memory": "2",
+    },
+    gpu_constraints = ["//:has_gpu"],
+    tags = ["gpu"],
+    target_compatible_with = select({
+        "@platforms//os:macos": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
+    deps = [
+        requirement("numpy"),
+        "//max/python/max:tensor",
+        "//max/python/max/driver",
+        "//max/python/max/dtype",
+        "//max/python/max/pipelines/architectures/kimi_k3_modulev3",
+    ],
+)
+
+# The published checkpoint's own KDA width: 96 heads of 128, bf16 q/k/v with
+# an fp32 recurrent pool, which makes the weights an order of magnitude larger
+# than the fixture-geometry KDA tests beside it.
+modular_eager_py_test(
+    name = "kda_finiteness_tests_gpu",
+    size = "enormous",
+    srcs = ["test_kda_finiteness.py"],
+    exec_properties = {
+        "test.resources:gpu-memory": "6",
+    },
+    gpu_constraints = ["//:has_gpu"],
+    tags = ["gpu"],
+    target_compatible_with = select({
+        "@platforms//os:macos": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
+    deps = [
+        requirement("numpy"),
+        "//max/python/max:tensor",
+        "//max/python/max/driver",
+        "//max/python/max/dtype",
+        "//max/python/max/pipelines/architectures/kimi_k3_modulev3",
+    ],
+)
+
 modular_eager_py_test(
     name = "kda_attention_parity_original_gate_tests_gpu",
     size = "enormous",
@@ -1385,6 +1524,7 @@ modular_eager_py_test(
     tags = ["gpu"],
     target_compatible_with = ["//:has_multi_gpu"],
     deps = [
+        ":ep_test_utils",
         ":moe_test_utils",
         requirement("numpy"),
         "//max/python/max:tensor",
@@ -1410,6 +1550,7 @@ modular_eager_py_test(
     tags = ["gpu"],
     target_compatible_with = ["//:has_multi_gpu"],
     deps = [
+        ":ep_test_utils",
         ":moe_test_utils",
         requirement("numpy"),
         "//max/python/max:tensor",
@@ -1459,8 +1600,13 @@ modular_eager_py_test(
         "//max/python/max/nn",
         "//max/python/max/nn/kv_cache",
         "//max/python/max/pipelines/architectures/kimi_k3_modulev3",
-        "//max/python/max/pipelines/architectures/kimi_k3_modulev3/dspark",
         "//max/python/max/pipelines/kv_cache",
         "//max/python/max/support",
     ],
+)
+
+# The Python files, which test_no_legacy_ep_imports scans.
+filegroup(
+    name = "py_srcs",
+    srcs = glob(["**/*.py"]),
 )

@@ -536,25 +536,25 @@ void IterElementwiseOp::print(OpAsmPrinter &p) {
 // map.iter.elementwise.body
 //===----------------------------------------------------------------------===//
 
-// Parses an optional `max_simd_width(<limit>)`.
+// Parses an optional `max_simd_width(<width>)`.
 static ParseResult parseOptionalMaxSimdWidth(OpAsmParser &parser,
                                              OperationState &state,
                                              StringAttr name) {
   if (failed(parser.parseOptionalKeyword("max_simd_width")))
     return mlir::success();
-  TypedAttr limit;
-  if (parser.parseLParen() || MAP::parseWidthLimit(parser, limit) ||
+  TypedAttr width;
+  if (parser.parseLParen() || MAP::GCDAttr::parseSimdWidth(parser, width) ||
       parser.parseRParen())
     return mlir::failure();
-  state.addAttribute(name, limit);
+  state.addAttribute(name, width);
   return mlir::success();
 }
 
-static void printOptionalMaxSimdWidth(OpAsmPrinter &p, TypedAttr limit) {
-  if (!limit)
+static void printOptionalMaxSimdWidth(OpAsmPrinter &p, TypedAttr width) {
+  if (!width)
     return;
   p << " max_simd_width(";
-  MAP::printWidthLimit(p, limit);
+  MAP::GCDAttr::printSimdWidth(p, width);
   p << ")";
 }
 
@@ -896,31 +896,44 @@ void IterReduceOp::getAsmResultNames(
 }
 
 //===----------------------------------------------------------------------===//
-// map.iter.tile
+// map.iter.tile, map.iter.cache
 //===----------------------------------------------------------------------===//
 
-ParseResult IterTileOp::parse(OpAsmParser &parser, OperationState &state) {
+// `index (%i: !map.index<N>) -> T { ... }`
+static ParseResult parseRowValueOp(OpAsmParser &parser, OperationState &state) {
   SmallVector<OpAsmParser::Argument> indexArgInfo;
   if (parser.parseKeyword("index") || parseBlockArgList(parser, indexArgInfo))
     return mlir::failure();
   if (indexArgInfo.size() != 1)
-    return parser.emitError(parser.getCurrentLocation(),
-                            "'map.iter.tile' expects exactly one index "
-                            "argument");
+    return parser.emitError(parser.getCurrentLocation(), "'")
+           << state.name << "' expects exactly one index argument";
   if (parser.parseArrowTypeList(state.types) ||
       parser.parseRegion(*state.addRegion(), indexArgInfo))
     return mlir::failure();
   return parser.parseOptionalAttrDict(state.attributes);
 }
 
-void IterTileOp::print(OpAsmPrinter &p) {
+static void printRowValueOp(OpAsmPrinter &p, Operation *op) {
+  Region &body = op->getRegion(0);
   p << " index ";
-  printBlockArgList(p, getBody().front().getArguments());
-  p.printArrowTypeList(getOperation()->getResultTypes());
+  printBlockArgList(p, body.front().getArguments());
+  p.printArrowTypeList(op->getResultTypes());
   p << " ";
-  p.printRegion(getBody(), /*printEntryBlockArgs=*/false);
-  p.printOptionalAttrDict(getOperation()->getAttrs());
+  p.printRegion(body, /*printEntryBlockArgs=*/false);
+  p.printOptionalAttrDict(op->getAttrs());
 }
+
+ParseResult IterTileOp::parse(OpAsmParser &parser, OperationState &state) {
+  return parseRowValueOp(parser, state);
+}
+
+void IterTileOp::print(OpAsmPrinter &p) { printRowValueOp(p, *this); }
+
+ParseResult IterCacheOp::parse(OpAsmParser &parser, OperationState &state) {
+  return parseRowValueOp(parser, state);
+}
+
+void IterCacheOp::print(OpAsmPrinter &p) { printRowValueOp(p, *this); }
 
 //===----------------------------------------------------------------------===//
 // map.iter.map

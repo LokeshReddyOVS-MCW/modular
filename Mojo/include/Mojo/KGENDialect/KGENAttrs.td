@@ -334,26 +334,6 @@ def KGEN_SingletonAttr : KGEN_ExprAttr<"Singleton", "singleton"> {
 }
 
 //===----------------------------------------------------------------------===//
-// UnboundAttr
-//===----------------------------------------------------------------------===//
-
-def KGEN_UnboundAttr : KGEN_ExprAttr<"Unbound", "unbound"> {
-  let summary = "An unbound parameter value.";
-  let description = [{
-    The `#kgen.unbound` attribute represents an unbound parameter value. It is
-    a special placeholder that appears in collections of parameters that have
-    been partially bound.
-  }];
-
-  let parameters = (ins AttributeSelfTypeParameter<"">:$type);
-  let assemblyFormat = "";
-
-  let builders = [TypeBuilderWithInferredContext<(ins "Type":$type), [{
-    return get(type.getContext(), type);
-  }]>];
-}
-
-//===----------------------------------------------------------------------===//
 // NoneAttr
 //===----------------------------------------------------------------------===//
 
@@ -1741,9 +1721,9 @@ def KGEN_ParamsBindingArrayAttr
   let assemblyFormat = "`<` struct(params) `>`";
 
   let builders = [
-    // Build `numParams` values from a dense list, where a null value or an
-    // UnboundAttr leaves that input unbound. Missing trailing values are
-    // unbound. The list must not be longer than `numParams`.
+    // Build `numParams` values from a dense list, where a null value leaves
+    // that input unbound. Missing trailing values are unbound. The list must
+    // not be longer than `numParams`.
     AttrBuilder<(ins
       "size_t":$numParams,
       "ArrayRef<TypedAttr>":$paramValues
@@ -1794,27 +1774,32 @@ def KGEN_BindParamsAttr : KGEN_ExprAttr<"BindParams", "bind_params"> {
   let parameters = (ins
     "TypedAttr":$generator,
     "ParamsBindingArrayAttr":$params,
-    OptionalParameter<"DenseBoolArrayAttr">:$discharged
+    OptionalParameter<"DenseBoolArrayAttr">:$discharged,
+    AttributeSelfTypeParameter<"">:$type
   );
-  let assemblyFormat =
-      "`<` custom<BindParams>($generator, $params, $discharged) `>`";
+  // The custom parser builds through `get`, so a parsed binding is simplified
+  // and takes its type from the printed one when there is one.
+  let hasCustomAssemblyFormat = 1;
 
   let skipDefaultBuilders = 1;
   let builders = [
     // Optionally takes an evaluation context to use when simplifying/folding.
     // The evaluation context is never stored, only used temporarily prior to
-    // construction.
+    // construction. A caller that already knows the result type, such as one
+    // substituting into an existing binding, passes it as `resultType` to skip
+    // inferring it.
     AttrBuilder<(ins
       "TypedAttr":$generator,
       "ParamsBindingArrayAttr":$params,
       "DenseBoolArrayAttr":$discharged,
+      CArg<"Type", "{}">:$resultType,
       CArg<"ParameterEvaluationContext *", "nullptr">:$evaluationContext
     ), "", "TypedAttr">
   ];
   let extraClassDeclaration = [{
-    /// Build from a dense list of parameter values, where a null value or an
-    /// UnboundAttr leaves that input unbound. Missing trailing values are
-    /// unbound. The list must not be longer than the generator's inputs.
+    /// Build from a dense list of parameter values, where a null value leaves
+    /// that input unbound. Missing trailing values are unbound. The list must
+    /// not be longer than the generator's inputs.
     static TypedAttr get(
         MLIRContext *context, TypedAttr generator,
         ArrayRef<TypedAttr> paramValues, DenseBoolArrayAttr discharged,
@@ -1841,13 +1826,12 @@ def KGEN_BindParamsAttr : KGEN_ExprAttr<"BindParams", "bind_params"> {
     static Type inferResultType(
         GeneratorType genType, ParamsBindingArrayAttr params,
         ParameterEvaluationContext *evaluationContext);
-    Type getType() const;
 
     /// A specific builder used to build the attribute from a bytecode context,
     /// bypassing simplification.
     static BindParamsAttr getFromBytecode(
         TypedAttr generator, ParamsBindingArrayAttr params,
-        DenseBoolArrayAttr discharged = {});
+        DenseBoolArrayAttr discharged, Type type);
   }];
   let genVerifyDecl = 1;
 }
@@ -2416,8 +2400,7 @@ def KGEN_EnvAttr : KGENAttr<"Env", "env"> {
 def KGEN_ParamOperatorAttr : KGEN_ExprAttr<"ParamOperator", "param.expr", [
     DeclareAttrInterfaceMethods<ContextuallyEvaluatedAttrInterface,
                                ["evaluateWithContext"]>,
-    DeclareAttrInterfaceMethods<ParameterAttrInterface,
-                                ["isLessThan", "validateForElaborator"]>
+    DeclareAttrInterfaceMethods<ParameterAttrInterface, ["isLessThan"]>
   ]> {
   let summary = "Parameter expression";
   let parameters = (ins "POC":$opcode,
@@ -2513,9 +2496,7 @@ def KGEN_ParamOperatorAttr : KGEN_ExprAttr<"ParamOperator", "param.expr", [
 def KGEN_ParamIdenticalAttr
     : KGEN_ExprAttr<"ParamIdentical", "param.identical", [
     DeclareAttrInterfaceMethods<ContextuallyEvaluatedAttrInterface,
-                                ["evaluateWithContext"]>,
-    DeclareAttrInterfaceMethods<ParameterAttrInterface,
-                                ["validateForElaborator"]>
+                                ["evaluateWithContext"]>
   ]> {
   let summary = "Parameter identity proposition";
   let description = [{
@@ -3149,8 +3130,11 @@ def KGEN_PogListAttr : KGEN_ExprAttr<"PogList", "pog_list"> {
     >
     ```
 
-    The `origVariadicConvention` indicates whether the original argument
-    convention of a VariadicList or VariadicPack, e.g. "mut *args: Int".
+    The `origVariadicConvention` denotes the argument convention of the
+    elements of a VariadicList, e.g. "mut *args: Int". A VariadicPack records
+    its elements' convention in the function's arg convention, so an argument
+    list with a VariadicPack must not set this field. Parameters have no
+    convention.
 
     Optional `bodyConstraints` holds constraints that are enforced by the body
     of the generator type that carries this list as metadata.

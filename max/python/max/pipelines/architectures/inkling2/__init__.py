@@ -10,19 +10,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
+"""The Inkling 2 architecture on ModuleV3."""
 
-"""The Inkling2 architecture on ModuleV3."""
-
-from .arch import inkling2_arch
-from .model_config import (
-    Inkling2Config,
-    Inkling2TextConfig,
-    Inkling2VisionConfig,
-)
+from .arch import inkling2_arch, inkling2_dspark_draft_arch, inkling2_loop_arch
 
 __all__ = [
-    "Inkling2Config",
-    "Inkling2TextConfig",
-    "Inkling2VisionConfig",
     "inkling2_arch",
+    "inkling2_dspark_draft_arch",
+    "inkling2_loop_arch",
 ]

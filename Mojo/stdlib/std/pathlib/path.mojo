@@ -29,9 +29,12 @@ print(p)  # a/b/c.txt
 """
 
 import std.os
+from std.io import IOError
 import std.format._utils as fmt
 from std.os import PathLike, listdir, stat_result
 from std.ffi import c_char, external_call
+from std.io import IOError
+from std.sys import CompilationTarget
 
 from std.reflection import call_location
 
@@ -347,6 +350,36 @@ struct Path(
         """
         return std.os.path.expanduser("~")
 
+    @staticmethod
+    def devnull() raises IOError -> Path:
+        """Returns the path to the platform's null device.
+
+        Constraints:
+            The target platform must be Linux or macOS.
+
+        Returns:
+            The path to the null device, `/dev/null` on Linux and macOS.
+
+        Raises:
+            Never on Linux or macOS. Other platforms may need to look up the
+            null device at runtime, which can fail.
+
+        Example:
+
+        ```mojo
+        from std.pathlib import Path
+
+        with open(Path.devnull(), "w") as f:
+            f.write("discarded")
+        ```
+        """
+        comptime if CompilationTarget.is_linux() or CompilationTarget.is_macos():
+            return Path("/dev/null")
+        else:
+            CompilationTarget.unsupported_target_error[
+                operation="Path.devnull"
+            ]()
+
     def is_dir(self) -> Bool:
         """Returns True if the path is a directory and False otherwise.
 
@@ -409,7 +442,7 @@ struct Path(
         with open(self, "r") as f:
             return f.read()
 
-    def read_bytes(self) raises -> List[Byte]:
+    def read_bytes(self) raises IOError -> List[Byte]:
         """Returns content of the file as bytes.
 
         Returns:
@@ -434,7 +467,7 @@ struct Path(
         with open(self, "r") as f:
             return f.read_bytes()
 
-    def write_text[T: Writable](self, value: T) raises:
+    def write_text[T: Writable](self, value: T) raises IOError:
         """Writes the value to the file as text.
 
         Parameters:
@@ -461,7 +494,7 @@ struct Path(
         with open(self, "w") as f:
             f.write(value)
 
-    def write_bytes(self, bytes: Span[Byte, _]) raises:
+    def write_bytes(self, bytes: Span[Byte, _]) raises IOError:
         """Writes bytes to the file.
 
         Args:
@@ -564,7 +597,7 @@ struct Path(
 
         return result
 
-    def listdir(self) raises -> List[Path]:
+    def listdir(self) raises IOError -> List[Path]:
         """Gets the list of entries contained in the path provided.
 
         Returns:

@@ -37,17 +37,12 @@ from max.pipelines.modeling.types import (
 
 from .tokenizer import TOOL_CALL_JSON_MARKER
 
-# Payload shape: {"name":...,"args":{...}}. The tool-call grammar pins that
-# frame to a const string, but the parser also runs when no grammar is
-# generated (e.g. when ``tool_call_policy`` is ``force_unconstrained``) or
-# after a rejected token causes enforcement to fail open. So neither the key
-# order nor ``args`` being the payload's last key is guaranteed here.
-_ARGS_KEY_RE = re.compile(r'[,{]\s*"args"\s*:\s*')
-
+# Payload shape: {"name":...,"args":{...}}. The grammar pins that frame, but
+# the parser also runs when no grammar was generated or enforcement failed
+# open, so key order is not guaranteed.
 _DECODER = json.JSONDecoder()
 
-# Closing quote included, so a half-streamed name never parses as a complete one.
-_NAME_VALUE_RE = re.compile(r'"name"\s*:\s*("(?:[^"\\]|\\.)*")')
+_WHITESPACE = " \t\n\r"
 
 # OpenAI's tool-name charset, anchored with ``\Z`` so a trailing newline does not
 # read as the end of a name run.
@@ -82,18 +77,77 @@ def _scan_json_object(text: str, start: int) -> tuple[int, bool]:
     return len(text), False
 
 
+def _skip_whitespace(text: str, pos: int) -> int:
+    while pos < len(text) and text[pos] in _WHITESPACE:
+        pos += 1
+    return pos
+
+
+def _top_level_fields(body: str) -> dict[str, tuple[int, int | None]]:
+    """Maps each top-level key of the payload object to its value's extent.
+
+    A value still arriving maps to ``(start, None)`` and ends the scan, so a
+    key nested inside ``args`` can never pass for a top-level one, whatever
+    the key order.
+    """
+    fields: dict[str, tuple[int, int | None]] = {}
+    pos = _skip_whitespace(body, 0)
+    if pos >= len(body) or body[pos] != "{":
+        return fields
+    pos += 1
+    while True:
+        pos = _skip_whitespace(body, pos)
+        if pos < len(body) and body[pos] == ",":
+            pos = _skip_whitespace(body, pos + 1)
+        if pos >= len(body) or body[pos] != '"':
+            return fields
+        try:
+            key, pos = _DECODER.raw_decode(body, pos)
+        except json.JSONDecodeError:
+            return fields
+        pos = _skip_whitespace(body, pos)
+        if pos >= len(body) or body[pos] != ":":
+            return fields
+        start = _skip_whitespace(body, pos + 1)
+        try:
+            _, pos = _DECODER.raw_decode(body, start)
+        except json.JSONDecodeError:
+            fields[key] = (start, None)
+            return fields
+        fields[key] = (start, pos)
+
+
 def _args_text(body: str, is_complete: bool) -> str | None:
-    match = _ARGS_KEY_RE.search(body)
-    if match is None:
+    extent = _top_level_fields(body).get("args")
+    if extent is None:
         return None
-    start = match.end()
-    try:
-        _, end = _DECODER.raw_decode(body, start)
-    except json.JSONDecodeError:
+    start, end = extent
+    if end is None:
         # A value still arriving streams as the raw tail, which the base class
         # diffs into deltas. In a closed payload it is malformed, so withhold.
         return None if is_complete else body[start:]
-    return body[start:end]
+    return _unwrap_string_object(body[start:end])
+
+
+def _unwrap_string_object(text: str) -> str:
+    """Unwrap a JSON string that holds a JSON object, else return ``text``.
+
+    An unconstrained payload can encode the arguments as a JSON string where a
+    client parses ``arguments`` as an object.
+    """
+    if not text.startswith('"'):
+        return text
+    try:
+        inner = json.loads(text)
+    except json.JSONDecodeError:
+        return text
+    if not isinstance(inner, str):
+        return text
+    try:
+        holds_object = isinstance(json.loads(inner), dict)
+    except json.JSONDecodeError:
+        return text
+    return inner if holds_object else text
 
 
 def _iter_call_payloads(
@@ -174,19 +228,13 @@ class InklingToolParser(StructuralTagToolParser):
     def _split_tool_call_body(
         self, body: str, is_complete: bool
     ) -> tuple[str | None, str | None]:
-        args_match = _ARGS_KEY_RE.search(body)
-        if args_match is None:
+        # Top-level keys only, in either order: a ``name`` nested inside
+        # ``args`` cannot pass for the tool's own name.
+        extent = _top_level_fields(body).get("name")
+        if extent is None or extent[1] is None:
             return (None, None)
-
-        # Bounded to the text ahead of the key so a ``name`` property nested
-        # inside ``args`` cannot pass for the tool's own name.
-        match = _NAME_VALUE_RE.search(body[: args_match.start()])
-        if match is None:
-            return (None, None)
-        try:
-            name = json.loads(match.group(1))
-        except json.JSONDecodeError:
-            # An invalid escape in the name must not abort the stream.
+        name = json.loads(body[extent[0] : extent[1]])
+        if not isinstance(name, str) or not name:
             return (None, None)
 
         args = _args_text(body, is_complete)
@@ -218,18 +266,23 @@ class InklingToolParser(StructuralTagToolParser):
             return 0
 
         if marker_pos == -1:
-            return (
-                len(run)
-                if any(n.startswith(run) for n in self._declared_tool_names)
-                else 0
-            )
+            # Text can run straight into a name ("checkget_"), so hold back the
+            # longest tail of the run that could still become a declared name.
+            for length in range(len(run), 0, -1):
+                tail = run[-length:]
+                if any(n.startswith(tail) for n in self._declared_tool_names):
+                    return length
+            return 0
 
-        # Prefer an exact declared name so content fused to it
-        # ("checkget_weather") is not swallowed whole.
+        # With the marker in the buffer the run ends with the bare name, but it
+        # may also carry prose fused to that name ("checkget_weather"). Hold
+        # back a declared name only: an undeclared run stays content here and
+        # ``parse_complete`` trims the payload's own name from it, so the two
+        # paths agree instead of the stream dropping a word.
         for name in self._declared_tool_names:
             if content.endswith(name):
                 return len(name)
-        return len(run)
+        return 0
 
     @staticmethod
     def generate_tool_call_grammar(

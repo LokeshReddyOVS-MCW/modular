@@ -5,6 +5,8 @@ load("@rules_mojo//mojo:toolchain.bzl", "mojo_copts_toolchain")
 load("@rules_mypy//mypy:mypy.bzl", "mypy_cli")
 load("@rules_python//python:defs.bzl", "py_binary")
 load("@rules_rust//extensions/pyo3:defs.bzl", "rust_pyo3_toolchain")
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load("//bazel:api.bzl", "modular_cc_binary", "modular_cc_library", "modular_py_binary", "modular_py_library", "modular_py_test", "requirement")
 load("//bazel:config.bzl", "ASYNCRT_PROFILING_OPTIONS", "TOP_LEVEL_TAG")
 load("//max/python/max:all_deps.bzl", "ALL_MAX_PYTHON_DEPS")
@@ -18,6 +20,7 @@ package(default_visibility = ["//visibility:public"])
 
 exports_files([
     "create_venv.py",
+    "libLLVM.map",
     "load_bazel_tools.py",
     "lsan-suppressions.txt",
 ])
@@ -357,6 +360,7 @@ toolchain(
 # global state. See ../docs/dynamic-linking.md.
 cc_shared_library(
     name = "LLVMSupport",
+    additional_linker_inputs = [":libLLVM.map"],
     exports_filter = [
         "@llvm-project//llvm:__subpackages__",
         "@llvm-project//third-party:__subpackages__",
@@ -366,7 +370,10 @@ cc_shared_library(
     ],
     user_link_flags = select({
         # Matches libLLVM.
-        "@platforms//os:linux": ["-Wl,-Bsymbolic-functions"],
+        "@platforms//os:linux": [
+            "-Wl,-Bsymbolic-functions",
+            "-Wl,--version-script,$(location :libLLVM.map)",
+        ],
         "//conditions:default": [],
     }),
     deps = [
@@ -400,4 +407,18 @@ cc_shared_library(
         "//conditions:default": [],
     }),
     deps = MLIR_DYLIB_LIBS,
+)
+
+# Applied to every test by `--config=remote-b200` through `--run_under`.
+sh_binary(
+    name = "nvidia_device_wrapper",
+    srcs = ["nvidia_device_wrapper.sh"],
+)
+
+sh_test(
+    name = "nvidia_device_wrapper_test",
+    size = "small",
+    srcs = ["nvidia_device_wrapper_test.sh"],
+    args = ["$(rootpath nvidia_device_wrapper.sh)"],
+    data = ["nvidia_device_wrapper.sh"],
 )

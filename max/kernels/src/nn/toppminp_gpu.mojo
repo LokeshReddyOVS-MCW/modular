@@ -25,7 +25,7 @@ from max.gpu.primitives.grid_controls import (
     PDLLevel,
     pdl_launch_attributes,
 )
-from max.gpu.host import DeviceContext, DeviceBuffer
+from max.gpu.host import DeviceBuffer, DeviceContext, GridBlockLaunchConfig
 from max.gpu.host import Dim
 from std.random import Random
 from layout import Coord, TileTensor, row_major
@@ -522,7 +522,7 @@ struct DoubleBuffer[dtype: DType](ImplicitlyCopyable):
         self._size = copy._size
 
     @inline(.always)
-    def current(self, ctx: DeviceContext) -> DeviceBuffer[Self.dtype]:
+    def current(self, ctx: DeviceContext) raises -> DeviceBuffer[Self.dtype]:
         if case .Some(ptr) = self._d_buffers[self._selection]:
             return DeviceBuffer[Self.dtype](
                 ctx,
@@ -534,7 +534,7 @@ struct DoubleBuffer[dtype: DType](ImplicitlyCopyable):
             return DeviceBuffer[Self.dtype].empty(ctx)
 
     @inline(.always)
-    def alternate(self, ctx: DeviceContext) -> DeviceBuffer[Self.dtype]:
+    def alternate(self, ctx: DeviceContext) raises -> DeviceBuffer[Self.dtype]:
         if case .Some(ptr) = self._d_buffers[self._selection ^ 1]:
             return DeviceBuffer[Self.dtype](
                 ctx,
@@ -920,7 +920,7 @@ def _topp_minp_sampling_gpu[
         row_major(batch_size, vocab_size),
     )
 
-    _softmax_gpu[dtype, 1, input_logits.rank](
+    _softmax_gpu[dtype, 1](
         apply_temperature,
         input_shape,
         input_probs,
@@ -940,8 +940,10 @@ def _topp_minp_sampling_gpu[
             probs_buf,
             out_token_ids.to_device_buffer(ctx),
             Int32(vocab_size),
-            grid_dim=batch_size,
-            block_dim=BLOCK_SIZE,
+            execution_config=GridBlockLaunchConfig(
+                grid_dim=batch_size,
+                block_dim=BLOCK_SIZE,
+            ),
         )
         _ = probs_buf^
         return

@@ -71,7 +71,7 @@ struct RaiseContext {
                             const ExprNode *sourceExpr);
 
   /// Records an error propagation terminator for deferred try type unification.
-  void recordRaiseSite(MLValue errorSlot, Operation *terminator,
+  void recordRaiseSite(MLValue errorSlot, LIT::RaiseOp terminator,
                        Operation *sourceOperation, SMLoc sourceLoc);
 
   /// Converts deferred errors to a common slot, optionally constrained to
@@ -79,6 +79,18 @@ struct RaiseContext {
   /// no error was raised and no type was specified.
   MLValue finalizeErrorSlots(IREmitter &emitter, ASTType requiredErrorType = {},
                              bool isSlotRequired = false);
+
+  /// Routes errors convertible to `requiredErrorType` to `handlerIndex`.
+  /// Returns the handler's error slot and whether any raise can reach it.
+  std::pair<MLValue, bool>
+  finalizeErrorSlotsForHandler(IREmitter &emitter, ASTType requiredErrorType,
+                               size_t handlerIndex);
+
+  /// Routes all pending raises to the catch-all handler.
+  void selectCatchAllHandler(size_t handlerIndex);
+
+  /// Returns the distinct error types that no handler has consumed.
+  SmallVector<ASTType> getPendingErrorTypes() const;
 
   /// Returns whether this context writes directly to a fixed error slot or
   /// collects all the raised temporaries and processes them at finalization
@@ -100,10 +112,13 @@ private:
 
   struct RaiseSite {
     MLValue errorSlot;
-    Operation *terminator;
+    LIT::RaiseOp terminator;
     Operation *sourceOperation;
     SMLoc sourceLoc;
   };
+
+  /// Routes `sites` to `handlerIndex`.
+  void selectHandler(ArrayRef<RaiseSite> sites, size_t handlerIndex);
 
   Operation *opForRaise;
   SmallVector<MLValue, 2> errorSlots;
@@ -279,15 +294,13 @@ public:
   /// `declScope` supplies the `where` assumptions used to discharge generator
   /// body constraints; `additionalAssumptions` are extra facts to consider
   /// alongside it.
-  static TriBool
-  canZeroCostConvert(ASTType fromType, ASTType toType, SharedState &shared,
-                     ASTDecl &declScope,
-                     ArrayRef<ConstraintAttr> additionalAssumptions = {});
+  static TriBool canZeroCostConvert(ASTType fromType, ASTType toType,
+                                    SharedState &shared, ASTDecl &declScope,
+                                    TypedAttr additionalAssumptions);
 
   /// Same as the above, using this emitter's shared state and scope.
-  TriBool
-  canZeroCostConvert(ASTType fromType, ASTType toType,
-                     ArrayRef<ConstraintAttr> additionalAssumptions = {}) {
+  TriBool canZeroCostConvert(ASTType fromType, ASTType toType,
+                             TypedAttr additionalAssumptions) {
     return canZeroCostConvert(fromType, toType, shared, declScope,
                               additionalAssumptions);
   }
@@ -532,10 +545,11 @@ public:
   /// When `deferralCtx` is non-null and the only obstacle to the conversion is
   /// an unprovable (`unknown`) trait conformance, the conversion is
   /// reported as convertible (and not cached since it's context-dependent).
-  static TriBool classifyImplicitConversion(
-      ASTExprAnd<CValue> value, ASTType requiredType, ASTDecl &declScope,
-      ArrayRef<ConstraintAttr> additionalAssumptions = {},
-      DeferredTypingContext *deferralCtx = nullptr);
+  static TriBool
+  classifyImplicitConversion(ASTExprAnd<CValue> value, ASTType requiredType,
+                             ASTDecl &declScope,
+                             TypedAttr additionalAssumptions,
+                             DeferredTypingContext *deferralCtx = nullptr);
 
   /// The answer from `classifyImplicitConversionWithDetails`:
   /// - A `no`/`unknown` carries why the conversion was rejected. Only the
@@ -549,15 +563,15 @@ public:
   /// reasons.
   static ImplicitConversionResult classifyImplicitConversionWithDetails(
       ASTExprAnd<CValue> value, ASTType requiredType, ASTDecl &declScope,
-      ArrayRef<ConstraintAttr> additionalAssumptions,
-      DeferredTypingContext *deferralCtx);
+      TypedAttr additionalAssumptions, DeferredTypingContext *deferralCtx);
 
   /// Boolean form of `classifyImplicitConversion`, collapsing an undecided
   /// answer the way callers that cannot represent one have always seen it.
-  static bool canImplicitlyConvertToType(
-      ASTExprAnd<CValue> value, ASTType requiredType, ASTDecl &declScope,
-      ArrayRef<ConstraintAttr> additionalAssumptions = {},
-      DeferredTypingContext *deferralCtx = nullptr) {
+  static bool
+  canImplicitlyConvertToType(ASTExprAnd<CValue> value, ASTType requiredType,
+                             ASTDecl &declScope,
+                             TypedAttr additionalAssumptions,
+                             DeferredTypingContext *deferralCtx = nullptr) {
     TriBool verdict = classifyImplicitConversion(
         value, requiredType, declScope, additionalAssumptions, deferralCtx);
     if (verdict.isUnknown())
@@ -568,9 +582,9 @@ public:
   /// This emits an implicit conversion to the specified type if the types
   /// differ, including emitting any implicit constructor calls as well as
   /// implicit promotions like origin conversions.
-  CValue emitImplicitConversionToType(
-      ASTExprAnd<CValue> value, ASTType requiredType, ExprDest &dest,
-      ArrayRef<ConstraintAttr> additionalAssumptions = {});
+  CValue emitImplicitConversionToType(ASTExprAnd<CValue> value,
+                                      ASTType requiredType, ExprDest &dest,
+                                      TypedAttr additionalAssumptions);
 
   /// Emit the specified expression into the specified destination.
   AnyValue emitExpr(const ExprNode *expr, ExprDest &dest);
@@ -617,6 +631,13 @@ public:
   /// value in the specified destination.  This returns an RValue if
   /// there is no consuming dest, otherwise a BValue.
   CValue emitCopyOfValue(ASTExprAnd<CValue> value, ExprDest &dest);
+
+  /// Copy a reference outside the default address space to a new owned value
+  /// in the default address space, where argument conventions take values.
+  /// Emits an error and returns null if the type is not provably trivially
+  /// copyable.
+  RValue emitCopyFromNonDefaultAddressSpace(ASTExprAnd<AnyValue> value,
+                                            ExprContext context);
 
   /// Given a value with a known type, emit a store to the specified LValue.
   /// This returns an borrowed reference to the value after it is done.
@@ -741,8 +762,7 @@ Type maybeRefineTypeWithAssumptions(Type varType, ASTDecl &declScope);
 /// Select the arm of a conditional type (`A if c else B`) that `assumptions`
 /// decide. Returns the original type if it is not a conditional type or the
 /// assumptions do not decide its condition.
-Type maybeRefineCondTypeWithAssumptions(Type type,
-                                        ArrayRef<ConstraintAttr> assumptions);
+Type maybeRefineCondTypeWithAssumptions(Type type, TypedAttr assumptions);
 
 /// Refine a type-valued parameter expression based on where-clause constraints
 /// in the scope. Returns the refined type value if refinement applies,

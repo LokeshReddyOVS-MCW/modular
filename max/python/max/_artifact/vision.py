@@ -59,6 +59,9 @@ class SmartResize:
             none.
         default_max_long_side_pixel: The long-side cap when a request gives
             none, or ``0`` to bound the area alone.
+        newline_per_row: Whether each merged row ends with one more
+            placeholder, the projector's newline row, for
+            ``rows * (cols + 1)`` placeholders.
     """
 
     rule: ClassVar[str] = "smart_resize"
@@ -66,6 +69,32 @@ class SmartResize:
     max_pixels: int
     min_short_side_pixel: int = 0
     default_max_long_side_pixel: int = 0
+    newline_per_row: bool = False
+
+
+@dataclass(frozen=True)
+class KimiK3NavitResize:
+    """Shrinks by a floor-patch budget, then pads to merged patches.
+
+    The budget applies before padding. The resulting token count can exceed
+    ``in_patch_limit / merge_size**2``.
+
+    Args:
+        in_patch_limit: The floor-patch count used to choose the content scale.
+        patch_limit_on_one_side: The maximum padded patch-grid side.
+    """
+
+    rule: ClassVar[str] = "kimi_k3_navit"
+    in_patch_limit: int
+    patch_limit_on_one_side: int
+
+    def __post_init__(self) -> None:
+        if not _is_int_in(self.in_patch_limit, 1, 2**32 - 1):
+            raise ValueError("in_patch_limit must be a positive uint32")
+        if not _is_int_in(self.patch_limit_on_one_side, 1, 2**16 - 1):
+            raise ValueError(
+                "patch_limit_on_one_side must be a positive uint16"
+            )
 
 
 @dataclass(frozen=True)
@@ -130,6 +159,58 @@ class MuseSmartResize:
 
 
 @dataclass(frozen=True)
+class Glm5NextSmartResize:
+    """Aligns the canvas up to the merged patch within a decoder-token budget.
+
+    GLM-5.3-Flash's ``smart_resize``: both raw sides align up to
+    ``patch_size * merge_size``, a canvas under ``min_tokens`` scales up, and
+    one over ``max_tokens`` takes the tallest content height whose aligned
+    canvas fits. The budget counts a still image as ``temporal_patch_size``
+    frames, each token covering ``temporal_patch_size * (patch * merge)**2``
+    pixels. The content is resized to fit inside the canvas, never upscaled
+    once it is over the token floor, and the rest of the canvas is zero
+    padding.
+
+    Args:
+        temporal_patch_size: The frames one temporal patch spans; a still
+            image is replicated to fill it.
+        min_tokens: The fewest decoder tokens an item may produce.
+        max_tokens: The most decoder tokens an item may produce.
+        max_entry_tokens: Video only, ``0`` for none: the most decoder tokens
+            one temporal patch may span.
+
+    Raises:
+        ValueError: If a field is not an integer Mach reads as ``u32``, or
+            ``min_tokens`` is over ``max_tokens``.
+    """
+
+    rule: ClassVar[str] = "glm5_next_smart_resize"
+    temporal_patch_size: int
+    min_tokens: int
+    max_tokens: int
+    max_entry_tokens: int = 0
+
+    def __post_init__(self) -> None:
+        for name in (
+            "temporal_patch_size",
+            "min_tokens",
+            "max_tokens",
+            "max_entry_tokens",
+        ):
+            value = getattr(self, name)
+            low = 0 if name == "max_entry_tokens" else 1
+            if not _is_int_in(value, low, 2**32 - 1):
+                raise ValueError(
+                    f"{name} {value!r} is not an integer from {low} to 2**32 - 1"
+                )
+        if self.min_tokens > self.max_tokens:
+            raise ValueError(
+                f"min_tokens {self.min_tokens} is over max_tokens "
+                f"{self.max_tokens}"
+            )
+
+
+@dataclass(frozen=True)
 class DeepseekV41Letterbox:
     """Grows small images, then letterboxes them into a span budget.
 
@@ -184,13 +265,27 @@ def _is_int_in(value: object, low: int, high: int) -> bool:
     )
 
 
+@dataclass(frozen=True)
+class Inkling2Blocks:
+    """Pads to whole blocks of ``patch_size * merge_size`` without resizing.
+
+    The image keeps its pixels and grows at the bottom and right to the next
+    whole block; each block is one embedding row.
+    """
+
+    rule: ClassVar[str] = "inkling2_blocks"
+
+
 ResizeStrategy: TypeAlias = (
     SmartResize
     | AspectRatioPreserving
+    | KimiK3NavitResize
     | VideoSmartResize
     | InklingPatchRows
     | MuseSmartResize
+    | Glm5NextSmartResize
     | DeepseekV41Letterbox
+    | Inkling2Blocks
 )
 
 
@@ -281,7 +376,7 @@ class ModalityLayout:
         return {
             "patch_size": self.patch_size,
             "merge_size": self.merge_size,
-            "strategy": {"rule": self.strategy.rule, **asdict(self.strategy)},
+            "strategy": _strategy_json(self.strategy),
             "span": {"static": asdict(self.span)},
             "template_markers": (
                 None
@@ -293,6 +388,15 @@ class ModalityLayout:
                 **asdict(self.video_layout),
             },
         }
+
+
+def _strategy_json(strategy: ResizeStrategy) -> dict[str, JsonValue]:
+    fields: dict[str, JsonValue] = {"rule": strategy.rule, **asdict(strategy)}
+    # Mach images that predate the field refuse it, so it is written only
+    # where it is set.
+    if fields.get("newline_per_row") is False:
+        del fields["newline_per_row"]
+    return fields
 
 
 @dataclass(frozen=True)

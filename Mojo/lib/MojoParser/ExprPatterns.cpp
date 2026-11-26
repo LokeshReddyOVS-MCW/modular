@@ -557,9 +557,8 @@ LogicalResult ListLiteralNode::buildCheckList(
   ASTType subjectType = path->type;
   auto sizedConformance =
       subjectType
-          .conformsToBuiltinTrait(
-              "Sized", getLoc(), builder.shared,
-              ASTDecl::getAssumptionsFromScope(&builder.declScope))
+          .conformsToBuiltinTrait("Sized", getLoc(), builder.shared,
+                                  builder.declScope.getScopeAssumptions())
           .first;
   if (!sizedConformance.isTrue()) {
     auto diag = builder.emitError(getLoc());
@@ -597,8 +596,8 @@ CallNode::buildCheckList(PatternMatchBuilder &builder, CValue subject,
                          SmallVectorImpl<const PatternCommand *> &out) const {
   ASTType subjectType = path->type;
 
-  if (subjectType.provenConformsToBuiltinTrait("EnumLike", getLoc(),
-                                               builder.shared, {}))
+  if (subjectType.provenConformsToBuiltinTrait(
+          "EnumLike", getLoc(), builder.shared, builder.shared.noAssumptions))
     return buildEnumCheckList(builder, subject, path, out);
 
   IREmitter emitter = builder.getParamEmitter();
@@ -700,15 +699,32 @@ CallNode::buildCheckList(PatternMatchBuilder &builder, CValue subject,
 //===----------------------------------------------------------------------===//
 
 /// Read `SubjectType._enum_case_names` as a concrete ParamListAttr value list.
-static std::optional<ArrayRef<TypedAttr>>
+/// Returns failure when the emission fails (an error was already reported),
+/// success with nullopt when the names are not a concrete list (a parametric
+/// enum).
+static FailureOr<std::optional<ArrayRef<TypedAttr>>>
 getEnumCaseNames(IREmitter &emitter, ASTType subjectType, SMLoc loc) {
   SyntheticNode typeNode(loc, PValue(subjectType));
   AttributeRefNode namesRef(&typeNode, loc, "_enum_case_names");
   TypedAttr namesAttr = emitter.emitExprPValue(&namesRef, EC_AttributeRefBase);
-  if (auto namesList =
-          dyn_cast_or_null<ParamListAttr>(getCanonicalAttr(namesAttr)))
-    return namesList.getValues();
-  return std::nullopt;
+  if (!namesAttr)
+    return failure();
+  if (auto namesList = dyn_cast<ParamListAttr>(getCanonicalAttr(namesAttr)))
+    return std::optional<ArrayRef<TypedAttr>>(namesList.getValues());
+  return std::optional<ArrayRef<TypedAttr>>();
+}
+
+LogicalResult LIT::checkEnumCaseNamesReadable(PatternMatchBuilder &builder,
+                                              const PatternPath *rootPath,
+                                              SMLoc loc) {
+  ASTType subjectType = rootPath->type;
+  if (!subjectType.provenConformsToBuiltinTrait(
+          "EnumLike", loc, builder.shared,
+          builder.declScope.getScopeAssumptions()))
+    return success();
+  IREmitter emitter = builder.getParamEmitter();
+  // A failed reading already reported its error.
+  return getEnumCaseNames(emitter, subjectType, loc);
 }
 
 /// Read `SubjectType._enum_is_exhaustive` when it is statically known.
@@ -748,20 +764,24 @@ static LogicalResult checkEnumCaseTypeBase(IREmitter &emitter, CValue subject,
 }
 
 /// Look up `caseName` in `SubjectType._enum_case_names`. Returns nullopt after
-/// emitting an error when the name is not a case.
+/// emitting an error when the name is not a case or the names are not a
+/// concrete list, and nullopt without one when reading the names failed (the
+/// failed emission already reported an error).
 static std::optional<size_t> lookupEnumCaseIndex(IREmitter &emitter,
                                                  ASTType subjectType,
                                                  StringRef caseName,
                                                  const ExprNode *expr) {
-  std::optional<ArrayRef<TypedAttr>> caseNames =
+  FailureOr<std::optional<ArrayRef<TypedAttr>>> caseNames =
       getEnumCaseNames(emitter, subjectType, expr->getLoc());
-  if (!caseNames) {
+  if (failed(caseNames))
+    return std::nullopt; // The failed emission already reported an error.
+  if (!*caseNames) {
     emitter.emitError(expr->getLoc(), "cannot match on a parametric enum type")
         << expr->getRange();
     return std::nullopt;
   }
 
-  for (auto [idx, nameAttr] : llvm::enumerate(*caseNames)) {
+  for (auto [idx, nameAttr] : llvm::enumerate(**caseNames)) {
     auto nameStr = dyn_cast<StringAttr>(nameAttr);
     if (nameStr && nameStr.getValue() == caseName)
       return idx;
@@ -773,10 +793,11 @@ static std::optional<size_t> lookupEnumCaseIndex(IREmitter &emitter,
 
 /// Return the payload type of case `caseIndex` of `subjectType`, as
 /// `_enum_case_types` lists it. The payload type must be a `Tuple` (`Tuple[]`
-/// for a case without a payload). If it is not, or `_enum_case_types` lists no
-/// type for the case, an error is emitted and null is returned.
-static ASTType getEnumCasePayloadType(IREmitter &emitter, ASTType subjectType,
-                                      size_t caseIndex, const ExprNode *expr) {
+/// for a case without a payload). If `_enum_case_types` is missing or lists no
+/// type for the case, or the type is not a `Tuple`, an error is emitted and
+/// null is returned.
+static ASTType getCasePayloadType(IREmitter &emitter, ASTType subjectType,
+                                  size_t caseIndex, const ExprNode *expr) {
   SyntheticNode typeNode(expr->getLoc(), PValue(subjectType));
   AttributeRefNode typesRef(&typeNode, expr->getLoc(), "_enum_case_types");
   PValue typesPV = emitter.emitExprPValue(&typesRef, EC_AttributeRefBase);
@@ -808,7 +829,9 @@ static ASTType getEnumCasePayloadType(IREmitter &emitter, ASTType subjectType,
       !bindings.empty() && isa<ParamListType>(bindings.front().getType()))
     return payloadType;
   auto names = getEnumCaseNames(emitter, subjectType, expr->getLoc());
-  auto name = names ? dyn_cast<StringAttr>((*names)[caseIndex]) : StringAttr();
+  auto name = succeeded(names) && *names
+                  ? dyn_cast<StringAttr>((**names)[caseIndex])
+                  : StringAttr();
   emitter.emitError(expr->getLoc(), "payload type for case '")
       << (name ? name.getValue() : StringRef()) << "' must be a 'Tuple', found "
       << payloadType << expr->getRange();
@@ -820,6 +843,64 @@ static ASTType getEnumCasePayloadType(IREmitter &emitter, ASTType subjectType,
 static ParamListAttr getKnownEnumPayloadElementTypes(ASTType payloadType) {
   return sugarDynCast<ParamListAttr>(
       UpcastAttr::strip(payloadType.getParamBindings().front()));
+}
+
+/// The struct declaration `type` names, or null when `type` is not a struct.
+static StructASTDecl *getStructDecl(SharedState &shared, ASTType type) {
+  return dyn_cast_if_present<StructASTDecl>(type.getDecl(shared));
+}
+
+/// True when `type` declares union cases, whose patterns require parentheses.
+static bool isUnionType(SharedState &shared, ASTType type) {
+  // TODO(rmorel): Check for a `UnionLike` conformance once that trait exists,
+  // so every union-like type takes parentheses.
+  auto *structDecl = getStructDecl(shared, type);
+  return structDecl && structDecl->getOp().isUnion();
+}
+
+/// Spell the subpatterns that match any value of `payloadType`, the payload of
+/// a union case: `()`, `(_)`, `(_, _)`, ... Nothing when the payload's element
+/// count is a compile-time parameter.
+static std::optional<std::string>
+spellUnionCaseSubpatterns(ASTType payloadType) {
+  // A `Tuple[*Ts]` payload, whose element count is a compile-time parameter,
+  // is rejected at the declaration, so a declared case's count is known.
+  ParamListAttr elements = getKnownEnumPayloadElementTypes(payloadType);
+  if (!elements)
+    return std::nullopt;
+  std::string spelling = "(";
+  for (size_t i = 0, e = elements.getValues().size(); i < e; ++i)
+    spelling += i == 0 ? "_" : ", _";
+  return spelling + ")";
+}
+
+/// Diagnose `.eof`, a union case written in a pattern without its parentheses,
+/// with a fix-it that adds them and a `_` per payload element.
+static void diagnoseUnionCaseWithoutParens(PatternMatchBuilder &builder,
+                                           IREmitter &emitter,
+                                           ASTType subjectType,
+                                           size_t caseIndex, StringRef caseName,
+                                           const ExprNode *expr) {
+  ASTType payloadType =
+      getCasePayloadType(emitter, subjectType, caseIndex, expr);
+  if (!payloadType)
+    return;
+  std::optional<std::string> subpatterns =
+      spellUnionCaseSubpatterns(payloadType);
+  if (!subpatterns) {
+    builder.emitError(expr->getLoc(), "cannot match the payload of case '")
+        << caseName << "': its element count is a compile-time parameter"
+        << expr->getRange();
+    return;
+  }
+  auto diag = builder.emitError(expr->getLoc(), "pattern for union case '")
+              << caseName << "' must have parentheses; add '" << *subpatterns
+              << "'";
+  if (*subpatterns != "()")
+    diag << " to match any payload";
+  diag << expr->getRange()
+       << FixIt::insertAfterToken(expr->getRangeEnd(), *subpatterns,
+                                  builder.shared.diags);
 }
 
 /// Given a value of EnumLike type, extract the discriminant from it.
@@ -864,18 +945,19 @@ LogicalResult CallNode::buildEnumCheckList(
   if (!caseIndex)
     return failure();
   ASTType payloadType =
-      getEnumCasePayloadType(emitter, subjectType, *caseIndex, this);
+      getCasePayloadType(emitter, subjectType, *caseIndex, this);
   if (!payloadType)
     return failure();
   ParamListAttr elementTypes = getKnownEnumPayloadElementTypes(payloadType);
 
-  if (elementTypes && elementTypes.getValues().empty()) {
+  bool isUnion = isUnionType(builder.shared, subjectType);
+  if (!isUnion && elementTypes && elementTypes.getValues().empty()) {
     builder.emitError(getLoc(), "enum case '")
         << caseName << "' has no associated value" << getParenRange();
     return failure();
   }
 
-  if (operands.empty()) {
+  if (!isUnion && operands.empty()) {
     builder.emitError(getLoc(), "enum case '")
         << caseName << "' requires a payload pattern inside the parentheses"
         << getParenRange();
@@ -884,14 +966,18 @@ LogicalResult CallNode::buildEnumCheckList(
 
   for (const Operand &operand : operands) {
     if (operand.unpackStyle == ArgUnpackStyle::kKeyword) {
-      builder.emitError(operand.getLoc(),
-                        "enum case patterns do not support keyword arguments")
+      builder.emitError(
+          operand.getLoc(),
+          isUnion ? "union case patterns do not support keyword arguments"
+                  : "enum case patterns do not support keyword arguments")
           << operand.expr->getRange();
       return failure();
     }
     if (operand.unpackStyle != ArgUnpackStyle::kPositional) {
-      builder.emitError(operand.getLoc(),
-                        "enum case patterns do not support unpacked arguments")
+      builder.emitError(
+          operand.getLoc(),
+          isUnion ? "union case patterns do not support unpacked arguments"
+                  : "enum case patterns do not support unpacked arguments")
           << operand.expr->getRange();
       return failure();
     }
@@ -900,10 +986,13 @@ LogicalResult CallNode::buildEnumCheckList(
   // TODO(rmorel): Support payload subpatterns on a `Tuple[*Ts]` payload, whose
   // element count is known only when the code is instantiated.
   if (!elementTypes) {
-    builder.emitError(operands[0].getLoc(),
-                      "cannot match the payload of case '")
+    // A pattern with no subpatterns has no operand to point at.
+    SMLoc loc = operands.empty() ? getLoc() : operands[0].getLoc();
+    SourceRange range =
+        operands.empty() ? getParenRange() : operands[0].expr->getRange();
+    builder.emitError(loc, "cannot match the payload of case '")
         << caseName << "': its element count is a compile-time parameter"
-        << operands[0].expr->getRange();
+        << range;
     return failure();
   }
 
@@ -913,8 +1002,8 @@ LogicalResult CallNode::buildEnumCheckList(
   if (operands.size() != elements.size()) {
     builder.emitError(getLoc(), "expected ")
         << elements.size() << " subpattern" << plural(elements.size())
-        << " for enum case '" << caseName << "', found " << operands.size()
-        << getParenRange();
+        << " for " << (isUnion ? "union" : "enum") << " case '" << caseName
+        << "', found " << operands.size() << getParenRange();
     return failure();
   }
   out.push_back(builder.createEnumTag(path, this, *caseIndex));
@@ -933,14 +1022,18 @@ LogicalResult AttributeRefNode::buildCheckList(
     PatternMatchBuilder &builder, CValue subject, const PatternPath *path,
     SmallVectorImpl<const PatternCommand *> &out) const {
   ASTType subjectType = path->type;
-  if (subjectType.provenConformsToBuiltinTrait("EnumLike", getLoc(),
-                                               builder.shared, {})) {
+  if (subjectType.provenConformsToBuiltinTrait(
+          "EnumLike", getLoc(), builder.shared, builder.shared.noAssumptions)) {
     IREmitter emitter = builder.getParamEmitter();
     if (subject && failed(checkEnumCaseTypeBase(emitter, subject, base, this)))
       return failure();
     auto caseIndex = lookupEnumCaseIndex(emitter, subjectType, spelling, this);
     if (!caseIndex)
       return failure();
+    // The pattern still tests the case, as the fix-it's spelling does.
+    if (isUnionType(builder.shared, subjectType))
+      diagnoseUnionCaseWithoutParens(builder, emitter, subjectType, *caseIndex,
+                                     spelling, this);
     out.push_back(builder.createEnumTag(path, this, *caseIndex));
     return success();
   }
@@ -952,12 +1045,16 @@ LogicalResult InferredAttributeRefNode::buildCheckList(
     PatternMatchBuilder &builder, CValue subject, const PatternPath *path,
     SmallVectorImpl<const PatternCommand *> &out) const {
   ASTType subjectType = path->type;
-  if (subjectType.provenConformsToBuiltinTrait("EnumLike", getLoc(),
-                                               builder.shared, {})) {
+  if (subjectType.provenConformsToBuiltinTrait(
+          "EnumLike", getLoc(), builder.shared, builder.shared.noAssumptions)) {
     IREmitter emitter = builder.getParamEmitter();
     auto caseIndex = lookupEnumCaseIndex(emitter, subjectType, spelling, this);
     if (!caseIndex)
       return failure();
+    // The pattern still tests the case, as the fix-it's spelling does.
+    if (isUnionType(builder.shared, subjectType))
+      diagnoseUnionCaseWithoutParens(builder, emitter, subjectType, *caseIndex,
+                                     spelling, this);
     out.push_back(builder.createEnumTag(path, this, *caseIndex));
     return success();
   }
@@ -1327,10 +1424,13 @@ PatternEmitState::getConsumedBindingValues(IREmitter &emitter,
     assert(elementTypes &&
            "a payload subpattern on a `Tuple[*Ts]` payload is rejected when "
            "the pattern is built");
-    // TODO(MOCO-5256): Move the elements of a multi-element payload too, once
-    // the transfer no longer destroys them with the subject. Until then they
-    // are copied, as the elements of a tuple subpattern are.
-    if (elementTypes.getValues().size() > 1)
+    // TODO(MOCO-5454): Move payload elements out once moving a part out of a
+    // value is sound. Until then the elements of a `__union` payload, and of a
+    // multi-element payload of a hand-written EnumLike type, are copied, as the
+    // elements of a tuple subpattern are.
+    auto *subjectDecl = getStructDecl(emitter.shared, rootType);
+    if (elementTypes.getValues().size() > 1 ||
+        (subjectDecl && subjectDecl->getOp().isUnion()))
       return success();
     for (auto [index, type] : llvm::enumerate(elementTypes.getValues())) {
       PatternPath child{};
@@ -2123,7 +2223,7 @@ static bool collectFiniteDims(PatternMatchBuilder &builder,
   ASTType type = path->type;
   if (type.provenConformsToBuiltinTrait(
           "EnumLike", loc, builder.shared,
-          ASTDecl::getAssumptionsFromScope(&builder.declScope))) {
+          builder.declScope.getScopeAssumptions())) {
     IREmitter emitter = builder.getParamEmitter();
     auto names = getEnumCaseNames(emitter, type, loc);
     auto isExhaustive = getEnumIsExhaustive(emitter, type, loc);
@@ -2134,9 +2234,9 @@ static bool collectFiniteDims(PatternMatchBuilder &builder,
           "EnumLike type");
       return false;
     }
-    if (!names || names->empty() || isExhaustive.isFalse())
+    if (failed(names) || !*names || (*names)->empty() || isExhaustive.isFalse())
       return false;
-    dims.push_back({path, names->size(), *names});
+    dims.push_back({path, (*names)->size(), **names});
     return true;
   }
 
@@ -2187,11 +2287,11 @@ static MatchCoveringSpace *createRootCoveringSpace(PatternMatchBuilder &builder,
   // EnumLike root → closed or open constructor space.
   if (subjectType.provenConformsToBuiltinTrait(
           "EnumLike", matchLoc, builder.shared,
-          ASTDecl::getAssumptionsFromScope(&builder.declScope))) {
+          builder.declScope.getScopeAssumptions())) {
     IREmitter emitter = builder.getParamEmitter();
     auto names = getEnumCaseNames(emitter, subjectType, matchLoc);
     auto isExhaustive = getEnumIsExhaustive(emitter, subjectType, matchLoc);
-    if (!names || names->empty())
+    if (failed(names) || !*names || (*names)->empty())
       return space; // Opaque — incomplete reflection metadata
     if (isExhaustive.isUnknown()) {
       builder.emitError(
@@ -2203,8 +2303,8 @@ static MatchCoveringSpace *createRootCoveringSpace(PatternMatchBuilder &builder,
 
     space->kind = isExhaustive.isTrue() ? MatchCoveringSpace::Kind::FiniteCtors
                                         : MatchCoveringSpace::Kind::OpenCtors;
-    space->numCtors = names->size();
-    space->caseNames = *names;
+    space->numCtors = (*names)->size();
+    space->caseNames = **names;
     space->remaining = builder.allocator.allocate<bool>(space->numCtors);
     std::fill(space->remaining, space->remaining + space->numCtors, true);
     return space;
@@ -2644,7 +2744,8 @@ static bool isBuiltinBool(PatternMatchBuilder &builder, ASTType type,
 
 /// Spell case `ctor` of the enum at `path` as a pattern: `False` for a `Bool`,
 /// otherwise an inferred member such as `.Some`, which only tests the tag and
-/// so is valid whether or not the case carries a payload.
+/// so is valid whether or not the case carries a payload. A union's case takes
+/// its parentheses, with a `_` per payload element: `.eof()`, `.span(_, _)`.
 static std::string spellCasePattern(PatternMatchBuilder &builder,
                                     const PatternPath *path,
                                     ArrayRef<TypedAttr> caseNames, size_t ctor,
@@ -2652,6 +2753,14 @@ static std::string spellCasePattern(PatternMatchBuilder &builder,
   StringRef name = caseNameSpelling(caseNames, ctor);
   if (isBuiltinBool(builder, path->type, loc))
     return name.str();
+  if (isUnionType(builder.shared, path->type)) {
+    IREmitter emitter = builder.getParamEmitter();
+    SyntheticNode node(loc);
+    if (ASTType payloadType =
+            getCasePayloadType(emitter, path->type, ctor, &node))
+      if (auto subpatterns = spellUnionCaseSubpatterns(payloadType))
+        return ("." + name + *subpatterns).str();
+  }
   return ("." + name).str();
 }
 

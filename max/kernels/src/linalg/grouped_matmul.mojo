@@ -21,7 +21,12 @@ from std.sys.info import (
     has_amd_rdna_gpu_accelerator,
 )
 
-from max.gpu.host import DeviceBuffer, DeviceContext, get_gpu_target
+from max.gpu.host import (
+    DeviceBuffer,
+    DeviceContext,
+    GridBlockLaunchConfig,
+    get_gpu_target,
+)
 from max.gpu.host.nvidia.tma import TensorMapSwizzle
 from max.gpu.host.info import H100, _is_sm10x_gpu, is_gpu
 from max.gpu import (
@@ -44,6 +49,7 @@ from std.collections.string.string_span import get_static_string
 
 from max.gpu.compute.arch.mma_nvidia_sm100 import *
 from max.gpu.compute.arch.tcgen05 import *
+from algorithm.bisect import bisect_right
 from layout import (
     Coord,
     Idx,
@@ -352,6 +358,7 @@ def grouped_matmul_amd_kernel_launcher[
 
     # Takes this group's rows from 0; the epilogues take rows of all of `c`.
     @inline(.always)
+    @__allow_legacy_any_origin_fields
     def group_epilogue_fn[
         dtype: DType, width: SIMDLength, *, alignment: Int
     ](idx: Coord, val: SIMD[dtype, width]) {
@@ -664,9 +671,11 @@ def grouped_matmul_amd[
             a_offsets,
             expert_ids,
             Int32(num_active_experts),
+            execution_config=GridBlockLaunchConfig(
+                grid_dim=(ceildiv(N, config.block_tile_shape[1]), grid_y, 1),
+                block_dim=(block_dim),
+            ),
             host_args=(epilogue_fn, compute_fn),
-            grid_dim=(ceildiv(N, config.block_tile_shape[1]), grid_y, 1),
-            block_dim=(block_dim),
         )
 
     # Dispatch to the best configuration based on runtime dimensions
@@ -1215,13 +1224,15 @@ def naive_grouped_matmul[
         b.as_imm(),
         a_offsets,
         expert_ids,
-        host_args=(epilogue_fn, compute_fn),
-        grid_dim=(
-            ceildiv(Int(c.dim[1]()), 32),
-            ceildiv(max_num_tokens_per_expert, 16),
-            num_active_experts,
+        execution_config=GridBlockLaunchConfig(
+            grid_dim=(
+                ceildiv(Int(c.dim[1]()), 32),
+                ceildiv(max_num_tokens_per_expert, 16),
+                num_active_experts,
+            ),
+            block_dim=(32, 16, 1),
         ),
-        block_dim=(32, 16, 1),
+        host_args=(epilogue_fn, compute_fn),
     )
 
 
@@ -1686,17 +1697,19 @@ def grouped_matmul_rowwise_dynamic_scaled_fp8[
             ), "the matmul epilogue contract is rank 2"
             var row = Int(idx[0])
             var col = Int(idx[1])
+
             # Last group whose start is at or before `row`; empty groups share
             # a start with their successor, so this lands on the non-empty one.
-            var lo = 0
-            var hi = num_active_experts - 1
-            while lo < hi:
-                var mid = (lo + hi + 1) // 2
-                if Int(a_offsets[mid]) <= row:
-                    lo = mid
-                else:
-                    hi = mid - 1
-            var expert = Int(expert_ids[lo])
+            var group = max(
+                bisect_right(
+                    num_active_experts,
+                    row,
+                    lambda (i: Int) {a_offsets} -> Int: Int(a_offsets[i]),
+                )
+                - 1,
+                0,
+            )
+            var expert = Int(expert_ids[group])
             if expert < 0:
                 return val
             var a_scale = a_scales.load[width=1]((row, Idx[0])).cast[.float32]()

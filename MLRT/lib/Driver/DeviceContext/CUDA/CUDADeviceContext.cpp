@@ -24,12 +24,12 @@
 #include "MLRT/Driver/DeviceContext/LaunchTraceRegistry.h"
 #include "MLRT/lib/Driver/DeviceContext/AcceleratorArch.h"
 #include "MLRT/lib/Driver/DeviceContext/HostMemoryInfo.h"
-#include "MLRT/lib/Driver/DeviceContext/MemoryManager.h"
 #include "MLRT/lib/Driver/DeviceContext/PinnedCompletionFlag.h"
+#include "MLRT/lib/Driver/MemoryManager/MemoryManager.h"
 #include "NVML.h"
 #include "Support/HashUtils.h"
 #include "Support/Profiling/Ranges.h"
-#include "Support/max_license/Tracy/Tracy.h"
+#include "Support/max_license/Profiling/ProfileRange.h"
 #include "Support/max_license/Tracy/TracyCuda.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/ScopeExit.h"
@@ -37,6 +37,7 @@
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/Process.h"
 #include "llvm/Support/Threading.h"
+#include <algorithm>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -636,12 +637,45 @@ int CUDADevice::deviceCount() const {
   return *errOrCount;
 }
 
+// cuMemAllocHost's 4 KiB pages make GPU random access slow on GB10.
+// Write-combined memory avoids that and stays CPU-cached there, but is
+// CPU-uncached elsewhere, including Jetson Orin, which lacks host page tables.
+bool CUDADevice::useWriteCombinedHostAlloc() const {
+  std::call_once(writeCombinedHostAllocOnce_, [&]() {
+    auto hasAttribute = [&](CUdevice_attribute attr) {
+      int value = 0;
+      return driver_.cuDeviceGetAttribute(&value, attr, cudaDevice_) ==
+                 CUDADriver::SUCCESS &&
+             value != 0;
+    };
+    bool isIntegrated = hasAttribute(CUdevice_attribute::INTEGRATED);
+    bool readsHostPageTables = hasAttribute(
+        CUdevice_attribute::PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES);
+    writeCombinedHostAllocCached_ = isIntegrated && readsHostPageTables;
+  });
+  return writeCombinedHostAllocCached_;
+}
+
+ErrorOrSuccess CUDADevice::hostAlloc(void **ptr, size_t byteSize) const {
+  if (useWriteCombinedHostAlloc()) {
+    constexpr unsigned int kPortable = 0x1;
+    constexpr unsigned int kDeviceMap = 0x2;
+    constexpr unsigned int kWriteCombined = 0x4;
+    // PORTABLE and DEVICEMAP match cuMemAllocHost's semantics.
+    CUDA_CHECK_ERR(driver_.cuMemHostAlloc(
+        ptr, byteSize, kPortable | kDeviceMap | kWriteCombined));
+  } else {
+    CUDA_CHECK_ERR(driver_.cuMemAllocHost_v2(ptr, byteSize));
+  }
+  return success();
+}
+
 ErrorOrSuccess CUDADevice::chunkAlloc(void **ptr, size_t byteSize,
                                       bool isHost) {
   assert(byteSize != 0);
   CUDA_WITH_DEV_ERR(*this);
   if (isHost) {
-    CUDA_CHECK_ERR(driver_.cuMemAllocHost_v2(ptr, byteSize));
+    RETURN_IF_ERROR(hostAlloc(ptr, byteSize));
   } else {
     CUDA_CHECK_ERR(driver_.cuMemAlloc_v2(ptr, byteSize));
   }
@@ -1685,8 +1719,8 @@ const std::string &CUDADeviceFunction::name() const {
 ErrorOrSuccess CUDADeviceFunction::copyToNamedConstant(const char *name,
                                                        const void *data,
                                                        size_t byteSize) {
-  TRACY_ZONE_SCOPED_NC("CUDADeviceFunction::copyToNamedConstant",
-                       TRACY_COLOR_PURPLE);
+  M_PROFILE_SPAN("CUDADeviceFunction::copyToNamedConstant",
+                 M_PROFILE_COLOR_PURPLE);
   CUdeviceptr devicePtr;
   size_t deviceSize;
   const auto &cudaContext = CUDADeviceContext::cast(context());
@@ -1825,7 +1859,7 @@ CUDADeviceContext::CUDADeviceContext(CUDADevice &device, CUcontext context,
 
 ErrorOrSuccess CUDADeviceContext::memAlloc(void **ptr, size_t byteSize,
                                            Device::AllocMode mode) {
-  TRACY_ZONE_SCOPED_NC("CUDADeviceContext::memAlloc", TRACY_COLOR_PURPLE);
+  M_PROFILE_SPAN("CUDADeviceContext::memAlloc", M_PROFILE_COLOR_PURPLE);
 
   assert(byteSize != 0);
   CUDA_WITH_CTX_ERR(*this);
@@ -1840,9 +1874,9 @@ ErrorOrSuccess CUDADeviceContext::memAlloc(void **ptr, size_t byteSize,
     break;
   }
   case Device::AllocMode::HOST: {
-    // We must poll here since cuMemAllocHost_v2 is synchronous.
+    // We must poll here since host allocation is synchronous.
     POLL_PENDING_EVENTS(*this);
-    CUDA_CHECK_ERR(driver_.cuMemAllocHost_v2(ptr, byteSize));
+    RETURN_IF_ERROR(CUDADevice::cast(device()).hostAlloc(ptr, byteSize));
     break;
   }
   case Device::AllocMode::SYNC: {
@@ -1856,7 +1890,7 @@ ErrorOrSuccess CUDADeviceContext::memAlloc(void **ptr, size_t byteSize,
 
 ErrorOrSuccess CUDADeviceContext::memWrap(void **devPtr, void *hostPtr,
                                           size_t byteSize) {
-  TRACY_ZONE_SCOPED_NC("CUDADeviceContext::memWrap", TRACY_COLOR_PURPLE);
+  M_PROFILE_SPAN("CUDADeviceContext::memWrap", M_PROFILE_COLOR_PURPLE);
   CUDA_WITH_CTX_ERR(*this);
   // CU_MEMHOSTREGISTER_PORTABLE (0x1): the registration is visible from every
   // context in the process
@@ -1868,7 +1902,7 @@ ErrorOrSuccess CUDADeviceContext::memWrap(void **devPtr, void *hostPtr,
 }
 
 ErrorOrSuccess CUDADeviceContext::memFree(void *ptr, Device::FreeKind kind) {
-  TRACY_ZONE_SCOPED_NC("CUDADeviceContext::memFree", TRACY_COLOR_PURPLE);
+  M_PROFILE_SPAN("CUDADeviceContext::memFree", M_PROFILE_COLOR_PURPLE);
 
   CUDA_WITH_CTX_ERR(*this);
   if (kind == Device::FreeKind::WRAPPED) {
@@ -1905,8 +1939,8 @@ ErrorOrSuccess CUDADeviceContext::memFree(void *ptr, Device::FreeKind kind) {
 }
 
 ErrorOr<CompletionFlagRef> CUDADeviceContext::allocateCompletionFlag() {
-  TRACY_ZONE_SCOPED_NC("CUDADeviceContext::allocateCompletionFlag",
-                       TRACY_COLOR_PURPLE);
+  M_PROFILE_SPAN("CUDADeviceContext::allocateCompletionFlag",
+                 M_PROFILE_COLOR_PURPLE);
   CUDA_WITH_CTX_ERR(*this);
   POLL_PENDING_EVENTS(*this);
   void *hostPtr = nullptr;
@@ -1935,8 +1969,8 @@ ErrorOr<CompletionFlagRef> CUDADeviceContext::allocateCompletionFlag() {
 }
 
 ErrorOrSuccess CUDADeviceContext::freeCompletionFlag(void *hostPtr) {
-  TRACY_ZONE_SCOPED_NC("CUDADeviceContext::freeCompletionFlag",
-                       TRACY_COLOR_PURPLE);
+  M_PROFILE_SPAN("CUDADeviceContext::freeCompletionFlag",
+                 M_PROFILE_COLOR_PURPLE);
   CUDA_WITH_CTX_ERR(*this);
   POLL_PENDING_EVENTS(*this);
   CUDA_CHECK_ERR(driver_.cuMemFreeHost(hostPtr));
@@ -1972,8 +2006,8 @@ void *CUDADeviceContext::driverContext() const { return cudaContext(); }
 ErrorOrSuccess CUDADeviceContext::enqueueCopyToDevice(void *dst,
                                                       const void *src,
                                                       size_t byteSize) {
-  TRACY_ZONE_SCOPED_NC("CUDADeviceContext::enqueueCopyToDevice",
-                       TRACY_COLOR_PURPLE);
+  M_PROFILE_SPAN("CUDADeviceContext::enqueueCopyToDevice",
+                 M_PROFILE_COLOR_PURPLE);
   CUDA_WITH_CTX_ERR(*this);
 
   CUDA_CHECK_ERR(driver_.cuMemcpyHtoDAsync_v2(dst, src, byteSize, stream_));
@@ -1992,8 +2026,8 @@ ErrorOrSuccess CUDADeviceContext::enqueueCopyToDevice(void *dst,
 ErrorOrSuccess CUDADeviceContext::enqueueCopyFromDevice(void *dst,
                                                         const void *src,
                                                         size_t byteSize) {
-  TRACY_ZONE_SCOPED_NC("CUDADeviceContext::enqueueCopyFromDevice",
-                       TRACY_COLOR_PURPLE);
+  M_PROFILE_SPAN("CUDADeviceContext::enqueueCopyFromDevice",
+                 M_PROFILE_COLOR_PURPLE);
   CUDA_WITH_CTX_ERR(*this);
 
   CUDA_CHECK_ERR(driver_.cuMemcpyDtoHAsync_v2(dst, const_cast<void *>(src),
@@ -2015,7 +2049,7 @@ ErrorOrSuccess CUDADeviceContext::memCopyDtoD(DeviceBuffer &dst,
                                               size_t srcByteOffset,
                                               size_t srcByteSize,
                                               bool crossStreamSync) {
-  TRACY_ZONE_SCOPED_NC("CUDADeviceContext::memCopyDtoD", TRACY_COLOR_PURPLE);
+  M_PROFILE_SPAN("CUDADeviceContext::memCopyDtoD", M_PROFILE_COLOR_PURPLE);
 
   CHECK_IS_CUDA_ERR(src.context().device());
   CHECK_IS_CUDA_ERR(dst.context().device());
@@ -2083,7 +2117,7 @@ ErrorOrSuccess CUDADeviceContext::memCopyDtoD(DeviceBuffer &dst,
 ErrorOrSuccess
 CUDADeviceContext::memBatchCopy(llvm::ArrayRef<DeviceBuffer *> dsts,
                                 llvm::ArrayRef<DeviceBuffer *> srcs) {
-  TRACY_ZONE_SCOPED_NC("CUDADeviceContext::memBatchCopy", TRACY_COLOR_PURPLE);
+  M_PROFILE_SPAN("CUDADeviceContext::memBatchCopy", M_PROFILE_COLOR_PURPLE);
   const size_t count = dsts.size();
 
   // No cuMemcpyBatchAsync (pre-CUDA 12.8): use the scalar loop.
@@ -2174,8 +2208,7 @@ CUDADeviceContext::memBatchCopy(llvm::ArrayRef<DeviceBuffer *> dsts,
 ErrorOrSuccess CUDADeviceContext::enqueueSetMemory(void *dst, size_t byteSize,
                                                    uint64_t val,
                                                    size_t valSize) {
-  TRACY_ZONE_SCOPED_NC("CUDADeviceContext::enqueueSetMemory",
-                       TRACY_COLOR_PURPLE);
+  M_PROFILE_SPAN("CUDADeviceContext::enqueueSetMemory", M_PROFILE_COLOR_PURPLE);
 
   CUDA_WITH_CTX_ERR(*this);
   if (valSize == 1) {
@@ -2280,15 +2313,13 @@ setupCompilationOptions(StringRef debugLevel, int32_t optimizationLevel) {
 
 ErrorOr<DeviceFunctionRef>
 CUDADeviceContext::loadFunction(StringRef moduleName, StringRef functionName,
-                                StringRef code, int32_t maxDynamicSharedBytes,
-                                StringRef debugLevel,
+                                StringRef code, StringRef debugLevel,
                                 int32_t optimizationLevel) {
-  TRACY_ZONE_SCOPED_NC("CUDADeviceContext::loadFunction", TRACY_COLOR_PURPLE);
+  M_PROFILE_SPAN("CUDADeviceContext::loadFunction", M_PROFILE_COLOR_PURPLE);
   Device::FunctionCacheKey key{
       /*name=*/Device::FunctionCacheKey::moduleCacheName(moduleName, code),
       /*functionName=*/functionName.str(),
       /*debugLevel=*/debugLevel.str(),
-      /*maxDynamicSharedBytes=*/maxDynamicSharedBytes,
       /*optimizationLevel=*/optimizationLevel};
   DeviceFunctionCacheEntryRef entry = device().findInFunctionCache(key);
   if (entry.getPointer() != nullptr && !bypassFunctionCache_) {
@@ -2343,12 +2374,20 @@ CUDADeviceContext::loadFunction(StringRef moduleName, StringRef functionName,
       CUfunction_attribute::FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED,
       1));
 
-  if (maxDynamicSharedBytes >= 0) {
-    CUDA_CHECK_ERR(driver_.cuFuncSetAttribute(
-        function,
-        CUfunction_attribute::FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-        maxDynamicSharedBytes));
-  }
+  // CUDA caps dynamic shared memory at 48 KB by default. The cap only limits
+  // what a launch may ask for, so raise it to the device max once at load.
+  int optinBytes = 0;
+  CUDA_CHECK_ERR(driver_.cuDeviceGetAttribute(
+      &optinBytes, CUdevice_attribute::MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+      CUDADevice::cast(device()).cudaDevice()));
+  int staticBytes = 0;
+  CUDA_CHECK_ERR(driver_.cuFuncGetAttribute(
+      &staticBytes, CUfunction_attribute::FUNC_ATTRIBUTE_SHARED_SIZE_BYTES,
+      function));
+  CUDA_CHECK_ERR(driver_.cuFuncSetAttribute(
+      function,
+      CUfunction_attribute::FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+      std::max(optinBytes - staticBytes, 0)));
 
   // Allocate func outside of the lock region to reduce the time spent under
   // lock. If this functionName has been registered concurrently, then we will
@@ -2368,8 +2407,8 @@ ErrorOrSuccess CUDADeviceContext::enqueueFunctionExecDirect(
     uint32_t blockX, uint32_t blockY, uint32_t blockZ, uint32_t sharedMemBytes,
     void *attrs, uint32_t numAttrs, void **args, uint32_t argCount,
     const size_t *argSizes) {
-  TRACY_ZONE_SCOPED_NC("CUDADeviceContext::enqueueFunctionExecDirect",
-                       TRACY_COLOR_PURPLE);
+  M_PROFILE_SPAN("CUDADeviceContext::enqueueFunctionExecDirect",
+                 M_PROFILE_COLOR_PURPLE);
 
   const auto &cudaFunc = CUDADeviceFunction::cast(func);
 
@@ -2490,7 +2529,7 @@ CUDADeviceContext::createExternalStream(void *externalStream) {
 }
 
 ErrorOrSuccess CUDADeviceContext::synchronize() {
-  TRACY_ZONE_SCOPED_NC("CUDADeviceContext::synchronize", TRACY_COLOR_PURPLE);
+  M_PROFILE_SPAN("CUDADeviceContext::synchronize", M_PROFILE_COLOR_PURPLE);
 
   CUDA_WITH_CTX_ERR(*this);
   CUDA_CHECK_ERR(driver_.cuStreamSynchronize(stream_));
@@ -2501,7 +2540,7 @@ ErrorOrSuccess CUDADeviceContext::synchronize() {
 }
 
 ErrorOr<DeviceEventRef> CUDADeviceContext::enqueueEvent() {
-  TRACY_ZONE_SCOPED_NC("CUDADeviceContext::enqueueEvent", TRACY_COLOR_PURPLE);
+  M_PROFILE_SPAN("CUDADeviceContext::enqueueEvent", M_PROFILE_COLOR_PURPLE);
 
   CUDA_WITH_CTX_ERR(*this);
   const bool recordedDuringCapture = isStreamCapturing(driver_, stream_);
@@ -2533,7 +2572,7 @@ bool CUDADeviceContext::isBaseStreamCapturing() const {
 }
 
 ErrorOrSuccess CUDADeviceContext::enqueueEvent(const DeviceEvent &event) {
-  TRACY_ZONE_SCOPED_NC("CUDADeviceContext::enqueueEvent", TRACY_COLOR_PURPLE);
+  M_PROFILE_SPAN("CUDADeviceContext::enqueueEvent", M_PROFILE_COLOR_PURPLE);
 
   CUDA_WITH_CTX_ERR(*this);
   CUDA_CHECK_ERR(
@@ -2542,7 +2581,7 @@ ErrorOrSuccess CUDADeviceContext::enqueueEvent(const DeviceEvent &event) {
 }
 
 ErrorOr<DeviceEventRef> CUDADeviceContext::eventCreate(bool enableTiming) {
-  TRACY_ZONE_SCOPED_NC("CUDADeviceContext::eventCreate", TRACY_COLOR_PURPLE);
+  M_PROFILE_SPAN("CUDADeviceContext::eventCreate", M_PROFILE_COLOR_PURPLE);
 
   const bool recordedDuringCapture = isStreamCapturing(driver_, stream_);
 
@@ -2569,7 +2608,7 @@ ErrorOr<DeviceEventRef> CUDADeviceContext::eventCreate(bool enableTiming) {
 }
 
 ErrorOrSuccess CUDADeviceContext::enqueueWaitFor(DeviceEvent &event) {
-  TRACY_ZONE_SCOPED_NC("CUDADeviceContext::enqueueWaitFor", TRACY_COLOR_PURPLE);
+  M_PROFILE_SPAN("CUDADeviceContext::enqueueWaitFor", M_PROFILE_COLOR_PURPLE);
 
   const auto &cudaEvent = CUDADeviceEvent::cast(event);
   CUDA_WITH_CTX_ERR(*this);
@@ -2579,7 +2618,7 @@ ErrorOrSuccess CUDADeviceContext::enqueueWaitFor(DeviceEvent &event) {
 }
 
 ErrorOrSuccess CUDADeviceContext::enqueueWaitFor(DeviceContext &ctx) {
-  TRACY_ZONE_SCOPED_NC("CUDADeviceContext::enqueueWaitFor", TRACY_COLOR_PURPLE);
+  M_PROFILE_SPAN("CUDADeviceContext::enqueueWaitFor", M_PROFILE_COLOR_PURPLE);
 
   DEFINE_OR_RETURN_ERROR(DeviceEventRef, event, ctx.enqueueEvent());
   RETURN_IF_ERROR(enqueueWaitFor(*event));

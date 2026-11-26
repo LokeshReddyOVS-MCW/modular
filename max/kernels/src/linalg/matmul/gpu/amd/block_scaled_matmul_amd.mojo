@@ -71,7 +71,7 @@ from max.gpu import (
     warp_id,
 )
 from max.gpu.sync import barrier
-from max.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext, GridBlockLaunchConfig
 from max.gpu.sync import (
     AMDScheduleBarrierMask,
     schedule_barrier,
@@ -1389,6 +1389,7 @@ struct BlockScaledMatmulAMD[
         var k_scale_counter = split_id * tiles_per_split
 
         @inline(.always)
+        @__allow_legacy_any_origin_fields
         def load_tiles_from_dram() {mut k_counter, imm}:
             """Load one BK-wide tile from DRAM to register buffers."""
             var a_block = a_blockrow.tile[Self.BM, A_BK_BYTES](0, k_counter)
@@ -1476,6 +1477,7 @@ struct BlockScaledMatmulAMD[
                     store_b()
 
         @inline(.always)
+        @__allow_legacy_any_origin_fields
         def load_scales_from_dram() {mut k_scale_counter, imm}:
             """Cooperatively read one BK iteration's scale tiles to registers.
 
@@ -1969,9 +1971,11 @@ def _launch_block_scaled_impl[
             b,
             a_scales,
             b_scales,
+            execution_config=GridBlockLaunchConfig(
+                grid_dim=(ceildiv(N, BN), ceildiv(M, BM)),
+                block_dim=Kernel.num_threads,
+            ),
             host_args=(epilogue_fn,),
-            grid_dim=(ceildiv(N, BN), ceildiv(M, BM)),
-            block_dim=Kernel.num_threads,
         )
     elif has_compute_fn:
         comptime kernel = Kernel.run_with_compute_fn[
@@ -1994,9 +1998,11 @@ def _launch_block_scaled_impl[
             b,
             a_scales,
             b_scales,
+            execution_config=GridBlockLaunchConfig(
+                grid_dim=(ceildiv(N, BN), ceildiv(M, BM)),
+                block_dim=Kernel.num_threads,
+            ),
             host_args=(compute_fn,),
-            grid_dim=(ceildiv(N, BN), ceildiv(M, BM)),
-            block_dim=Kernel.num_threads,
         )
     else:
         comptime kernel = Kernel.run[
@@ -2018,8 +2024,10 @@ def _launch_block_scaled_impl[
             b,
             a_scales,
             b_scales,
-            grid_dim=(ceildiv(N, BN), ceildiv(M, BM)),
-            block_dim=Kernel.num_threads,
+            execution_config=GridBlockLaunchConfig(
+                grid_dim=(ceildiv(N, BN), ceildiv(M, BM)),
+                block_dim=Kernel.num_threads,
+            ),
         )
 
 
@@ -2185,8 +2193,10 @@ def _launch_block_scaled_split_k_impl[
         b,
         a_scales,
         b_scales,
-        grid_dim=(ceildiv(N, BN), ceildiv(M, BM), num_splits),
-        block_dim=Kernel.num_threads,
+        execution_config=GridBlockLaunchConfig(
+            grid_dim=(ceildiv(N, BN), ceildiv(M, BM), num_splits),
+            block_dim=Kernel.num_threads,
+        ),
     )
 
     # Reduce + cast on the same stream — naturally serialized after the
@@ -2209,9 +2219,11 @@ def _launch_block_scaled_split_k_impl[
             Int32(total_elems),
             Int32(elems_per_split),
             Int32(N),
+            execution_config=GridBlockLaunchConfig(
+                grid_dim=num_blocks,
+                block_dim=block_dim_x,
+            ),
             host_args=(epilogue_fn,),
-            grid_dim=num_blocks,
-            block_dim=block_dim_x,
         )
     elif has_compute_fn:
         comptime reduce_kernel = _split_k_reduce_kernel_compute_fn[
@@ -2227,9 +2239,11 @@ def _launch_block_scaled_split_k_impl[
             Int32(total_elems),
             Int32(elems_per_split),
             Int32(N),
+            execution_config=GridBlockLaunchConfig(
+                grid_dim=num_blocks,
+                block_dim=block_dim_x,
+            ),
             host_args=(compute_fn,),
-            grid_dim=num_blocks,
-            block_dim=block_dim_x,
         )
     else:
         comptime reduce_kernel = _split_k_reduce_kernel[
@@ -2244,8 +2258,10 @@ def _launch_block_scaled_split_k_impl[
             Int32(total_elems),
             Int32(elems_per_split),
             Int32(N),
-            grid_dim=num_blocks,
-            block_dim=block_dim_x,
+            execution_config=GridBlockLaunchConfig(
+                grid_dim=num_blocks,
+                block_dim=block_dim_x,
+            ),
         )
 
     # Keep the workspace alive until both kernels are enqueued.
@@ -3398,8 +3414,10 @@ def _launch_block_scaled_preb_impl[
         a_scales_pre_dst_tt,
         Int32(M),
         Int32(a_scale_pad),
-        grid_dim=ceildiv(total_scale_cells, PRESHUFFLE_BLOCK),
-        block_dim=PRESHUFFLE_BLOCK,
+        execution_config=GridBlockLaunchConfig(
+            grid_dim=ceildiv(total_scale_cells, PRESHUFFLE_BLOCK),
+            block_dim=PRESHUFFLE_BLOCK,
+        ),
     )
 
     var a_scales_pre_view = TileTensor[mut=False, Engine=_](
@@ -3435,15 +3453,17 @@ def _launch_block_scaled_preb_impl[
             b_pre,
             a_scales_pre_view,
             b_scales_pre,
+            execution_config=GridBlockLaunchConfig(
+                grid_dim=(N // BN, ceildiv(M, BM)),
+                block_dim=BlockScaledMatmulAMD_PreB[
+                    BM=BM,
+                    BN=BN,
+                    BK_ELEMS=BK_ELEMS,
+                    WN=WN,
+                    matrix_format=matrix_format,
+                ].num_threads,
+            ),
             host_args=(epilogue_fn,),
-            grid_dim=(N // BN, ceildiv(M, BM)),
-            block_dim=BlockScaledMatmulAMD_PreB[
-                BM=BM,
-                BN=BN,
-                BK_ELEMS=BK_ELEMS,
-                WN=WN,
-                matrix_format=matrix_format,
-            ].num_threads,
         )
     elif has_compute_fn:
         comptime kernel = _preb_grid_kernel_compute_fn[
@@ -3473,15 +3493,17 @@ def _launch_block_scaled_preb_impl[
             b_pre,
             a_scales_pre_view,
             b_scales_pre,
+            execution_config=GridBlockLaunchConfig(
+                grid_dim=(N // BN, ceildiv(M, BM)),
+                block_dim=BlockScaledMatmulAMD_PreB[
+                    BM=BM,
+                    BN=BN,
+                    BK_ELEMS=BK_ELEMS,
+                    WN=WN,
+                    matrix_format=matrix_format,
+                ].num_threads,
+            ),
             host_args=(compute_fn,),
-            grid_dim=(N // BN, ceildiv(M, BM)),
-            block_dim=BlockScaledMatmulAMD_PreB[
-                BM=BM,
-                BN=BN,
-                BK_ELEMS=BK_ELEMS,
-                WN=WN,
-                matrix_format=matrix_format,
-            ].num_threads,
         )
     else:
         comptime kernel = _preb_grid_kernel[
@@ -3510,14 +3532,16 @@ def _launch_block_scaled_preb_impl[
             b_pre,
             a_scales_pre_view,
             b_scales_pre,
-            grid_dim=(N // BN, ceildiv(M, BM)),
-            block_dim=BlockScaledMatmulAMD_PreB[
-                BM=BM,
-                BN=BN,
-                BK_ELEMS=BK_ELEMS,
-                WN=WN,
-                matrix_format=matrix_format,
-            ].num_threads,
+            execution_config=GridBlockLaunchConfig(
+                grid_dim=(N // BN, ceildiv(M, BM)),
+                block_dim=BlockScaledMatmulAMD_PreB[
+                    BM=BM,
+                    BN=BN,
+                    BK_ELEMS=BK_ELEMS,
+                    WN=WN,
+                    matrix_format=matrix_format,
+                ].num_threads,
+            ),
         )
     _ = a_scales_pre_d^
 

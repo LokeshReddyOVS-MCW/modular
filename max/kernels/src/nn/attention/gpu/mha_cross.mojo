@@ -127,6 +127,7 @@ def _bmm0_bs[
                 batch, x, kv_head, 0
             )
 
+            @__allow_legacy_any_origin_fields
             def accum_fn[
                 width: Int
             ](offset: Int) {q, y, _num_heads, _depth, k_ptr, mut}:
@@ -392,7 +393,7 @@ def mha_cross_gpu_naive[
         comptime assert p_buffer.flat_rank >= coords.flat_rank
         return p_buffer.load[width=_simd_width](coords)
 
-    _softmax_gpu[p_type, 1, 3](
+    _softmax_gpu[p_type, 1](
         input_fn_device,
         Coord(batch_size * num_heads, q_max_seq_len, num_keys),
         p_buffer,

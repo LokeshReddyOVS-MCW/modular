@@ -237,7 +237,7 @@ void OriginPrinter::print(raw_ostream &os, TypedAttr param,
     return;
   }
 
-  if (isa<UnknownAttr, UnboundAttr, SingletonAttr>(param)) {
+  if (isa<UnknownAttr, SingletonAttr>(param)) {
     os << "_";
     return;
   }
@@ -483,10 +483,10 @@ void LIT::printFnType(AsmPrinter &p, FuncType signature) {
     VariadicKind variadicness = argListAttr.getVariadicKind(i);
     if (variadicness == VariadicKind::PosVarArg ||
         variadicness == VariadicKind::PackVarArg) {
-      assert(argConv == ArgConvention::ImmMem ||
-             argConv == ArgConvention::Mut ||
-             argConv == ArgConvention::OwnedMem ||
-             argConv == ArgConvention::OwnedReg);
+      assert(
+          argConv == ArgConvention::ImmMem || argConv == ArgConvention::Mut ||
+          argConv == ArgConvention::OwnedMem ||
+          argConv == ArgConvention::OwnedReg || getPackEltConvention(argConv));
       argConv = signature.getVariadicConvention(i);
     }
     printConventionAndVariadicness(p, argConv, variadicness);
@@ -715,6 +715,25 @@ void LIT::sortAndDeduplicateTraitSymbols(
     return false;
   });
   symbols.erase(std::unique(symbols.begin(), symbols.end()), symbols.end());
+}
+
+SmallVector<ConstraintAttr> LIT::getTraitConstraintsInSymbolOrder(
+    MLIRContext *context, ArrayRef<TraitSymbolAttr> symbols,
+    const DenseMap<TraitSymbolAttr, ConstraintAttr> &constraintMap) {
+  if (constraintMap.empty())
+    return {};
+
+  SmallVector<ConstraintAttr> constraints;
+  constraints.reserve(symbols.size());
+  for (TraitSymbolAttr symbol : symbols) {
+    if (auto it = constraintMap.find(symbol); it != constraintMap.end()) {
+      constraints.push_back(it->second);
+    } else {
+      // FIXME(MOCO-4250): `True` is wrong, should be inherited from parents.
+      constraints.push_back(getUnconditionalConstraint(context));
+    }
+  }
+  return constraints;
 }
 
 std::optional<ParameterEvaluator>
@@ -1016,22 +1035,49 @@ Attribute NameToImplicitOriginRefRemapper::tryReplace(Attribute attr,
 // Constraint Implication
 //===----------------------------------------------------------------------===//
 
-static TypedAttr conjunctionOf(ArrayRef<TypedAttr> propositions,
-                               MLIRContext *ctx) {
+TypedAttr LIT::buildAssumptions(ArrayRef<TypedAttr> propositions,
+                                MLIRContext *ctx) {
   if (propositions.empty())
     return SIMDAttr::getScalarBool(ctx, true);
   if (propositions.size() == 1)
-    return propositions.front();
+    return getCanonicalAttr(propositions.front());
   return ParamOperatorAttr::get(POC::And, propositions);
 }
 
-bool LIT::isPropositionPrecluded(TypedAttr proposition,
-                                 ArrayRef<TypedAttr> assumptions) {
+TypedAttr LIT::buildAssumptions(ArrayRef<ConstraintAttr> constraints,
+                                MLIRContext *ctx) {
+  SmallVector<TypedAttr> propositions = llvm::map_to_vector(
+      constraints, [](ConstraintAttr c) { return c.getProposition(); });
+  return buildAssumptions(propositions, ctx);
+}
+
+TypedAttr LIT::conjoinAssumptions(TypedAttr lhs, TypedAttr rhs) {
+  if (isTriviallyTrueProposition(rhs))
+    return lhs;
+  if (isTriviallyTrueProposition(lhs))
+    return rhs;
+  return ParamOperatorAttr::get(POC::And, {lhs, rhs});
+}
+
+TypedAttr LIT::conjoinAssumptions(TypedAttr assumptions,
+                                  ArrayRef<ConstraintAttr> constraints) {
+  if (constraints.empty())
+    return assumptions;
+  if (isTriviallyTrueProposition(assumptions))
+    return buildAssumptions(constraints, constraints.front().getContext());
+  SmallVector<TypedAttr> operands{assumptions};
+  for (ConstraintAttr constraint : constraints)
+    operands.push_back(constraint.getProposition());
+  return ParamOperatorAttr::get(POC::And, operands);
+}
+
+bool LIT::isPropositionPrecluded(TypedAttr proposition, TypedAttr assumptions) {
   TypedAttr negated = ParamOperatorAttr::getNot(proposition);
   return isPropositionImplied(negated, assumptions).isTrue();
 }
 
 TriBool LIT::isPropositionImplied(TypedAttr proposition, TypedAttr assumption) {
+  assert(assumption && "an assumption set is never null");
   switch (
       testClause(getCanonicalAttr(assumption), getCanonicalAttr(proposition))) {
   case ClauseInsertResult::Redundant:
@@ -1042,29 +1088,6 @@ TriBool LIT::isPropositionImplied(TypedAttr proposition, TypedAttr assumption) {
     return TriBool::unknown();
   }
   llvm_unreachable("unhandled ClauseInsertResult");
-}
-
-TriBool LIT::isPropositionImplied(TypedAttr proposition,
-                                  ArrayRef<TypedAttr> assumptions) {
-  return isPropositionImplied(
-      proposition, conjunctionOf(assumptions, proposition.getContext()));
-}
-
-TriBool LIT::isPropositionImplied(ConstraintAttr proposition,
-                                  ArrayRef<ConstraintAttr> assumptions,
-                                  ParameterEvaluator &evaluator) {
-  TypedAttr propositionAttr = getCanonicalAttr(proposition.getProposition());
-  TypedAttr reboundProposition =
-      getCanonicalAttr(evaluator.getReboundAttribute(propositionAttr));
-  if (isTriviallyTrueProposition(reboundProposition))
-    return TriBool::yes();
-
-  SmallVector<TypedAttr> canonAssumptions;
-  canonAssumptions.reserve(assumptions.size());
-  for (ConstraintAttr assumption : assumptions)
-    canonAssumptions.push_back(getCanonicalAttr(assumption.getProposition()));
-
-  return isPropositionImplied(reboundProposition, canonAssumptions);
 }
 
 void LIT::forEachConformsToInProposition(
@@ -1090,11 +1113,11 @@ void LIT::forEachConformsToInProposition(
 }
 
 TraitType LIT::getTraitBoundFromAssumptions(
-    TypedAttr typeAttr, ArrayRef<ConstraintAttr> assumptions,
+    TypedAttr typeAttr, TypedAttr assumptions,
     llvm::function_ref<TraitDeclOp(SymbolRefAttr)> traitDeclResolver) {
   typeAttr = getCanonicalAttr(typeAttr);
 
-  if (assumptions.empty())
+  if (isTriviallyTrueProposition(assumptions))
     return {};
 
   TypedAttr targetStripped = stripIdentityWrappers(typeAttr);
@@ -1107,21 +1130,17 @@ TraitType LIT::getTraitBoundFromAssumptions(
 
   // Collect trait symbols from all relevant conforms_to constraints.
   SmallVector<TraitSymbolAttr> allTraits;
-  for (ConstraintAttr assumption : assumptions) {
-    forEachConformsToInProposition(
-        assumption.getProposition(), [&](TypeConformsToTraitAttr ct) {
-          TypedAttr striped =
-              stripIdentityWrappers(getCanonicalAttr(ct.getTypeValue()));
-          if (isEqualCanon(striped, targetStripped) ||
-              (targetParamList && isEqualCanon(striped, targetParamList))) {
-            std::optional<ArrayRef<TraitSymbolAttr>> symOr =
-                ct.getTraitSymbols();
-            if (!symOr)
-              return;
-            allTraits.append(symOr->begin(), symOr->end());
-          }
-        });
-  }
+  forEachConformsToInProposition(assumptions, [&](TypeConformsToTraitAttr ct) {
+    TypedAttr striped =
+        stripIdentityWrappers(getCanonicalAttr(ct.getTypeValue()));
+    if (isEqualCanon(striped, targetStripped) ||
+        (targetParamList && isEqualCanon(striped, targetParamList))) {
+      std::optional<ArrayRef<TraitSymbolAttr>> symOr = ct.getTraitSymbols();
+      if (!symOr)
+        return;
+      allTraits.append(symOr->begin(), symOr->end());
+    }
+  });
 
   if (allTraits.empty())
     return {};

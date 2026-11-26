@@ -52,6 +52,28 @@ def _sum_of_squares_plus_bias(x: TensorValue, b: TensorValue) -> TensorValue:
     return ops.sum(x * x, axis=1) + b
 
 
+def _sum_last_of_3d(x: TensorValue) -> TensorValue:
+    return ops.sum(x, axis=2)
+
+
+def _sum_middle_of_5d(x: TensorValue) -> TensorValue:
+    return ops.sum(x, axis=2)
+
+
+def _softmax_last_of_3d(x: TensorValue) -> TensorValue:
+    e = ops.exp(x - ops.max(x, axis=2))
+    return e / ops.sum(e, axis=2)
+
+
+def _rms_norm_last_of_3d(x: TensorValue) -> TensorValue:
+    return x * ops.rsqrt(ops.mean(x * x, axis=2) + 1e-6)
+
+
+def _np_softmax(x: np.ndarray) -> np.ndarray:
+    e = np.exp(x - x.max(2, keepdims=True))
+    return e / e.sum(2, keepdims=True)
+
+
 _CASES: list[
     tuple[
         str,
@@ -68,6 +90,32 @@ _CASES: list[
         _sum_of_squares_plus_bias,
         [[4, 8], [4, 1]],
         lambda x, b: (x * x).sum(1, keepdims=True) + b,
+    ),
+    # Flattened to [12, 9] and [6, 5, 24] by map-flatten.
+    (
+        "sum_last_of_3d",
+        _sum_last_of_3d,
+        [[3, 4, 9]],
+        lambda x: x.sum(2, keepdims=True),
+    ),
+    (
+        "sum_middle_of_5d",
+        _sum_middle_of_5d,
+        [[2, 3, 5, 4, 6]],
+        lambda x: x.sum(2, keepdims=True),
+    ),
+    # A per-element phase after the folds, flattened to [12, 32].
+    (
+        "softmax_last_of_3d",
+        _softmax_last_of_3d,
+        [[3, 4, 32]],
+        _np_softmax,
+    ),
+    (
+        "rms_norm_last_of_3d",
+        _rms_norm_last_of_3d,
+        [[3, 4, 32]],
+        lambda x: x / np.sqrt((x * x).mean(2, keepdims=True) + 1e-6),
     ),
 ]
 
@@ -188,4 +236,28 @@ def test_buffer_store_of_a_rowwise_sum(session: InferenceSession) -> None:
     model(buf, Buffer.from_numpy(x_np))
     np.testing.assert_allclose(
         buf.to_numpy(), x_np.sum(1, keepdims=True), rtol=1e-5, atol=1e-5
+    )
+
+
+def test_rowwise_cache_with_side_output(session: InferenceSession) -> None:
+    """Two reductions, the second over a value the first scales and the
+    graph also outputs, fuse into one rowwise kernel: the scaled value is
+    cached, stored once, and read back by the second reduction and the
+    final scale."""
+    with Graph("cached_side_output", input_types=[_f32([4, 128])]) as graph:
+        x = graph.inputs[0].tensor
+        h = x * _sum_inner(x)
+        graph.output(h * _sum_inner(h), h)
+    model = session.load(graph)
+    rowwise = [s for s in model.kernel_summaries if "Rowwise(" in s]
+    assert len(rowwise) == 1, model.kernel_summaries
+
+    x_np = np.random.default_rng(0).standard_normal((4, 128))
+    x_np = x_np.astype(np.float32)
+    y, h_out = model(Buffer.from_numpy(x_np))
+    assert isinstance(y, Buffer) and isinstance(h_out, Buffer)
+    h_np = x_np * x_np.sum(1, keepdims=True)
+    np.testing.assert_allclose(h_out.to_numpy(), h_np, rtol=1e-5, atol=1e-4)
+    np.testing.assert_allclose(
+        y.to_numpy(), h_np * h_np.sum(1, keepdims=True), rtol=1e-4, atol=1e-3
     )

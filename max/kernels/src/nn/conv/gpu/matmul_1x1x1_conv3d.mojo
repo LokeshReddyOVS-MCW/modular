@@ -30,10 +30,10 @@ the QRSCF dispatch chain, before `dispatch_im2col_matmul_conv3d`.
 """
 
 from std.math import divmod
+from std.sys.info import align_of
 from max.gpu.host import DeviceContext
 from layout import Coord, TileTensor, row_major
 from linalg.matmul.gpu import _matmul_gpu
-from std.utils.index import IndexList
 from nn.conv.conv_utils import (
     ConvSimdComputeFn,
     ConvSimdEpilogueFn,
@@ -56,9 +56,9 @@ def dispatch_1x1x1_matmul_conv3d[
     input: TileTensor[input_type, ...],
     filter: TileTensor[filter_type, ...],
     output: TileTensor[mut=True, output_type, ...],
-    stride: IndexList[3],
-    dilation: IndexList[3],
-    symmetric_padding: IndexList[3],
+    stride: Coord[Int, Int, Int],
+    dilation: Coord[Int, Int, Int],
+    symmetric_padding: Coord[Int, Int, Int],
     num_groups: Int,
     ctx: DeviceContext,
     epilogue_fn: EpilogueFnType = no_conv_simd_epilogue_fn,
@@ -190,7 +190,7 @@ def dispatch_1x1x1_matmul_conv3d[
             var batch_idx, sp = divmod(m_idx, DHW_out)
             var d_idx, rem = divmod(sp, HW_out)
             var h_idx, w_idx = divmod(rem, W_out)
-            epilogue_fn(
+            epilogue_fn[alignment=max(alignment, align_of[output_type]())](
                 (batch_idx, d_idx, h_idx, w_idx, n_idx),
                 rebind[SIMD[output_type, _width]](val),
             )

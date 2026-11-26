@@ -25,25 +25,20 @@ from std._gpu.host.info import (
     TargetAcceleratorType,
 )
 from std._plugin.selector import Plugin
-from std.sys.info import CompilationTarget, _accelerator_arch, _TargetType
+from std.sys.info import CompilationTarget, _accelerator_arch
 
 from max.gpu import PDLLevel
 from max.gpu.globals import WARP_SIZE
 from max.gpu.host import (
     ConstantMemoryMapping,
     DeviceContext,
+    DeviceFunction,
     Dim,
     GridBlockLaunchConfig,
     LaunchAttribute,
 )
 
-# Hooks the legacy `DeviceContext` calls take its types. It still compiles when
-# `--config=hal-device-context` points `max.gpu.host` at the HAL one.
 from max.gpu.host._launch_args import DeviceFunctionWrapper, _IdentityWrapper
-from max.gpu.host._legacy.device_context import (
-    LegacyDeviceContext as _LegacyDeviceContext,
-    LegacyDeviceFunction,
-)
 from max.gpu.host.info import get_gpu_info
 from max.gpu.memory.memory import (
     _AsyncCopyGroupPluginHookFnType,
@@ -55,6 +50,7 @@ from max.gpu.sync.sync import (
     _SyncwarpPluginHookFnType,
 )
 from max._driver.max_license.hal._plugin._trait import (
+    CPUHalPluginHooks,
     DefaultHalPluginHooks,
     HalPluginHooks,
 )
@@ -74,14 +70,6 @@ trait MaxPlugin(Plugin):
 
 trait MaxPluginHooks:
     """Defines compile-time hooks for target-specific MAX behavior."""
-
-    comptime _raw_mlir_target: _TargetType
-    """The target these hooks are for, as its raw MLIR value."""
-
-    comptime hooks_target = CompilationTarget[
-        _mlir_value=Self._raw_mlir_target
-    ]()
-    """The target these hooks are for."""
 
     @staticmethod
     def elementwise_fn[
@@ -386,10 +374,12 @@ trait MaxPluginHooks:
 
     @staticmethod
     def enqueue_function_fn[
-        *Ts: DevicePassable
+        ctx_target: CompilationTarget,
+        //,
+        *Ts: DevicePassable,
     ](
-        ctx: _LegacyDeviceContext[Self.hooks_target],
-        f: LegacyDeviceFunction,
+        ctx: DeviceContext[ctx_target],
+        f: DeviceFunction[target=ctx_target, ...],
         *args: *Ts,
         grid_dim: Dim,
         block_dim: Dim,
@@ -402,6 +392,7 @@ trait MaxPluginHooks:
         """Per-target plugin hook for launching a compiled `DeviceFunction`.
 
         Parameters:
+            ctx_target: The target of the device context.
             Ts: The argument types.
 
         Args:
@@ -428,15 +419,20 @@ trait MaxPluginHooks:
     """Whether this plugin overrides launching a compiled `DeviceFunction`."""
 
     comptime ClosureKernel[
-        ClosureType: RegisterPassable & def() -> None
+        ClosureType: RegisterPassable & def() -> None,
+        closure_target: CompilationTarget,
     ]: ImplicitlyCopyable & Deinitable = NoneType
     """The compiled form of a closure kernel, from `compile_closure_fn`."""
 
     @staticmethod
     def compile_closure_fn[
-        ClosureType: RegisterPassable & def() -> None
-    ](ctx: _LegacyDeviceContext) raises -> Self.ClosureKernel[ClosureType]:
-        """Per-target plugin hook for `DeviceContext.compile_function[ClosureType]`.
+        ctx_target: CompilationTarget,
+        //,
+        ClosureType: RegisterPassable & def() -> None,
+    ](ctx: DeviceContext[ctx_target]) raises -> Self.ClosureKernel[
+        ClosureType, ctx_target
+    ]:
+        """Per-target plugin hook for `DeviceContext.compile_closure`.
 
         Parameters:
             ClosureType: The closure's type.
@@ -455,18 +451,23 @@ trait MaxPluginHooks:
 
     @staticmethod
     def enqueue_closure_fn[
-        ClosureType: RegisterPassable & def() -> None
+        ctx_target: CompilationTarget,
+        //,
+        ClosureType: RegisterPassable & def() -> None,
     ](
-        ctx: _LegacyDeviceContext,
-        kernel: Self.ClosureKernel[ClosureType],
+        ctx: DeviceContext[ctx_target],
+        kernel: Self.ClosureKernel[ClosureType, ctx_target],
         closure: ClosureType,
         grid_dim: Dim,
         block_dim: Dim,
+        num_cores: OptionalReg[Int],
+        thread_mask: OptionalReg[Int],
         location: SourceLocation,
     ) raises:
         """Per-target plugin hook for launching a closure kernel.
 
         Parameters:
+            ctx_target: The target of the device context.
             ClosureType: The closure's type.
 
         Args:
@@ -475,6 +476,8 @@ trait MaxPluginHooks:
             closure: The closure whose captures to launch with.
             grid_dim: The grid dimensions.
             block_dim: The block dimensions.
+            num_cores: A core count that only some targets support.
+            thread_mask: A thread mask that only some targets support.
             location: Source location of the launch.
 
         Only invoked when `_handles_closure_kernels` is `True`; the default
@@ -485,19 +488,16 @@ trait MaxPluginHooks:
     comptime _handles_closure_kernels: Bool = False
     """Whether this plugin compiles and launches closure kernels."""
 
-    comptime _supports_default_compile_function: Bool = True
-    """Whether `DeviceContext.compile_function[func]` can compile `func`
-    unchanged for this target."""
-
     comptime _supports_external_function: Bool = True
     """Whether a `DeviceExternalFunction` can launch on this target."""
 
     @staticmethod
     def whole_device_launch_config() -> GridBlockLaunchConfig:
-        """Per-target plugin hook for `max._graph_blob.launch_config`.
+        """Per-target plugin hook for the graph blob primitive
+        `_graph_blob_launch_config`.
 
-        It runs on the host, so `max._graph_blob` reaches it through the plugin
-        of the device context's target rather than `CurrentMaxPlugin`.
+        It runs on the host, so the primitive reaches it through the plugin of
+        the device context's target rather than `CurrentMaxPlugin`.
 
         Returns:
             A launch on every thread of every core of the device.
@@ -508,8 +508,34 @@ trait MaxPluginHooks:
         return GridBlockLaunchConfig(grid_dim=Dim(1), block_dim=Dim(1))
 
     @staticmethod
+    def elementwise_device_fn[
+        simd_width: Int
+    ](
+        func: Some[def[width: Int, alignment: Int = 1](Coord) -> None],
+        extents: Coord,
+    ):
+        """Per-target plugin hook for the graph blob loop primitive,
+        `_graph_blob_foreach`: runs the calling thread's share of an
+        elementwise loop over `extents`, in a launch whose every thread calls
+        it.
+
+        Parameters:
+            simd_width: The width of a full-width call to `func`.
+
+        Args:
+            func: The body, called with the index of the first element it
+                covers, at `width` elements of one row.
+            extents: The shape of the loop.
+
+        Only invoked when `_handles_graph_blobs` is `True`; the default is
+        never called.
+        """
+        pass
+
+    @staticmethod
     def graph_blob_is_thread_active(active: Int32) -> Bool:
-        """Per-target plugin hook for `max._graph_blob.is_thread_active`.
+        """Per-target plugin hook for the graph blob primitive
+        `_graph_blob_is_thread_active`.
 
         Args:
             active: The number of blocks a call runs on, from the start of
@@ -525,7 +551,8 @@ trait MaxPluginHooks:
 
     @staticmethod
     def graph_blob_barrier():
-        """Per-target plugin hook for `max._graph_blob.barrier`.
+        """Per-target plugin hook for the graph blob primitive
+        `_graph_blob_barrier`.
 
         Only invoked when `_handles_graph_blobs` is `True`; the default is
         never called and is a no-op.
@@ -535,7 +562,7 @@ trait MaxPluginHooks:
     comptime _handles_graph_blobs: Bool = False
     """Whether this plugin implements the hooks a graph blob's kernel calls."""
 
-    comptime HalHooks: HalPluginHooks = DefaultHalPluginHooks[Self.hooks_target]
+    comptime HalHooks: HalPluginHooks = DefaultHalPluginHooks
     """The HAL backend's hooks for this target.
 
     The HAL `DeviceContext` and the HAL client API read their execution
@@ -548,12 +575,20 @@ struct DefaultMaxPlugin(MaxPlugin):
     """Provides the default MAX plugin behavior."""
 
     comptime name: __mlir_type.`!kgen.string` = _get_kgen_string["default"]()
-    comptime HookFor = DefaultMaxPluginHooks[_]
+    # No plugin claims the host CPU, so the default names its HAL hooks.
+    comptime HookFor[target: CompilationTarget] = (
+        _CPUMaxPluginHooks if target.is_cpu() else DefaultMaxPluginHooks
+    )
 
 
-struct DefaultMaxPluginHooks[target: CompilationTarget](MaxPluginHooks):
-    comptime _raw_mlir_target = Self.target._mlir_value
+struct DefaultMaxPluginHooks(MaxPluginHooks):
     comptime warp_size = _accelerator_warp_size()
+
+
+struct _CPUMaxPluginHooks(MaxPluginHooks):
+    comptime warp_size = _accelerator_warp_size()
+
+    comptime HalHooks: HalPluginHooks = CPUHalPluginHooks
 
 
 def _accelerator_warp_size() -> Int:

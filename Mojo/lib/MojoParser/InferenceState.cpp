@@ -42,8 +42,8 @@ InferenceState::InferenceState(ASTDecl &declScope,
                                ArrayRef<Type> declaredParamTypes,
                                PogListAttr declaredParamPogs, SMLoc defaultLoc,
                                bool discardError,
-                               DeferredTypingContext *deferredTypingContext,
-                               ArrayRef<ConstraintAttr> additionalAssumptions)
+                               TypedAttr additionalAssumptions,
+                               DeferredTypingContext *deferredTypingContext)
     : deferredTypingContext(deferredTypingContext),
       additionalAssumptions(additionalAssumptions), declScope(declScope),
       shared(declScope.getShared()), evaluator(shared.getParameterEvaluator()),
@@ -160,14 +160,13 @@ private:
 LogicalResult InferenceState::checkBodyConstraints(
     ArrayRef<ConstraintAttr> extraConstraints) {
   // Substitute the parameters that are bound, but leave the unbound ones as
-  // references rather than inlining their `UnboundAttr` marker.
+  // references.
   assert(evaluator.getDepth() == 0 &&
          "body constraints are checked from the decl scope");
   ParameterEvaluator partialEvaluator;
   partialEvaluator.setEvaluationContext(evaluator.getEvaluationContext());
   for (TypedAttr binding : evaluator.getIndexBindings())
-    partialEvaluator.appendIndexBinding(
-        binding && sugarIsa<UnboundAttr>(binding) ? TypedAttr() : binding);
+    partialEvaluator.appendIndexBinding(binding);
 
   // Check the extra constraints first.
   if (LIT::canDischargeConstraintsInScope(
@@ -238,7 +237,7 @@ VerifiedParamBindings::specializeGenerator(TypedAttr generator) const {
       generator.getContext(), dischargedBodyConstraints);
   TypedAttr result =
       BindParamsAttr::get(generator.getContext(), generator, bindings,
-                          discharged, evaluationContext);
+                          discharged, /*resultType=*/{}, evaluationContext);
   assert(isEqualCanon(result.getType(), specializedType) &&
          "inferred bind_params type must match verified specialization");
   return result;

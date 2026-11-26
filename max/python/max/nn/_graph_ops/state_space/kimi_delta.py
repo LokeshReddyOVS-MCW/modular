@@ -22,7 +22,11 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Literal, cast
 
-from max.driver import accelerator_api, accelerator_architecture_name
+from max.driver import (
+    accelerator_api,
+    accelerator_architecture_name,
+    accelerator_count,
+)
 from max.dtype import DType
 from max.graph import (
     BufferValue,
@@ -38,6 +42,7 @@ from max.nn._graph_ops import _check_dtype, _check_rank, _check_same_dtype
 __all__ = [
     "KDA_GATE_LOWER_BOUND",
     "STATE_LAYOUT",
+    "TCGEN05_ARCHITECTURES",
     "KdaBetaMode",
     "KdaGateMode",
     "KdaInputMode",
@@ -45,10 +50,14 @@ __all__ = [
     "amd_kda_chunk_eligible",
     "amd_kda_chunk_workspace_bytes",
     "amd_kda_long_row_scratch_bytes",
+    "has_blackwell_tcgen05",
     "kda_chunk",
+    "kda_chunk_conv",
+    "kda_chunk_max_segments",
     "kda_chunk_predicate",
     "kda_chunk_rows",
     "kda_chunk_rows_servable",
+    "kda_chunk_scratch_rows",
     "kda_chunk_servable",
     "kda_chunk_workspace_bytes",
     "kda_decode",
@@ -58,6 +67,8 @@ __all__ = [
     "kda_verify_ring",
     "kda_verify_ring_conv",
     "kda_verify_ring_conv_packed",
+    "kda_verify_ring_kgroup_conv",
+    "kda_verify_ring_kgroup_conv_servable",
 ]
 
 KdaGateMode = Literal["original", "safe"]
@@ -140,7 +151,8 @@ def kda_chunk_rows_servable(key_head_dim: int, value_head_dim: int) -> bool:
 
     Row select needs the sm100 fused or bt16 path, whose kernels only
     instantiate at a head width the fused arm accepts; a geometry outside
-    that keeps the non-skip serial ring.
+    that keeps the non-skip serial ring. The accelerator question belongs to
+    the caller: this one stays pure so a host with no device can ask it.
 
     Args:
         key_head_dim: Per-head key width.
@@ -216,15 +228,35 @@ def _check_amd_chunk_contract(
 KDA_GATE_LOWER_BOUND = -5.0
 """Hard-coded lower bound for ``gate_mode="safe"``."""
 
-_CHUNK_MIN_COMPUTE_CAPABILITY = 100
-"""Lowest NVIDIA compute capability (``sm_100`` -> 100) ``kda_chunk`` builds for."""
+TCGEN05_ARCHITECTURES = frozenset(
+    ("sm_100", "sm_100a", "sm_101", "sm_101a", "sm_103", "sm_103a")
+)
+"""Accelerators with Blackwell tcgen05, as the stdlib's
+``Accelerator._has_blackwell_tcgen05`` names them."""
 
-_AMD_CHUNK_MAX_ELEMENTS = 1 << 31
-"""Largest tensor or workspace the gfx950 ``kda_chunk`` launch indexes; it
-raises past this rather than overflow its 32-bit offsets."""
 
-_CHUNK_LEN = 64
+def has_blackwell_tcgen05() -> bool:
+    """Returns whether the accelerator can issue tcgen05 instructions.
+
+    A capability floor cannot stand in for these: GB10 reports ``sm_121a``
+    and cannot issue them. Answers ``False`` on a host with no accelerator,
+    where the architecture query itself would raise.
+
+    Returns:
+        True when the accelerator is one the stdlib admits for tcgen05.
+    """
+    return (
+        accelerator_count() > 0
+        and accelerator_architecture_name() in TCGEN05_ARCHITECTURES
+    )
+
+
+_AMD_CHUNK_LEN = 32
 """Tokens per chunk of the AMD ``kda_chunk`` recurrence."""
+
+_AMD_CU_CEILING = 512
+"""Conservative CU count standing in for the device's in the single-sequence
+segment rule of :func:`kda_chunk_max_segments`."""
 
 
 def kda_gate_mode(lower_bound: float | None) -> KdaGateMode:
@@ -253,11 +285,16 @@ def kda_chunk_servable(
 ) -> bool:
     """Returns whether prefill can take ``kda_chunk``, not ``kda_decode``.
 
-    The op's NVIDIA kernels only instantiate on SM100+, and its AMD kernels
-    only on gfx950, where they also take only the ``"safe"`` gate and a
+    The op's NVIDIA kernels only instantiate on parts with tcgen05; the AMD
+    ones only on gfx950, where they also take only the ``"safe"`` gate and a
     float32 pool. The AMD kernels take bf16 q/k/v and a bf16 or fp32 output,
     so callers cast at the op boundary there. Builds without the closed-source kernels lack
     the op. Anything outside that keeps the sequential recurrence for prefill.
+
+    Parts without tcgen05 keep the recurrence even though the op compiles
+    there: its speed is in the tcgen05 scan and chain bodies, and the
+    portable body measured slower on GB10 (2.2-2.4 ms/token prefill against
+    1.7-2.0).
 
     Call this while a graph is being built: it reads that graph's kernel
     library.
@@ -276,13 +313,10 @@ def kda_chunk_servable(
             amd_kda_chunk_eligible(head_dim, gate_mode, pool_dtype)
             and kda_chunk_is_registered()
         )
-    # TODO(KERN-3635): widen once kda_chunk compiles below SM100.
-    name = accelerator_architecture_name()
-    digits = name.removeprefix("sm_").rstrip("abcdefghijklmnopqrstuvwxyz")
+    # TODO(kda-chunk-gate): widen once the portable body beats the recurrence.
     return (
         api == "cuda"
-        and digits.isdigit()
-        and int(digits) >= _CHUNK_MIN_COMPUTE_CAPABILITY
+        and has_blackwell_tcgen05()
         and kda_chunk_supports_head_dims(head_dim, head_dim)
         and kda_chunk_is_registered()
     )
@@ -332,52 +366,107 @@ def kda_chunk_bf16_launch() -> tuple[DType, bool]:
 
 
 def kda_chunk_predicate(
-    total_tokens: TensorValue,
-    batch_size: TensorValue,
-    num_heads: int,
-    head_dim: int,
+    total_tokens: TensorValue, batch_size: TensorValue
 ) -> TensorValue:
     """Returns whether a batch takes the ``kda_chunk`` side of the cond.
 
-    A batch with more tokens than sequences is a prefill. On AMD it must also
-    fit the launch's 32-bit indexing, or it falls back to ``kda_decode``
-    instead of raising: the largest buffer, ``kg_t``, holds ``(T // 64 + N) *
-    64 <= T + 64 N`` rows of ``num_heads * head_dim``. That also bounds q/k/v,
-    gate and output, and the launch's stride check, because every q/k/v the
-    layers pass reaches the op as dense rows of that same width: a cast that
-    changes dtype copies, and where the cast is elided (K3's bf16 slices of
-    the fused qkv) the graph compiler materializes the slices for the op.
+    A batch with more tokens than sequences is a prefill. The gfx950 launch
+    indexes in 64 bits, so no size bound applies on any accelerator. Mirrors
+    ``kda_amd_decode_runs_chunk_pipeline`` in
+    ``Kernels/lib/kda/amd_prefill.mojo``; keep the two in step.
 
     Args:
         total_tokens: Scalar token count of the batch.
         batch_size: Scalar sequence count of the batch.
-        num_heads: KDA heads on this device.
-        head_dim: Key and value head width.
 
     Returns:
         A boolean scalar.
     """
-    is_prefill = total_tokens > batch_size
-    if accelerator_api() != "hip":
-        return is_prefill
-    max_rows = _AMD_CHUNK_MAX_ELEMENTS // (num_heads * head_dim)
-    return is_prefill & (total_tokens + _CHUNK_LEN * batch_size <= max_rows)
+    return total_tokens > batch_size
+
+
+def kda_chunk_max_segments(tokens: int, seqs: int, heads: int) -> int:
+    """Largest segment count the AMD ``kda_chunk`` launch picks for a shape.
+
+    Mirrors ``kda_max_batch_segments`` in
+    ``Kernels/lib/kda/amd_prefill.mojo``; the launcher uses the
+    device's CU count, so the single-sequence residency clamp substitutes a
+    512-CU ceiling, and the launcher's further one-wave clamp, which only
+    lowers the count, is left out. The result is never below what the
+    launcher picks, which the workspace bound relies on. Keep the two
+    expressions in sync.
+
+    Args:
+        tokens: Total tokens across the batch.
+        seqs: Number of sequences (rows of ``state_indices``).
+        heads: Number of value heads.
+
+    Returns:
+        The largest per-sequence segment count the launch can use.
+    """
+    chunks = -(-tokens // _AMD_CHUNK_LEN)
+    if seqs > 1:
+        avg_chunks = -(-chunks // seqs)
+        if avg_chunks < 40:
+            return 1
+        return min(12, max(8, (avg_chunks + 15) // 16))
+    if tokens <= 2048:
+        segments = max(1, (tokens + 255) // 256)
+    elif tokens <= 8192:
+        segments = (tokens + 511) // 512
+    else:
+        segments = (tokens + 1023) // 1024
+    segments = min(segments, max(1, _AMD_CU_CEILING // heads))
+    if 2048 < tokens <= 8192:
+        # The launcher may raise a mid-length sequence's count to fill one
+        # replay wave, never past 12 chunks per segment.
+        fill = min(max(1, _AMD_CU_CEILING // (2 * heads)), -(-chunks // 12))
+        segments = max(segments, fill)
+    return segments
+
+
+def kda_chunk_scratch_rows(tokens: int, seqs: int, heads: int) -> int:
+    """Workspace of one AMD ``kda_chunk`` launch, in output-row units.
+
+    One row holds ``heads * 128`` bf16 elements: 138 rows per 32-token
+    chunk -- four bf16 chunk matrices, the bf16 within-chunk score block
+    and the fp32 gamma strip -- plus, when the launch splits sequences into
+    segments, 768 rows per (sequence, segment) of fp32 segment maps and
+    segment states.
+
+    Args:
+        tokens: Total tokens across the batch.
+        seqs: Number of sequences (rows of ``state_indices``).
+        heads: Number of value heads.
+
+    Returns:
+        Workspace rows the launch allocates (an upper bound).
+    """
+    max_chunks = -(-tokens // _AMD_CHUNK_LEN) + seqs
+    max_segments = kda_chunk_max_segments(tokens, seqs, heads)
+    segment_slots = seqs * max_segments if max_segments > 1 else 0
+    rows_per_chunk = 138
+    rows_per_segment = 768
+    return max_chunks * rows_per_chunk + segment_slots * rows_per_segment
 
 
 def kda_chunk_workspace_bytes(
     num_heads: int, head_dim: int, batch_tokens: int, batch_size: int
 ) -> int:
-    """Returns an upper bound on one gfx950 ``kda_chunk`` call's workspaces.
+    """Returns an upper bound on one gfx950 ``kda_chunk`` call's workspace.
 
-    Mirrors the allocations in ``kda_amd_chunk_launch``
-    (``Kernels/lib/kda/amd_chunk_launch.mojo``), per head: bf16 ``qg``, ``w``,
-    ``u`` and ``aqk`` per token; bf16 ``kg_t`` and float32 ``decay`` per
-    64-token chunk, of which a batch holds at most ``tokens // 64 +
-    sequences``; and the float32 split-walk workspace, which the launch sizes
-    for at most one group per four chunks and 32 groups per sequence. The
-    per-device int32 chunk offsets are counted per head, which covers them on
-    any split. Every term is per head, so the bytes for a set of devices is
-    the sum over each device's heads, however the heads are split.
+    Uses :func:`kda_chunk_scratch_rows`, which mirrors the launcher's
+    workspace layout in ``Kernels/lib/kda/amd_prefill.mojo``: per
+    32-token chunk and per (sequence, segment), in rows of ``heads *
+    head_dim`` bf16 elements. The segment count only grows as a device holds
+    fewer heads, so rows at one head bound every device of any head split,
+    and the bytes for a set of devices is at most those rows times their
+    heads. The bound covers every batch the chunk path runs (see
+    :func:`kda_chunk_predicate`: more tokens than sequences) of at most
+    ``batch_tokens`` tokens and ``batch_size`` sequences, not only the full
+    one. A batch with no more tokens than sequences takes the token-serial
+    kernel and needs no workspace, so the sweep stops at ``tokens``
+    sequences.
 
     Args:
         num_heads: KDA heads the reservation sizes.
@@ -388,25 +477,23 @@ def kda_chunk_workspace_bytes(
     Returns:
         Workspace bytes for ``num_heads``.
     """
-    chunk_len = _CHUNK_LEN
-    min_chunks_per_group = 4
-    max_groups_per_sequence = 32
-    chunks = batch_tokens // chunk_len + batch_size
-    split_planes = min(
-        -(-batch_tokens // chunk_len) // min_chunks_per_group,
-        max_groups_per_sequence * batch_size,
+    assert head_dim == _AMD_CHUNK_HEAD_DIM, (
+        "the gfx950 kda_chunk kernel needs 128-wide heads"
     )
-    plane_elems = head_dim * head_dim
-    per_head = (
-        batch_tokens * (3 * head_dim + chunk_len) * DType.bfloat16.size_in_bytes
-        + chunks * head_dim * chunk_len * DType.bfloat16.size_in_bytes
-        + chunks * head_dim * DType.float32.size_in_bytes
-        + split_planes
-        * (2 * plane_elems + head_dim + plane_elems // 2)
-        * DType.float32.size_in_bytes
-        + batch_size * DType.int32.size_in_bytes
-    )
-    return num_heads * per_head
+    # The workspace is not monotone in either count: fewer, longer sequences
+    # cross the threshold where the launch starts splitting them into
+    # segments, and the single-sequence segment rule steps down just past
+    # 2048 and 8192 tokens. Past one sequence per chunk nothing splits and
+    # the rows only grow with the sequence count.
+    rows = 0
+    for tokens in {batch_tokens} | {
+        t for t in (2048, 8192) if t < batch_tokens
+    }:
+        chunks = -(-tokens // _AMD_CHUNK_LEN)
+        largest = max(1, min(batch_size, tokens))
+        for seqs in [*range(1, min(largest, chunks) + 1), largest]:
+            rows = max(rows, kda_chunk_scratch_rows(tokens, seqs, 1))
+    return rows * num_heads * head_dim * DType.bfloat16.size_in_bytes
 
 
 def amd_kda_chunk_workspace_bytes(
@@ -931,10 +1018,10 @@ def kda_chunk(
     of the L1/L2/L3 pipeline on supported shapes.
 
     On an AMD accelerator (gfx950 only) the op runs a separate pipeline over
-    64-token chunks with a narrower contract: ``key_head_dim ==
+    32-token chunks with a narrower contract: ``key_head_dim ==
     value_head_dim == 128``, ``num_key_heads == num_value_heads``,
-    ``gate_mode="safe"``, bf16 ``q``/``k``/``v`` and output, fp32 gates and
-    state, and ``use_computebound=False``.
+    ``gate_mode="safe"``, bf16 ``q``/``k``/``v``, a bf16 or fp32 output, fp32
+    gates and state, and ``use_computebound=False``.
 
     Args:
         q: ``[total_tokens, num_key_heads, key_head_dim]``.
@@ -1290,6 +1377,378 @@ def kda_verify_ring(
     return ops.squeeze(results[0].tensor, 0)
 
 
+_KGROUP_CONV_OP = "kda_verify_ring_kgroup_conv"
+_CHUNK_CONV_OP = "kda_chunk_conv"
+_FUSED_HEAD_DIM = 128
+"""Key and value head width the fused verify ops are compiled for."""
+_FUSED_CONV_TAPS = 4
+"""Taps of the short conv the fused verify ops run."""
+_CHUNK_CONV_VEC = 2
+"""Adjacent channels a lane of the ``kda_chunk_conv`` kernel owns. q, k and
+v each span a multiple of it, so no lane's channels straddle two of them."""
+
+
+def _check_conv_shapes(
+    conv_dim: Dim, conv_weight: TensorValue, conv_pool: BufferValue
+) -> None:
+    """Raises ``ValueError`` unless the conv is the fused ops' 4-tap conv.
+
+    The taps must be ``[conv_dim, 4]`` and the window pool
+    ``[rows, conv_dim, 3]``.
+    """
+    if (
+        conv_weight.shape[0] != conv_dim
+        or conv_weight.shape[1] != _FUSED_CONV_TAPS
+    ):
+        raise ValueError(
+            f"expected conv_weight to be [{conv_dim}, {_FUSED_CONV_TAPS}],"
+            f" was {conv_weight.shape}"
+        )
+    if (
+        conv_pool.shape[1] != conv_dim
+        or conv_pool.shape[2] != _FUSED_CONV_TAPS - 1
+    ):
+        raise ValueError(
+            f"expected conv_pool to be [conv_rows, {conv_dim},"
+            f" {_FUSED_CONV_TAPS - 1}], was {conv_pool.shape}"
+        )
+
+
+def _check_fused_head_dims(
+    op_name: str, key_head_dim: Dim, value_head_dim: Dim
+) -> None:
+    """Raises ``ValueError`` unless static head widths are both 128.
+
+    The fused verify ops are compiled for 128-wide key and value heads.
+    """
+    if isinstance(key_head_dim, StaticDim) and isinstance(
+        value_head_dim, StaticDim
+    ):
+        pair = (int(key_head_dim), int(value_head_dim))
+        if pair != (_FUSED_HEAD_DIM, _FUSED_HEAD_DIM):
+            raise ValueError(
+                f"{op_name} is compiled for (key_head_dim, value_head_dim)"
+                f" = ({_FUSED_HEAD_DIM}, {_FUSED_HEAD_DIM}), got {pair}"
+            )
+
+
+def _check_conv_operands(
+    op_name: str,
+    qkv: TensorValue,
+    conv_weight: TensorValue,
+    conv_pool: BufferValue,
+    conv_rows: TensorValue,
+) -> None:
+    """Raises ``ValueError`` unless the shared conv operands fit the ops.
+
+    The K-group verify and the chunk conv take the same raw input, taps,
+    window pool and pool rows. Both widen a bf16 raw input to float32 as
+    they load it, which is exact, so a bf16 ``qkv`` gives the float32
+    conv's sums.
+    """
+    if qkv.dtype not in (DType.bfloat16, DType.float32):
+        raise ValueError(
+            f"{op_name} takes a bf16 or float32 qkv, got {qkv.dtype}"
+        )
+    _check_dtype(DType.float32, conv_weight=conv_weight)
+    _check_dtype(DType.uint32, conv_rows=conv_rows)
+    _check_rank(2, qkv=qkv, conv_weight=conv_weight)
+    _check_rank(3, conv_pool=conv_pool)
+    _check_rank(1, conv_rows=conv_rows)
+
+
+def _window_rows(rows: Dim, verify_width: TensorValue) -> Dim:
+    """Returns the rows of a verify's conv input copy, ``K + 1`` a sequence."""
+    return Dim(rows) * (Dim(verify_width.shape[0]) + 1)
+
+
+def kda_chunk_conv(
+    qkv: TensorValue,
+    conv_weight: TensorValue,
+    conv_pool: BufferValue,
+    conv_rows: TensorValue,
+    input_row_offsets: TensorValue,
+    verify_width: TensorValue,
+    *,
+    num_key_heads: int,
+    num_value_heads: int,
+    head_dim: int,
+) -> tuple[TensorValue, TensorValue, TensorValue, TensorValue]:
+    """Runs a draft-free verify's short conv into :func:`kda_chunk`'s q, k, v.
+
+    Computes
+    :func:`~max.nn._graph_ops.state_space.gated_delta_conv1d_verify_fwd`
+    with ``silu`` at a verify width of zero, which commits every conv
+    window, then the bf16 cast of its output and the split of that cast into
+    q, k and v, and returns what those return, bit for bit, from one launch.
+    The conv takes ``qkv`` widened to float32, which is exact, so a bf16
+    ``qkv`` is read as it is. A verify with drafts must leave the conv windows
+    to the rollback, and this op commits them, so it raises at run time for
+    one: call it behind a draft-free predicate.
+
+    The contract is GLM-5.3-Flash's prefill on NVIDIA, which ships the op
+    beside :func:`kda_verify_ring_kgroup_conv`: a 4-tap conv, with ``qkv``
+    holding q and k of the key heads and then v of the value heads.
+
+    Args:
+        qkv: ``[total_tokens, conv_dim]`` bf16 or float32 raw conv input.
+        conv_weight: ``[conv_dim, 4]`` float32 depthwise conv taps.
+        conv_pool: ``[conv_rows, conv_dim, 3]`` conv window pool, committed
+            in place.
+        conv_rows: ``[batch_size]`` uint32 conv pool row per sequence.
+        input_row_offsets: ``[batch_size + 1]`` uint32 ragged offsets.
+        verify_width: The operand
+            :func:`~max.nn._graph_ops.state_space.verify_width_operand` returns.
+        num_key_heads: Heads of q and of k.
+        num_value_heads: Heads of v.
+        head_dim: Channels a head.
+
+    Returns:
+        q and k, ``[total_tokens, num_key_heads, head_dim]``, and v,
+        ``[total_tokens, num_value_heads, head_dim]``, all bf16, then the
+        conv input copy, ``[batch_size * (K + 1), conv_dim]`` float32, which
+        a verify of no drafts leaves unwritten.
+
+    Raises:
+        ValueError: If the dtypes, ranks or extents fall outside the contract.
+    """
+    _check_conv_operands(_CHUNK_CONV_OP, qkv, conv_weight, conv_pool, conv_rows)
+    _check_dtype(DType.uint32, input_row_offsets=input_row_offsets)
+    _check_dtype(DType.int64, verify_width=verify_width)
+    _check_rank(
+        1, input_row_offsets=input_row_offsets, verify_width=verify_width
+    )
+    total_tokens, conv_dim = qkv.shape
+    qk_channels = num_key_heads * head_dim
+    v_channels = num_value_heads * head_dim
+    if qk_channels % _CHUNK_CONV_VEC or v_channels % _CHUNK_CONV_VEC:
+        raise ValueError(
+            f"{_CHUNK_CONV_OP} splits q, k and v at multiples of"
+            f" {_CHUNK_CONV_VEC} channels, got {qk_channels} and {v_channels}"
+        )
+    _check_same_dim(
+        "the channel axis",
+        qkv=conv_dim,
+        heads=Dim(2 * qk_channels + v_channels),
+    )
+    _check_conv_shapes(conv_dim, conv_weight, conv_pool)
+    device = qkv.device
+    qk_type = TensorType(
+        DType.bfloat16, [total_tokens, num_key_heads, head_dim], device
+    )
+    results = ops.inplace_custom(
+        _CHUNK_CONV_OP,
+        device,
+        [
+            qkv,
+            conv_weight,
+            conv_pool,
+            conv_rows,
+            input_row_offsets,
+            verify_width,
+        ],
+        [
+            qk_type,
+            qk_type,
+            TensorType(
+                DType.bfloat16,
+                [total_tokens, num_value_heads, head_dim],
+                device,
+            ),
+            TensorType(
+                DType.float32,
+                [_window_rows(conv_rows.shape[0], verify_width), conv_dim],
+                device,
+            ),
+        ],
+    )
+    q, k, v, window = (result.tensor for result in results)
+    return q, k, v, window
+
+
+def kda_verify_ring_kgroup_conv_servable(
+    head_dim: int, gate_mode: KdaGateMode, pool_dtype: DType
+) -> bool:
+    """Returns whether a verify can take :func:`kda_verify_ring_kgroup_conv`.
+
+    The op runs the K-group verify kernel, so it serves that kernel's
+    contract only: NVIDIA, ``K = V = 128``, the ``"safe"`` gate and a
+    float32 pool, in a build that ships the closed-source kernels, which
+    also ship :func:`kda_chunk_conv` for the draft-free branch beside it.
+    Call this while a graph is being built: it reads that graph's kernel
+    library.
+
+    Args:
+        head_dim: Key and value head width.
+        gate_mode: The forget-gate form the layer passes the op.
+        pool_dtype: Dtype of the recurrent state pool.
+
+    Returns:
+        ``True`` when the op accepts this layer's verify.
+    """
+    return (
+        accelerator_api() == "cuda"
+        and head_dim == _FUSED_HEAD_DIM
+        and gate_mode == "safe"
+        and pool_dtype == DType.float32
+        and _KGROUP_CONV_OP in Graph.current._kernel_library
+        and _CHUNK_CONV_OP in Graph.current._kernel_library
+    )
+
+
+def kda_verify_ring_kgroup_conv(
+    qkv: TensorValue,
+    conv_weight: TensorValue,
+    conv_pool: BufferValue,
+    conv_rows: TensorValue,
+    raw_gate: TensorValue,
+    beta_logits: TensorValue,
+    a_log: TensorValue,
+    dt_bias: TensorValue,
+    cu_seqlens: TensorValue,
+    state_pool: BufferValue,
+    state_indices: TensorValue,
+    ring: BufferValue,
+    ring_indices: TensorValue,
+    verify_width: TensorValue,
+) -> tuple[TensorValue, TensorValue]:
+    """Runs a verify's short conv and its :func:`kda_verify_ring` as one op.
+
+    Computes
+    :func:`~max.nn._graph_ops.state_space.gated_delta_conv1d_verify_fwd`
+    with ``silu`` over the raw conv input, then :func:`kda_verify_ring`
+    with ``kgroup`` over that conv's q, k and v, and returns what the two
+    ops return, bit for bit: the readout, the ring records, the pools and the
+    conv input copy. With drafts it is one launch that keeps the conv output
+    out of memory. Unlike :func:`kda_verify_ring_conv`, which fuses the conv
+    into the ring kernel that ``kgroup`` replaces, it keeps the K-group
+    kernel. At a verify width of zero, and for a batch holding a prompt row,
+    it runs the two ops' own kernels.
+
+    The contract is :func:`kda_verify_ring_kgroup_conv_servable`'s: float32
+    operands and pools but for ``qkv``, ``K = V = 128``, the ``"safe"`` gate
+    with logit beta, a ``K_FIRST`` pool and a 4-tap conv, with ``qkv``
+    holding q and k of the key heads and then v of the value heads. The conv
+    takes ``qkv`` widened to float32, which is exact, so the op widens a
+    bf16 ``qkv`` itself.
+
+    Args:
+        qkv: ``[total_tokens, conv_dim]`` bf16 or float32 raw conv input.
+        conv_weight: ``[conv_dim, 4]`` float32 depthwise conv taps.
+        conv_pool: ``[conv_rows, conv_dim, 3]`` conv window pool, committed
+            in place only at a verify width of zero.
+        conv_rows: ``[batch_size]`` uint32 conv pool row per sequence.
+        raw_gate: ``[total_tokens, num_value_heads, key_head_dim]`` float32
+            forget-gate pre-activation, before ``dt_bias`` is added.
+        beta_logits: ``[total_tokens, num_value_heads]`` float32.
+        a_log: ``[num_value_heads]`` float32.
+        dt_bias: ``[num_value_heads, key_head_dim]`` float32.
+        cu_seqlens: ``[batch_size + 1]`` int32 exclusive prefix offsets.
+        state_pool: ``[max_slots, num_value_heads, key_head_dim,
+            value_head_dim]`` float32 live pool.
+        state_indices: ``[batch_size]`` int32 pool slot per sequence.
+        ring: As for :func:`kda_verify_ring`.
+        ring_indices: ``[batch_size]`` ring row per sequence.
+        verify_width: The operand
+            :func:`~max.nn._graph_ops.state_space.verify_width_operand` returns.
+
+    Returns:
+        The readout, ``[total_tokens, num_value_heads, value_head_dim]``
+        float32, and the conv input copy the rollback places the conv windows
+        from, ``[batch_size * (K + 1), conv_dim]`` float32.
+
+    Raises:
+        ValueError: If the dtypes, ranks or extents fall outside the contract.
+    """
+    _check_conv_operands(
+        _KGROUP_CONV_OP, qkv, conv_weight, conv_pool, conv_rows
+    )
+    _check_dtype(
+        DType.float32,
+        raw_gate=raw_gate,
+        beta_logits=beta_logits,
+        a_log=a_log,
+        dt_bias=dt_bias,
+        state_pool=state_pool,
+        ring=ring,
+    )
+    _check_dtype(
+        DType.int32, cu_seqlens=cu_seqlens, state_indices=state_indices
+    )
+    _check_rank(2, beta_logits=beta_logits, dt_bias=dt_bias)
+    _check_rank(3, raw_gate=raw_gate)
+    _check_rank(4, state_pool=state_pool, ring=ring)
+    _check_rank(
+        1,
+        a_log=a_log,
+        cu_seqlens=cu_seqlens,
+        state_indices=state_indices,
+        ring_indices=ring_indices,
+    )
+    total_tokens, num_value_heads, key_head_dim = raw_gate.shape
+    conv_dim = qkv.shape[1]
+    _check_same_dim(
+        "the token axis",
+        qkv=qkv.shape[0],
+        raw_gate=total_tokens,
+        beta_logits=beta_logits.shape[0],
+    )
+    _check_same_dim(
+        "the value-head axis",
+        raw_gate=num_value_heads,
+        beta_logits=beta_logits.shape[1],
+        a_log=a_log.shape[0],
+        dt_bias=dt_bias.shape[0],
+        state_pool=state_pool.shape[1],
+        ring=ring.shape[1],
+    )
+    # The pool is K_FIRST, so its third axis is the key-head width.
+    _check_same_dim(
+        "the key-head width",
+        raw_gate=key_head_dim,
+        state_pool=state_pool.shape[2],
+    )
+    _check_conv_shapes(conv_dim, conv_weight, conv_pool)
+    _check_fused_head_dims(_KGROUP_CONV_OP, key_head_dim, state_pool.shape[3])
+    device = raw_gate.device
+    results = ops.inplace_custom(
+        _KGROUP_CONV_OP,
+        device,
+        [
+            qkv,
+            conv_weight,
+            conv_pool,
+            conv_rows,
+            ops.unsqueeze(raw_gate, 0),
+            ops.unsqueeze(beta_logits, 0),
+            a_log,
+            dt_bias,
+            cu_seqlens,
+            state_pool,
+            state_indices,
+            ring,
+            ring_indices.cast(DType.int32),
+            verify_width,
+        ],
+        [
+            TensorType(
+                DType.float32,
+                [1, total_tokens, num_value_heads, _FUSED_HEAD_DIM],
+                device,
+            ),
+            TensorType(
+                DType.float32,
+                [_window_rows(conv_rows.shape[0], verify_width), conv_dim],
+                device,
+            ),
+        ],
+    )
+    return (
+        ops.squeeze(results[0].tensor, 0),
+        cast(TensorValue, results[1]),
+    )
+
+
 def _check_verify_ring_conv(
     qkv: TensorValue,
     conv_weight: TensorValue,
@@ -1489,16 +1948,8 @@ def _check_verify_ring_conv(
                 "expected raw_qkv to hold q | k | v thirds of "
                 f"{inner} channels ({3 * inner} total), was {conv_dim}"
             )
-    if conv_weight.shape[0] != conv_dim or conv_weight.shape[1] != 4:
-        raise ValueError(
-            f"expected conv_weight to be [{conv_dim}, 4], was "
-            f"{conv_weight.shape}"
-        )
-    if conv_pool.shape[1] != conv_dim or conv_pool.shape[2] != 3:
-        raise ValueError(
-            f"expected conv_pool to be [conv_rows, {conv_dim}, 3], was "
-            f"{conv_pool.shape}"
-        )
+    _check_conv_shapes(conv_dim, conv_weight, conv_pool)
+    _check_fused_head_dims(op_name, key_head_dim, value_head_dim)
     if (
         isinstance(cu_seqlens.shape[0], StaticDim)
         and isinstance(batch_size, StaticDim)
@@ -1539,15 +1990,6 @@ def _check_verify_ring_conv(
             f"expected state_pool to have trailing axes {expected} for "
             f"state_layout={state_layout!r}, was {pool_axes}"
         )
-    if isinstance(key_head_dim, StaticDim) and isinstance(
-        value_head_dim, StaticDim
-    ):
-        pair = (int(key_head_dim), int(value_head_dim))
-        if pair != (128, 128):
-            raise ValueError(
-                f"{op_name} is compiled for (key_head_dim, value_head_dim)"
-                f" = (128, 128), got {pair}"
-            )
     return conv_dim
 
 
@@ -1583,7 +2025,7 @@ def _launch_verify_ring_conv(
     ``kda_verify_ring_conv_packed_gate_up`` the gate's up-projection weight.
     """
     device = raw_gate.device
-    window_rows = Dim(state_indices.shape[0]) * (Dim(verify_width.shape[0]) + 1)
+    window_rows = _window_rows(state_indices.shape[0], verify_width)
     values: list[TensorValue | BufferValue] = [
         qkv,
         conv_weight,

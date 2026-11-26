@@ -21,6 +21,7 @@ import io
 import itertools
 import sys
 import traceback
+import weakref
 from collections import OrderedDict
 from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 from contextvars import ContextVar
@@ -127,7 +128,16 @@ class _DeviceChainMap(OrderedDict[DeviceRef, _ChainValue]):
 
     def __init__(self, graph: Graph) -> None:
         super().__init__()
-        self._graph = graph
+        # Weak because the graph owns this map. A strong reference would form
+        # a cycle, keeping a dropped graph and its MLIR module alive until
+        # the next garbage collection.
+        self._graph_ref = weakref.ref(graph)
+
+    @property
+    def _graph(self) -> Graph:
+        graph = self._graph_ref()
+        assert graph is not None, "the graph of these chains was freed"
+        return graph
 
     @staticmethod
     def _sort_key(device: DeviceRef) -> tuple[str, int]:
@@ -360,6 +370,30 @@ class KernelLibrary:
         """
         self._shared_analysis().verify_custom_op(custom_op)
 
+    def resolves(
+        self, kernel: str, graph_op: mlir.Operation, device: DeviceRef
+    ) -> bool:
+        """Returns whether a kernel registered as *kernel* applies to *device*.
+
+        A registration may be scoped to some devices only, by their API,
+        architecture or model, so a kernel that is registered under a name
+        does not apply to every device.
+
+        Args:
+            kernel: The registered name of the kernel to look up.
+            graph_op: The operation of the graph. Its module carries the
+                info of each device, which the scope of a registration is
+                matched against.
+            device: The device to resolve the kernel for.
+
+        Returns:
+            ``True`` if exactly one registration of *kernel* is selected for
+            *device*.
+        """
+        return self._shared_analysis().resolves_kernel(
+            kernel, graph_op, device.device_type.value, device.id
+        )
+
     def has_shape_function(self, kernel: str) -> bool:
         """Returns whether *kernel* registers a shape function.
 
@@ -536,6 +570,24 @@ def _to_mlir(o: Any) -> Any:
     elif isinstance(o, dict):
         return {k: _to_mlir(v) for k, v in o.items()}
     return o
+
+
+def _unwrap_to_cmlir(arg: Any) -> Any:
+    """Converts graph API values, types and attributes to ``max.mlir`` ones."""
+    if isinstance(arg, Value):
+        return mlir.Value._CAPICreate(arg._mlir_value._CAPIPtr)  # type: ignore[attr-defined]
+    elif isinstance(arg, Type):
+        return mlir.Type._CAPICreate(arg.to_mlir()._CAPIPtr)  # type: ignore
+    elif isinstance(arg, list | tuple):
+        return [_unwrap_to_cmlir(elem) for elem in arg]
+    elif isinstance(arg, _Attribute):
+        return mlir.Attribute._CAPICreate(arg._CAPIPtr)  # type: ignore
+    elif isinstance(arg, _Type):
+        return mlir.Type._CAPICreate(arg._CAPIPtr)  # type: ignore
+    elif isinstance(arg, _Value):
+        return mlir.Value._CAPICreate(arg._CAPIPtr)  # type: ignore[attr-defined]
+    else:
+        return arg
 
 
 # MLIR assembly text must be read and written through the ``max.mlir`` bindings
@@ -873,6 +925,10 @@ class Graph:
     device_chains: _DeviceChainMap
 
     _kernel_library: KernelLibrary
+    # The extension paths as the caller named them, before `_import_kernels`
+    # built any source package into a `.mojoc`. A `.mojoc`'s bytes depend on
+    # the tree it was built in; the sources do not.
+    _source_extension_paths: list[Path]
 
     _subgraphs: dict[str, Graph] = {}
 
@@ -966,9 +1022,15 @@ class Graph:
 
         # Resolving through `_resolved_custom_extensions` is what lets a graph
         # built without `custom_extensions` still reach a backend's kernel
-        # overlays (see `default_custom_extensions`).
+        # overlays (see `default_custom_extensions`). The resolved paths are
+        # kept before `_import_kernels` builds a source package into a `.mojoc`
+        # whose bytes depend on where it was built, so anything that has to
+        # compare two runs' kernel libraries reads the sources instead.
+        self._source_extension_paths = _resolved_custom_extensions(
+            custom_extensions
+        )
         self._kernel_library = kernel_library or KernelLibrary()
-        self._import_kernels(_resolved_custom_extensions(custom_extensions))
+        self._import_kernels(self._source_extension_paths)
 
         self._subgraphs = {}
 
@@ -1350,25 +1412,10 @@ class Graph:
         attach_profile_scopes: bool = True,
         **kwargs,
     ) -> tuple[list[Value[Any]], mlir.OpView]:
-        # Convert args from instances of Python graph-api Value() to mlir.Value
-        def unwrap(arg: Any) -> Any:
-            if isinstance(arg, Value):
-                return mlir.Value._CAPICreate(arg._mlir_value._CAPIPtr)  # type: ignore[attr-defined]
-            elif isinstance(arg, Type):
-                return mlir.Type._CAPICreate(arg.to_mlir()._CAPIPtr)  # type: ignore
-            elif isinstance(arg, list | tuple):
-                return [unwrap(elem) for elem in arg]
-            elif isinstance(arg, _Attribute):
-                return mlir.Attribute._CAPICreate(arg._CAPIPtr)  # type: ignore
-            elif isinstance(arg, _Type):
-                return mlir.Type._CAPICreate(arg._CAPIPtr)  # type: ignore
-            elif isinstance(arg, _Value):
-                return mlir.Value._CAPICreate(arg._CAPIPtr)  # type: ignore[attr-defined]
-            else:
-                return arg
-
-        unwrapped_args = tuple(unwrap(arg) for arg in args)
-        unwrapped_kwargs = {k: unwrap(arg) for k, arg in kwargs.items()}
+        unwrapped_args = tuple(_unwrap_to_cmlir(arg) for arg in args)
+        unwrapped_kwargs = {
+            k: _unwrap_to_cmlir(arg) for k, arg in kwargs.items()
+        }
 
         ip = _ip or mlir.InsertionPoint(self._body)
 
@@ -1504,28 +1551,20 @@ class Graph:
         )
         outputs = cast(tuple[Value[Any], ...], outputs)
         # mo.output doesn't support infer_type
-        graph_body_args = self._graph_body.arguments
         output_values: list[Value[Any]] = list(outputs)
         if self._has_chain_input:
             output_values = self.device_chains.pack(output_values)
         mlir_values: list[_Value[Any]] = [v._mlir_value for v in output_values]
 
-        # We have a type mismatch now, these are MLIR types
-        # Convert from max._core.Type to mlir.Type using CAPI bridge
-        output_types = [
-            mlir.Type._CAPICreate(value.type._CAPIPtr)  # type: ignore[attr-defined]
-            for value in mlir_values
-        ]
-
-        # Need to set some more stuff.
-        function_type = mlir.FunctionType.get(
-            graph_body_args.types,
-            output_types,
+        op = Operation._from_cmlir(self._mlir_op)
+        assert isinstance(op, _mo.GraphOp)
+        function_type = builtin.FunctionType(
+            [arg.type for arg in op.regions[0].front.arguments],
+            [value.type for value in mlir_values],
         )
-        signature = mlir.Type.parse(f"!kgen.generator<{function_type}>")
-        self._mlir_op.attributes["signature"] = mlir.TypeAttr.get(signature)
-        self._mlir_op.attributes["functionType"] = mlir.TypeAttr.get(
-            function_type
+        op.function_type = builtin.TypeAttr(function_type)
+        op.signature = builtin.TypeAttr(
+            kgen.FuncTypeGeneratorType([], function_type)
         )
 
         self._add_op_generated(
@@ -1538,13 +1577,12 @@ class Graph:
         # Set the result_names metadata on the staged op, which is needed by
         # the engine for execution.
         # Note that result_names here needs to match kMgpModelResultNames.
-        input_names = [f'"input{i}"' for i in range(len(self.inputs))]
-        self._mlir_op.attributes["argument_names"] = mlir.Attribute.parse(
-            f"[{', '.join(input_names)}]"
+        attrs = op.discardable_attributes
+        attrs["argument_names"] = builtin.ArrayAttr(
+            [builtin.StringAttr(f"input{i}") for i in range(len(self.inputs))]
         )
-        output_names = [f'"output{i}"' for i in range(len(output_types))]
-        self._mlir_op.attributes["result_names"] = mlir.Attribute.parse(
-            f"[{', '.join(output_names)}]"
+        attrs["result_names"] = builtin.ArrayAttr(
+            [builtin.StringAttr(f"output{i}") for i in range(len(mlir_values))]
         )
 
         self._subgraphs = {}
@@ -1633,6 +1671,7 @@ class Graph:
             if isinstance(paths_attr, mlir.ArrayAttr):
                 kernels_paths = [Path(str(x)) for x in paths_attr]
         self._kernel_library = KernelLibrary(kernels_paths)
+        self._source_extension_paths = kernels_paths
 
     def copy(self) -> Graph:
         """Creates a deep copy of this graph.
@@ -1669,6 +1708,7 @@ class Graph:
         # module body block.
         copied._mlir_op = mlir.Operation._CAPICreate(module.body[0]._CAPIPtr)
         copied._kernel_library = self._kernel_library
+        copied._source_extension_paths = list(self._source_extension_paths)
         copied._data_dependent_dims = 0
         return copied
 

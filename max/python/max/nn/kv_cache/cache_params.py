@@ -85,7 +85,9 @@ from .utils import (
 # on max.nn.kv_cache (BUILD.bazel), so importing back would create a circular
 # bazel dependency. The two definitions are structurally identical
 # Literals, so mypy treats them as the same type at use sites.
-SpeculativeMethod = Literal["eagle", "mtp", "dflash", "dflash2", "dspark"]
+SpeculativeMethod = Literal[
+    "eagle", "mtp", "dflash", "dflash2", "dspark", "dfly"
+]
 
 KVHashAlgo = Literal["ahash64", "sha256"]
 """Supported hash algorithms for KV-cache block identity."""
@@ -398,6 +400,11 @@ class KVConnectorConfigInterface(Protocol):
         """Endpoint for the co-located dKV service."""
         ...
 
+    @property
+    def sequence_major_striping(self) -> bool:
+        """Whether dKV keeps a sequence's blocks in the same region."""
+        ...
+
 
 @dataclass(frozen=True)
 class NullKVConnectorConfig:
@@ -417,6 +424,7 @@ class NullKVConnectorConfig:
     num_h2d_onload_lanes: int = 1
     use_disk_direct_io: bool = False
     block_store_endpoint: str | None = None
+    sequence_major_striping: bool = False
 
 
 def _validate_is_2d_uint8_buffer(buffer: Buffer) -> None:
@@ -944,6 +952,24 @@ class KVCacheQuantizationConfig:
 
 
 @dataclass(frozen=True)
+class KVCacheContextParallel:
+    """How a cache splits each request's token positions across ranks.
+
+    The positions split across ``degree`` consecutive ranks of a replica's
+    tensor-parallel group, the cache's decode context parallel (DCP) group:
+    position ``p`` lives on rank ``(p // interleave) % degree``. A page of the
+    cache still holds :attr:`KVCacheParams.page_size` rows on one device, so
+    one logical page spans ``page_size * degree`` positions.
+    """
+
+    degree: int
+    """The ranks that split the positions, more than one."""
+
+    interleave: int = 1
+    """The consecutive positions one rank owns before the next rank's turn."""
+
+
+@dataclass(frozen=True)
 class BatchCharacteristics:
     """Upper-bound batch shape used to prepare decode attention metadata.
 
@@ -1468,11 +1494,11 @@ class KVCacheParamInterface(CacheLeafParamInterface, Protocol):
 
         Zero when speculative decoding is disabled; one for autoregressive
         drafts (``eagle``, ``mtp``); equal to ``num_draft_tokens`` for block
-        drafts (``dflash``, ``dflash2``, ``dspark``).
+        drafts (``dflash``, ``dflash2``, ``dspark``, ``dfly``).
         """
         if self.speculative_method is None:
             return 0
-        elif self.speculative_method in ("dflash", "dflash2", "dspark"):
+        elif self.speculative_method in ("dflash", "dflash2", "dspark", "dfly"):
             return self.num_draft_tokens
         elif self.speculative_method in ("mtp", "eagle"):
             return 1
@@ -1674,6 +1700,10 @@ class KVCacheParams(KVCacheParamInterface):
     the other's width.
     """
 
+    context_parallel: KVCacheContextParallel | None = None
+    """How the cache splits token positions across a DCP group, or ``None``
+    when every rank of a replica holds them all."""
+
     def __post_init__(self):
         """Validates configuration and computes derived fields after initialization.
 
@@ -1707,6 +1737,21 @@ class KVCacheParams(KVCacheParamInterface):
 
         if self.scratch and self.window_size is not None:
             raise ValueError("A scratch cache has no window size.")
+
+        if (cp := self.context_parallel) is not None:
+            tp = self.n_devices // self.data_parallel_degree
+            if cp.degree < 2 or tp % cp.degree:
+                raise ValueError(
+                    f"A context parallel degree ({cp.degree}) must be more"
+                    " than 1 and divide the devices of a replica"
+                    f" ({tp})."
+                )
+            if cp.interleave < 1 or self.page_size % cp.interleave:
+                raise ValueError(
+                    f"A context parallel interleave ({cp.interleave}) must"
+                    f" be a positive divisor of the page size"
+                    f" ({self.page_size})."
+                )
 
         if self.slots_per_page is None:
             self.slots_per_page = self.page_size

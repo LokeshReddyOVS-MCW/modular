@@ -41,7 +41,7 @@ from max.gpu import (
     thread_idx,
 )
 from max.gpu.sync import barrier
-from max.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext, GridBlockLaunchConfig
 from max.gpu.host.info import is_gpu
 from max.gpu.primitives.grid_controls import (
     PDLLevel,
@@ -701,7 +701,7 @@ def multistage_qgemm_kernel[
     var block_idx = block_swizzle(
         (block_idx.x, block_idx.y),
         (grid_dim.x, grid_dim.y),
-    ) if swizzle_block else Index(block_idx.x, block_idx.y)
+    ) if swizzle_block else (block_idx.x, block_idx.y)
 
     # Coordinates of the current warp.
     var warp_y, warp_x = udivmod(warp_id, num_warps_n)
@@ -943,6 +943,7 @@ def multistage_qgemm_kernel[
     var c_rows_left = M - block_idx[1] * BM - Int(warp_y) * WM
 
     @inline(.always)
+    @__allow_legacy_any_origin_fields
     def apply_epilogue() {imm}:
         # This block is identical to the one used for f32 case
         # but putting this in a lambda function leads to test failures
@@ -2323,9 +2324,11 @@ def gpu_qint4_repack_Q4_0(
     ctx.enqueue_function[repack](
         b,
         b_packed,
-        grid_dim=(ceildiv(N, BN), ceildiv(K, BK), 1),
-        block_dim=(128, 1, 1),
-        shared_mem_bytes=smem_usage,
+        execution_config=GridBlockLaunchConfig(
+            grid_dim=(ceildiv(N, BN), ceildiv(K, BK), 1),
+            block_dim=(128, 1, 1),
+            shared_mem_bytes=smem_usage,
+        ),
     )
 
 
@@ -2394,8 +2397,10 @@ def gpu_qint4_repack_GPTQ[
             b,
             b_packed,
             perm_idx,
-            grid_dim=(ceildiv(N, BN), ceildiv(K, BK), 1),
-            block_dim=(128, 1, 1),
+            execution_config=GridBlockLaunchConfig(
+                grid_dim=(ceildiv(N, BN), ceildiv(K, BK), 1),
+                block_dim=(128, 1, 1),
+            ),
         )
 
     else:
@@ -2413,7 +2418,9 @@ def gpu_qint4_repack_GPTQ[
             b,
             b_packed,
             empty_permutation,
-            grid_dim=(ceildiv(N, BN), ceildiv(K, BK), 1),
-            block_dim=(128, 1, 1),
-            shared_mem_bytes=smem_usage,
+            execution_config=GridBlockLaunchConfig(
+                grid_dim=(ceildiv(N, BN), ceildiv(K, BK), 1),
+                block_dim=(128, 1, 1),
+                shared_mem_bytes=smem_usage,
+            ),
         )

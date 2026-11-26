@@ -14,7 +14,6 @@
 
 It runs BF16, or AMD CDNA4 MXFP4 W4A8 under tensor parallelism; expert
 parallelism runs BF16 only.
-Mirrors ``kimi_k3/layers/moe_latent.py``'s ``KimiK3LatentMoE``.
 :func:`expert_parallel_latent_moe` rejects an MXFP4 layer: expert
 parallelism's quantized dispatch needs its own transport kernels, a
 separate piece of work.
@@ -24,10 +23,6 @@ the W4A8 arm below is what actually runs the real model on this hardware
 (AMD CDNA4 / MI355X). See ``lossy_mxfp4_activations_available`` for why
 the alternatives (BF16 dequant, W4A4) aren't built here instead.
 
-Its AMD W4A8 validation (``validate_amd_tp_w4a8``, ``validate_amd_packed_k``)
-is copied from ``kimi_k3.layers.moe_latent`` rather than imported, so this
-port has no build dependency on V2.
-
 ``tensor_parallel_latent_moe`` shards the per-expert FFN width and the
 latent exit's input dim across the ``tp`` mesh axis. Unlike the other
 sharded layers, this block returns a complete value:
@@ -36,7 +31,7 @@ the expert output before the norm, then reduces the exit's and the shared
 branch's partial sums together.
 
 ``expert_parallel_latent_moe`` gives each device whole experts instead,
-exchanging tokens through :mod:`ep` (mirroring ``minimax_m3_modulev3/ep.py``).
+exchanging tokens through :mod:`max.nn.ep`.
 It dispatches the LATENT activations, not the hidden state, since that is
 what the experts actually consume. The block needs no allreduce under
 expert parallelism: the combine already returns final, correctly-ordered,
@@ -50,12 +45,11 @@ BEFORE the gate sees anything, at the full ``hidden_size``, while experts run
 at the narrower ``routed_expert_hidden_size`` latent) without also starving
 the gate of the width it needs. This block instead calls the same shared
 primitives ``QuantizedMoE`` itself calls (``moe_create_indices``,
-``grouped_matmul_ragged``, ``moe_finalize``) directly, the same way K3's V2
-``KimiK3LatentMoE`` does against ``max.graph.ops`` -- reusing the kernel-level
-infrastructure without reusing the monolithic orchestration class.
+``grouped_matmul_ragged``, ``moe_finalize``) directly, reusing the
+kernel-level infrastructure without reusing the monolithic orchestration
+class.
 
-Three non-obvious things this mirrors exactly from the V2 implementation and
-the official reference (``modeling_kimi_linear.py:776-832``):
+Three non-obvious things this mirrors exactly from the official reference (``modeling_kimi_linear.py:776-832``):
 
 * ``routed_expert_down_proj`` [latent, hidden] is the ENTRY (hidden -> latent)
   and ``routed_expert_up_proj`` [hidden, latent] is the EXIT (latent ->
@@ -96,6 +90,7 @@ from max.nn._graph_ops import (
 from max.nn.activation import GatedActivation
 from max.nn.common_layers._sharding import shard_and_stack
 from max.nn.common_layers.mesh_axis import EP, TP
+from max.nn.ep import EPBuffers, combine, dispatch
 from max.nn.ep_config import EPConfig
 from max.nn.kernels import (
     grouped_matmul_ragged,
@@ -115,7 +110,6 @@ from max.tensor.sharding import (
     Partial,
 )
 
-from . import ep
 from .amd_w4a8_validation import validate_amd_packed_k, validate_amd_tp_w4a8
 from .mlp import (
     KimiK3DenseMLP,
@@ -127,11 +121,11 @@ from .moe_router import make_kimi_k3_moe_router
 from .tensor_parallel import check_divisible
 
 # Scale-factor block width for MXFP4/MXFP8: one E8M0 scale per this many
-# elements along the contraction axis. Matches V2's ``_MXFP8_GROUP``.
+# elements along the contraction axis.
 _SF_VECTOR_SIZE = 32
 
-# Per-device K-granule the AMD block-scaled GEMM tiles at; matches V2's
-# ``_AMD_K_GRANULE``. ``validate_amd_packed_k`` checks against this.
+# Per-device K-granule the AMD block-scaled GEMM tiles at.
+# ``validate_amd_packed_k`` checks against this.
 _AMD_K_GRANULE = 128
 
 # Fallback per-expert token cap; serving passes
@@ -162,13 +156,13 @@ def _amd_moe_usage_stats(
     """The host ``[max_tokens_per_expert, num_active_experts]`` pair.
 
     The AMD grouped GEMM reads it.
-    Direct port of V2's ``_host_usage_stats``: ``moe_create_indices`` leaves
+    ``moe_create_indices`` leaves
     its own usage stats on device, while the AMD kernel reads element 0 and 1
     of a HOST ``uint32`` pair, so the bound is computed host-side here. A
     bound too small for this step's real token count silently drops an
-    expert's tail rows rather than erroring -- see that V2 docstring for the
-    real incident (98% of one kernel's launched workgroups were dead grid
-    rows from an unbounded per-expert cap, 47% of decode kernel time).
+    expert's tail rows rather than erroring. An unbounded per-expert cap once
+    left 98% of one kernel's launched workgroups as dead grid rows (47% of
+    decode kernel time).
 
     ``rows`` is the minimum of the static per-expert budget and this step's
     real token count, since no expert can hold more rows than the batch has
@@ -199,7 +193,7 @@ def _quantize_mxfp8(activations: Tensor) -> tuple[TensorValue, TensorValue]:
     """BF16 activations -> (E4M3 values, E8M0 scales), row-major.
 
     MXFP8 is purely block scaled (no per-tensor factor), so ``tensor_sf``
-    stays the identity; matches V2's ``_amd_w4a8_matmul``'s quantize call.
+    stays the identity.
     """
     return quantize_dynamic_block_scaled(
         TensorValue(activations),
@@ -346,9 +340,8 @@ def _amd_w4a8_grouped_matmul(
 ) -> TensorValue:
     """E4M3 activations against packed-MXFP4 weights, row-major (no preshuffle).
 
-    Direct port of V2's ``_amd_w4a8_matmul`` call, without its
-    ``preshuffled_b`` option -- an unmeasured optimization this first
-    MXFP4 commit doesn't add yet.
+    It does not use the ``preshuffled_b`` option, an optimization not yet
+    measured here.
     """
     return grouped_dynamic_block_scaled_matmul_amd(
         TensorValue(activations),
@@ -486,9 +479,8 @@ class KimiK3LatentMoE(Module[..., Tensor]):
 
     Single-device, tensor-parallel after :func:`tensor_parallel_latent_moe`,
     or expert-parallel after :func:`expert_parallel_latent_moe` shards it.
-    Expert-parallel runs through :meth:`expert_parallel_forward` instead of
-    :meth:`forward`, since its exchange needs an ``ep_config``/``ep_buffers``
-    pair ``forward``'s plain-Tensor signature has no room for.
+    Expert-parallel, built with an ``ep_config``, it runs
+    :meth:`expert_parallel_forward` over the exchange's buffers.
     """
 
     def __init__(
@@ -511,6 +503,7 @@ class KimiK3LatentMoE(Module[..., Tensor]):
         amd_w4a8: bool | None = None,
         max_tokens_per_expert: int = _DEFAULT_MAX_TOKENS_PER_EXPERT,
         amd_mega_ffn: bool = True,
+        ep_config: EPConfig | None = None,
     ) -> None:
         """Builds the latent MoE block.
 
@@ -548,8 +541,11 @@ class KimiK3LatentMoE(Module[..., Tensor]):
                 at decode and prefill, its weights preshuffled at model init,
                 rather than as the grouped-matmul chain. Builds without the
                 closed-source kernels keep the chain.
+            ep_config: The routed experts' exchange setup, sized for the
+                latent width, under expert parallelism.
         """
         super().__init__()
+        self.ep_config = ep_config
         self.latent_size = latent_size
         self.num_experts = num_experts
         self.num_experts_per_token = num_experts_per_token
@@ -634,10 +630,9 @@ class KimiK3LatentMoE(Module[..., Tensor]):
         """Stacks every expert's ``leaf`` and places it on the layer's mesh.
 
         Under tensor parallelism each device's gate/up holds, per expert, its
-        slice of the gate rows followed by its slice of the up rows (the
-        weight adapter's ``interleave_for_tp`` layout), and its down holds a
-        slice of the FFN (K) axis, so both split along the FFN width. Under
-        expert parallelism each device holds whole experts.
+        slice of the gate rows followed by its slice of the up rows, and its
+        down holds a slice of the FFN (K) axis, so both split along the FFN
+        width. Under expert parallelism each device holds whole experts.
 
         The MegaFFN's weights land in its preshuffled layout, each device's
         stack written from the host's per-expert buffers with no temporary
@@ -692,28 +687,19 @@ class KimiK3LatentMoE(Module[..., Tensor]):
     def forward(
         self,
         hidden_states: Tensor,
-        *,
-        ep_config: EPConfig | None = None,
-        ep_buffers: ep.EPBuffers | None = None,
+        ep: EPBuffers | None = None,
     ) -> Tensor:
         """Runs the block over ``hidden_states``.
 
         Args:
             hidden_states: ``[T, hidden_size]``.
-            ep_config: This block's expert-parallel exchange setup. Given
-                with ``ep_buffers``, it routes to
-                :meth:`expert_parallel_forward` instead of running this
-                method's own body.
-            ep_buffers: The exchange's graph buffers.
+            ep: The exchange's buffers, under expert parallelism.
 
         Returns:
             ``[T, hidden_size]``, replicated.
         """
-        if ep_config is not None:
-            assert ep_buffers is not None
-            return self.expert_parallel_forward(
-                hidden_states, ep_config, ep_buffers
-            )
+        if ep is not None:
+            return self.expert_parallel_forward(hidden_states, ep)
 
         mesh = self.routed_expert_down_proj.weight.mesh
         sharded = TP in mesh.axis_names and mesh.axis_size(TP) > 1
@@ -1026,8 +1012,8 @@ class KimiK3LatentMoE(Module[..., Tensor]):
         (the W4A8 quantize does that itself, inside its gather kernel).
 
         Returns:
-            The one GEMM's output, the shared expert's ``gate_up_proj``
-            output, sharded as ``gate_up_proj`` itself returns it, the
+            The one GEMM's output, the shared expert's gate/up output,
+            sharded as its own GEMM returns it, the
             replicated latent in the GEMM's output dtype (the leading
             slice of that output), and the replicated fp32 router logits,
             or ``None`` when the router did not join. The shared gate/up
@@ -1039,12 +1025,17 @@ class KimiK3LatentMoE(Module[..., Tensor]):
         mesh = entry.mesh
         dtype = entry.dtype
         tp_size = mesh.axis_size(TP)
-        weights = [entry, self.shared_experts.gate_up_proj.weight]
+        weights = [
+            entry,
+            self.shared_experts.gate_proj.weight,
+            self.shared_experts.up_proj.weight,
+        ]
         widths = [
             tp_size * self.latent_size,
             2 * self.shared_experts.intermediate_size,
         ]
-        if router.dtype == dtype:
+        router_joins = router.dtype == dtype
+        if router_joins:
             weights.append(router)
             widths.append(tp_size * self.num_experts)
         weight = F.call_on_mesh(
@@ -1055,7 +1046,7 @@ class KimiK3LatentMoE(Module[..., Tensor]):
         out = F.matmul(
             hidden_states.cast(dtype),
             weight.T,
-            out_dtype=DType.float32 if len(weights) == 3 else dtype,
+            out_dtype=DType.float32 if router_joins else dtype,
         )
         latent, shared_gate_up, *logits = out.split(widths, axis=-1)
         replicated = NamedMapping(mesh, (None, None))
@@ -1069,36 +1060,33 @@ class KimiK3LatentMoE(Module[..., Tensor]):
         )
 
     def expert_parallel_forward(
-        self,
-        hidden_states: Tensor,
-        ep_config: EPConfig,
-        ep_buffers: ep.EPBuffers,
+        self, hidden_states: Tensor, ep: EPBuffers
     ) -> Tensor:
         """The expert-parallel forward; see :func:`expert_parallel_latent_moe`.
 
         Args:
             hidden_states: ``[T, hidden_size]``, replicated across the mesh.
-            ep_config: Sized for this block's latent width -- see
-                :func:`expert_parallel_latent_moe`.
-            ep_buffers: This block's own dispatch/combine exchange buffers.
+            ep: The exchange's buffers.
 
         Returns:
             ``[T, hidden_size]``, replicated, placed as ``hidden_states``
             was.
         """
+        assert self.ep_config is not None
         topk_idx, topk_weight = self.gate(hidden_states)
         latent = self.routed_expert_down_proj(hidden_states)
 
-        received, src_info = ep.dispatch(
-            ep_config, ep_buffers, latent, F.cast(topk_idx, DType.int32)
+        received, route = dispatch(
+            self.ep_config, ep, latent, F.cast(topk_idx, DType.int32)
         )
-        usage = ep.grouped_matmul_bounds(ep_config)
+        bounds = received.bounds
+        assert isinstance(bounds, Tensor), "a BF16 dispatch has bounds"
         gate_up = grouped_matmul_ragged(
             received.tokens,
             self.experts_gate_up_proj,
-            received.start,
-            received.ids,
-            usage,
+            received.expert_start,
+            received.expert_ids,
+            bounds,
         )
         activated = kimi_situ_and_mul(
             gate_up, self.beta, self.linear_beta, self.moe_intermediate_size
@@ -1106,16 +1094,16 @@ class KimiK3LatentMoE(Module[..., Tensor]):
         expert_out = grouped_matmul_ragged(
             activated,
             self.experts_down_proj,
-            received.start,
-            received.ids,
-            usage,
+            received.expert_start,
+            received.expert_ids,
+            bounds,
         )
 
         # The combine already restores token order and applies
         # `topk_weight`, so unlike `forward`, there is no `moe_finalize`
         # here -- the result is the complete, weighted-combined latent.
-        combined = ep.combine(
-            ep_config, ep_buffers, expert_out, src_info, latent, topk_weight
+        combined = combine(
+            self.ep_config, ep, expert_out, route, latent, topk_weight
         )
         normed = self.routed_expert_norm(combined)
         routed = self.routed_expert_up_proj(normed)
@@ -1146,8 +1134,7 @@ def tensor_parallel_latent_moe(
         # The down weight is packed two values per byte along the expert FFN
         # axis and carries one E8M0 scale per 32 of those values, so a shard
         # boundary that is not a multiple of 32 would split a scale block and
-        # silently rescale the wrong elements -- same check V2 runs before
-        # sharding, via the same shared helper.
+        # silently rescale the wrong elements.
         validate_amd_packed_k(
             latent_size=layer.latent_size,
             per_device_ffn=layer.moe_intermediate_size // tp_size,
@@ -1165,9 +1152,10 @@ def tensor_parallel_latent_moe(
     # layer widths.
     merged = (
         (
-            layer.shared_experts.gate_up_proj,
-            2 * layer.shared_experts.intermediate_size,
+            layer.shared_experts.gate_proj,
+            layer.shared_experts.intermediate_size,
         ),
+        (layer.shared_experts.up_proj, layer.shared_experts.intermediate_size),
         (layer.routed_expert_down_proj, layer.latent_size),
         (layer.gate.gate_score, layer.num_experts),
     )
@@ -1180,7 +1168,8 @@ def tensor_parallel_latent_moe(
         int(linear.weight.shape[0]) == rows for linear, rows in merged
     ), "the merged entry GEMM's N must be the shared gate/up, latent and router"
     assert (
-        layer.shared_experts.gate_up_proj.weight.dtype
+        layer.shared_experts.gate_proj.weight.dtype
+        == layer.shared_experts.up_proj.weight.dtype
         == layer.routed_expert_down_proj.weight.dtype
     ), "the merged entry GEMM needs one dtype for the gate/up and the entry"
     layer.routed_expert_up_proj.weight = layer.routed_expert_up_proj.weight.to(

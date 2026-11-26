@@ -18,7 +18,6 @@ from std.sys.info import align_of, simd_width_of
 from max.algorithm.functional import elementwise
 from std.complex import ComplexSIMD
 from max.gpu.host import DeviceContext
-from max.gpu.host.info import is_cpu
 from layout import (
     Coord,
     CoordLike,
@@ -226,6 +225,7 @@ def rope_ragged[
     )
 
     @inline(.always)
+    @__allow_legacy_any_origin_fields
     def rope_fn[width: Int, alignment: Int = 1](idx_arg: Coord) {var}:
         comptime assert idx_arg.rank == 3, "Invalid rank passed to rope kernel"
         comptime assert freqs_cis.flat_rank >= 2
@@ -338,12 +338,7 @@ def rope_ragged[
         " of your target hardware."
     )
 
-    comptime if context.target.is_cpu():
-        elementwise[simd_width=kernel_simd_width](
-            rope_fn, x.layout.shape_coord(), context
-        )
-    else:
-        elementwise[
-            simd_width=kernel_simd_width,
-            _trace_description="rope",
-        ](rope_fn, x.layout.shape_coord(), context)
+    elementwise[
+        simd_width=kernel_simd_width,
+        _trace_description="rope",
+    ](rope_fn, x.layout.shape_coord(), context)

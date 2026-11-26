@@ -63,6 +63,9 @@ enum class ABIArgClass {
   // Indirect passing
   Memory, // Pass by pointer (struct exceeds register limits)
 
+  // No passing
+  Ignore, // A type without size: no register, no stack slot, no result
+
   // Special cases
   NoClass // Uninitialized or empty
 };
@@ -91,6 +94,11 @@ struct CoercionInfo {
   bool useIndirect = false;
   // In conjunction with useIndirect, set 'byval' on that pointer
   bool useByval = false;
+  /// Alignment in bytes of the memory that an indirect argument or an sret
+  /// result points to, when it is larger than the alignment of the LLVM type.
+  /// An `@align` struct has this alignment. Zero means the alignment of the
+  /// LLVM type.
+  int64_t indirectAlign = 0;
 
   /// For return values >16 bytes (sret convention)
   bool useSRet = false; // If true, use hidden pointer parameter
@@ -128,8 +136,19 @@ struct CoercionInfo {
     return info;
   }
 
+  /// Factory for a value that is not passed. This includes an argument
+  /// without a parameter, or a void result.
+  static CoercionInfo ignore() {
+    CoercionInfo info;
+    info.argClass = ABIArgClass::Ignore;
+    return info;
+  }
+
   /// Check if this is a pass-through (no coercion needed)
   bool isIdentity() const { return argClass == ABIArgClass::NoClass; }
+
+  /// Check if this value is not passed at all.
+  bool isIgnore() const { return argClass == ABIArgClass::Ignore; }
 
   /// Check if this requires two registers
   bool isTwoRegister() const {
@@ -139,7 +158,11 @@ struct CoercionInfo {
 
   /// Get the number of LLVM parameters an argument with this classification
   /// lowers to.
-  unsigned getNumLLVMParams() const { return isTwoRegister() ? 2 : 1; }
+  unsigned getNumLLVMParams() const {
+    if (isIgnore())
+      return 0;
+    return isTwoRegister() ? 2 : 1;
+  }
 };
 
 /// ABI classification for a whole call signature: one CoercionInfo per
@@ -219,6 +242,20 @@ protected:
   /// Get the LLVM type of an unconverted type.
   mlir::Type convertType(mlir::Type type) const;
 
+  /// Get the ABI alignment in bytes of an unconverted type. This includes the
+  /// alignment that `@align` gives a struct. The LLVM type of that struct has
+  /// the alignment of its members only.
+  int64_t getTypeABIAlign(mlir::Type type) const;
+
+  /// Returns true if an unconverted type has no size: an empty struct, a
+  /// zero-length array, or an aggregate of such types.
+  bool isZeroSize(mlir::Type type) const;
+
+  /// Get the natural alignment in bytes of an unconverted type: the alignment
+  /// of a struct's members, without the alignment that `@align` gives the
+  /// struct itself. A member keeps its `@align` alignment.
+  int64_t getNaturalTypeABIAlign(mlir::Type type) const;
+
   /// Classify a whole signature, independent of the role. Internal building
   /// block for computeSignatureInfo.
   ///
@@ -266,12 +303,16 @@ public:
 protected:
   CoercionInfo classifyArgumentType(mlir::Type type, mlir::Location loc,
                                     bool isVariadicArg) const override {
+    if (isZeroSize(type))
+      return CoercionInfo::ignore();
     // Pass through all types unchanged
     return CoercionInfo{}; // Identity: argClass=NoClass
   }
 
   CoercionInfo classifyReturnType(mlir::Type type,
                                   mlir::Location loc) const override {
+    if (isZeroSize(type))
+      return CoercionInfo::ignore();
     // Return all types unchanged
     return CoercionInfo{}; // Identity: argClass=NoClass
   }

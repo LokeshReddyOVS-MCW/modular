@@ -30,9 +30,10 @@ the lane functions below.
 from std.builtin.device_passable import DevicePassable, DeviceTypeEncoder
 from std.math import ceildiv, rsqrt
 
+from algorithm.bisect import bisect_right
 from internal_utils.fp8_utils import cast_saturating
 from max.gpu import WARP_SIZE, block_idx, thread_idx
-from max.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext, GridBlockLaunchConfig
 from max.gpu.primitives import warp
 
 from nn.activations import sigmoid
@@ -93,10 +94,6 @@ struct QkArgs[cache_dtype: DType, freq_dtype: DType = DType.float32](
     ):
         encoder.encode_fields[Self](self, target)
 
-    @staticmethod
-    def get_type_name() -> String:
-        return "QkArgs"
-
 
 @fieldwise_init
 struct GateArgs(DevicePassable, ImplicitlyCopyable):
@@ -117,10 +114,6 @@ struct GateArgs(DevicePassable, ImplicitlyCopyable):
         self, mut encoder: Some[DeviceTypeEncoder], target: MutOpaquePointer[_]
     ):
         encoder.encode_fields[Self](self, target)
-
-    @staticmethod
-    def get_type_name() -> String:
-        return "GateArgs"
 
 
 @always_inline
@@ -144,15 +137,16 @@ def head_norm(x: Piece, eps: Float32) -> Piece:
 @always_inline
 def _batch_of(offsets: In[DType.uint32], batch: Int, token: Int) -> Int:
     """The sequence holding `token`: the last offset at or below it."""
-    var lo = 0
-    var hi = batch
-    while hi - lo > 1:
-        var mid = (lo + hi) // 2
-        if Int(offsets[unsafe_offset=mid]) <= token:
-            lo = mid
-        else:
-            hi = mid
-    return lo
+
+    return max(
+        bisect_right(
+            batch,
+            token,
+            lambda (i: Int) {offsets} -> Int: Int(offsets[unsafe_offset=i]),
+        )
+        - 1,
+        0,
+    )
 
 
 @always_inline
@@ -298,8 +292,10 @@ def qk_norm_rope_store[
         ]
     ](
         a,
-        grid_dim=ceildiv(lanes, THREADS),
-        block_dim=THREADS,
+        execution_config=GridBlockLaunchConfig(
+            grid_dim=ceildiv(lanes, THREADS),
+            block_dim=THREADS,
+        ),
     )
 
 
@@ -315,6 +311,8 @@ def head_norm_gate[
         return
     ctx.enqueue_function[_gate_kernel[n_heads=n_heads, poison=poison]](
         a,
-        grid_dim=ceildiv(lanes, THREADS),
-        block_dim=THREADS,
+        execution_config=GridBlockLaunchConfig(
+            grid_dim=ceildiv(lanes, THREADS),
+            block_dim=THREADS,
+        ),
     )

@@ -128,9 +128,9 @@ def LowerCompiledRoutines: Pass<"mogg-lower-compiled-routines", "ModuleOp"> {
     compiled code.
   }];
 
-  let dependentDialects = ["MEF::MEFDialect",
+  let dependentDialects = ["MLRT::MEF::MEFDialect",
                           "MGP::MGPDialect",
-                          "GRT::GRTDialect",
+                          "MLRT::GRT::GRTDialect",
                           "MOGG::MOGGDialect"];
 }
 
@@ -142,9 +142,9 @@ def SequenceFusion: Pass<"mogg-sequence-fusion", "MGP::ModelOp"> {
     Option<"enableTransitiveFusion", "enable-transitive-fusion", "bool", "false",
       "Flag to allow control of fusion pass">
   ];
-  let dependentDialects = ["MEF::MEFDialect",
+  let dependentDialects = ["MLRT::MEF::MEFDialect",
                           "MGP::MGPDialect",
-                          "GRT::GRTDialect",
+                          "MLRT::GRT::GRTDialect",
                           "MOGG::MOGGDialect"];
 }
 
@@ -201,24 +201,28 @@ def OutlineAsyncRoutines: Pass<"mogg-outline-async-routines", "ModuleOp"> {
 
 def FormGraphBlobs
     : Pass<"mogg-form-graph-blobs", "mlir::ModuleOp"> {
-  let summary = "Fuse groups of declarative routines into graph blobs.";
+  let summary = "Fuse groups of device routines into graph blobs.";
   let description = [{
-    Replaces each group of declarative `mogg.routine`s with one routine that
-    runs the routines' bodies in order inside a `mogg.graph_blob`, so the group
-    launches as one device kernel. A group holds sequences, where one routine
-    reads another's results, and siblings that don't depend on each other. The
-    fused routine reads what the routines read from outside the group and
-    returns every routine's results.
+    Replaces each group of `mogg.routine`s that each call a declarative kernel
+    or run a generated elementwise loop (`mogg.call.foreach`) with one routine
+    that runs the routines' bodies in order inside a `mogg.graph_blob`, so the
+    group launches as one device kernel. A routine joins only when the launch
+    can take, or its kernel can build, every operand of its call. A group holds
+    sequences, where one routine reads another's results, and siblings that
+    don't depend on each other. The fused routine reads what the routines read
+    from outside the group and returns every routine's results.
 
     Each group runs on one device. It ends at the first routine with a result
-    that something outside the group reads, other than another declarative
-    routine on that device or the block's terminator, such as the graph's
-    output, so no path leaves the group and comes back in. Device graphs are
-    left alone. Runs before `OutlineRoutines`, which outlines the fused
-    routine.
+    that something outside the group reads, other than another routine that
+    can join it on that device or the block's terminator, such as the graph's
+    output, so no path leaves the group and comes back in. Device graphs and
+    routines on the host, which has no blob launch, are left alone. Runs before
+    `OutlineRoutines`, which outlines the fused routine.
 
     The group size is also limited by the `max-calls` configuration flag. With
-    `max-calls` at 0, no graph blobs will be formed.
+    `max-calls` at 0, no graph blobs will be formed. The pass doesn't check
+    that the target handles graph blobs, so set `max-calls` only for targets
+    whose MAX plugin does.
   }];
 
   let dependentDialects = [
@@ -253,6 +257,30 @@ def ReuseGraphBlobBuffers : Pass<"mogg-reuse-graph-blob-buffers"> {
     "M::MO::MODialect",
     "M::MOGG::MOGGDialect",
   ];
+}
+
+def LowerGraphBlobs : Pass<"mogg-lower-graph-blobs"> {
+  let summary = "Write each graph blob as host ops and one kernel launch.";
+  let description = [{
+    Replaces each `mogg.graph_blob` with the host ops that launch it and a
+    `mogg.graph_blob.launch` whose region is the kernel. The host computes each
+    declarative call's configuration, the blob's launch configuration, and the
+    part of the launch each call runs on. The kernel runs each call in a
+    `mogg.graph_blob.call`, in the blob's order, with a barrier between
+    consecutive calls. A generated loop (`mogg.call.foreach`) has no
+    configuration: it runs on the whole launch, as a
+    `mogg.graph_blob.foreach`.
+
+    Each call builds its operands from the values that cross the launch. A
+    value crosses when the kernel can't build it: a routine argument, or the
+    result of an op whose results are built on the host. A value that several
+    calls use crosses once. A value the host builds that can't cross is an
+    error.
+
+    Assumes every call in a blob runs on the blob's device context.
+  }];
+
+  let dependentDialects = ["M::MOGG::MOGGDialect"];
 }
 
 def OutlineRoutines
@@ -300,7 +328,8 @@ def RowwiseCreateTile
     skipped `map-rcse`) a tile that loads the capture its first fold reads
     at the element index, and turns those loads, in every phase, into
     `mogg.rowwise.tile.load`. Sets `keep_tile` when more than one phase
-    reads the tile.
+    reads the tile, or the kernel has a `mogg.rowwise.cache`, which computes
+    from the kept tile.
   }];
 
   let dependentDialects = ["MOGG::MOGGDialect"];
@@ -342,10 +371,11 @@ def RowwiseSetLaunchParams
     - A body that writes one value per row has `num_phases` 1 and
       `dtype_size` 0, and is expensive when its per-element cost reaches
       the threshold.
-    - A body that writes every element has `num_phases` folds + 1, and is
-      expensive. `dtype_size` is the row's element size, which lets a long
-      row split, when every fold keeps one field (as in rms_norm and
-      softmax), else 0 (as in layer_norm).
+    - A body that writes every element has `num_phases` folds + 1, not
+      counting folds of a `mogg.rowwise.cache`, and is expensive.
+      `dtype_size` is the row's element size, which lets a long row split,
+      when every fold keeps one field (as in rms_norm and softmax) and
+      there is no cache, else 0 (as in layer_norm).
 
     Runs after `mogg-rowwise-group-row-stores`, which leaves no store
     directly in the body.
@@ -365,9 +395,10 @@ def RowwiseSetLaunchParams
 def AnonymizeDimNames: Pass<"mogg-anonymize-dim-names", "ModuleOp"> {
   let summary = "Drop symbolic dim names from every kernel stub's signature.";
   let description = [{
-    Turns every `!mogg.dim<name>` in a `mogg.func` signature into
-    `!mogg.dim`, so `MergeIdenticalFuncs` can merge stubs that differ
-    only in dim names. Runs inside `EmitMojo` just before that merge.
+    Turns every `!mogg.dim<name>` in a `mogg.func` signature, and every one
+    that a block nested in its body takes, into `!mogg.dim`, so
+    `MergeIdenticalFuncs` can merge stubs that differ only in dim names. Runs
+    inside `EmitMojo` just before that merge.
   }];
 
   let dependentDialects = ["MOGG::MOGGDialect"];
@@ -446,9 +477,9 @@ def EmitMojo: Pass<"mogg-emit-mojo", "ModuleOp"> {
       "Flag to add prints for the fused tensor specs in the lambdas">
   ];
 
-  let dependentDialects = ["MEF::MEFDialect",
+  let dependentDialects = ["MLRT::MEF::MEFDialect",
                           "MGP::MGPDialect",
-                          "GRT::GRTDialect",
+                          "MLRT::GRT::GRTDialect",
                           "MOGG::MOGGDialect",
                           "M::KGEN::KGENDialect",
                           "M::KGEN::LIT::LITDialect",
@@ -467,9 +498,9 @@ def DumpMojo: Pass<"mogg-dump-mojo", "ModuleOp"> {
     Dumps the emitted Mojo to stderr.
   }];
 
-  let dependentDialects = ["MEF::MEFDialect",
+  let dependentDialects = ["MLRT::MEF::MEFDialect",
                           "MGP::MGPDialect",
-                          "GRT::GRTDialect",
+                          "MLRT::GRT::GRTDialect",
                           "MOGG::MOGGDialect",
                           "M::KGEN::KGENDialect",
                           "M::KGEN::LIT::LITDialect",
@@ -500,9 +531,9 @@ def LoadMojo: Pass<"mogg-load-mojo", "ModuleOp"> {
       "The label for resulting MGP graph. Default is mof.">
   ];
 
-  let dependentDialects = ["MEF::MEFDialect",
+  let dependentDialects = ["MLRT::MEF::MEFDialect",
                           "MGP::MGPDialect",
-                          "GRT::GRTDialect",
+                          "MLRT::GRT::GRTDialect",
                           "MOGG::MOGGDialect",
                           "M::KGEN::KGENDialect",
                           "M::KGEN::LIT::LITDialect",

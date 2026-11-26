@@ -148,8 +148,8 @@ struct DriverPluginTest : ::testing::Test {
       if (!session) {
         session = std::make_unique<SharedPluginSession>();
         // Its own reference keeps the plugin loaded between tests.
-        session->soHandle = dlopen(pluginSpec, RTLD_NOW);
-        ASSERT_TRUE(session->soHandle != nullptr);
+        session->soHandle = dlopen(soPath.str().c_str(), RTLD_NOW);
+        ASSERT_TRUE(session->soHandle != nullptr) << dlerror();
         session->destroy = destroy;
         session->context_destroy = context_destroy;
         DO_TEST(create(&version, &session->driver));

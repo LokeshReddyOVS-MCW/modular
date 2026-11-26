@@ -59,7 +59,12 @@ from max.gpu.primitives.grid_controls import (
     pdl_launch_attributes,
 )
 from max.gpu.sync import cp_async_bulk_commit_group, cp_async_bulk_wait_group
-from max.gpu.host import DeviceBuffer, DeviceContext, get_gpu_target
+from max.gpu.host import (
+    DeviceBuffer,
+    DeviceContext,
+    GridBlockLaunchConfig,
+    get_gpu_target,
+)
 from max.gpu.host.info import _is_sm10x_gpu
 
 from std.utils import StaticTuple
@@ -255,6 +260,7 @@ def _allgather_naive[
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(BLOCK_SIZE))
 )
 @__name(t"allgather_p2p_{dtype}")
+@__allow_legacy_any_origin_fields
 def _allgather_p2p_kernel[
     dtype: DType,
     rank: Int,
@@ -550,6 +556,7 @@ def _allgather_p2p_tma[
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(BLOCK_SIZE))
 )
 @__name(t"allgather_relay_{dtype}")
+@__allow_legacy_any_origin_fields
 def _allgather_relay_kernel[
     dtype: DType,
     ngpus: Int,
@@ -851,12 +858,15 @@ def _allgather_p2p_relay[
         Int32(recipe.relay_percent),
         Int32(num_direct_blocks),
         Int32(my_rank),
-        grid_dim=num_direct_blocks + num_relay_blocks,
-        block_dim=BLOCK_SIZE,
+        execution_config=GridBlockLaunchConfig(
+            grid_dim=num_direct_blocks + num_relay_blocks,
+            block_dim=BLOCK_SIZE,
+        ),
     )
 
 
 @inline(.always)
+@__allow_legacy_any_origin_fields
 def _allgather_p2p[
     dtype: DType,
     rank: Int,

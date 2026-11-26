@@ -76,7 +76,6 @@ def StructType : DialectType<(type
   TypedAttr:$elementTypesVariadic,
   TypedAttr:$isMemoryOnly,
   TypedAttr:$minAlignment,
-  Bool:$isParamPack,
   EnumAttr<"::M::KGEN::StructDomain">:$domain
 )>;
 
@@ -222,12 +221,6 @@ def SingletonAttr : DialectAttribute<(attr
   Type:$type
 )>;
 
-def UnboundAttr : DialectAttribute<(attr
-  Type:$type
-)> {
-  let cBuilder = "get<$_resultType>(context, $_args)";
-}
-
 def NoneAttr : DialectAttribute<(attr)>;
 
 def ParamDeclRefAttr : DialectAttribute<(attr
@@ -252,7 +245,8 @@ def WrappedTypeParamAttr : DialectAttribute<(attr
 def BindParamsAttr : DialectAttribute<(attr
   ConcreteAttribute<"TypedAttr">:$generator,
   ConcreteAttribute<"ParamsBindingArrayAttr">:$params,
-  ConcreteOptionalAttribute<"DenseBoolArrayAttr">:$discharged
+  ConcreteOptionalAttribute<"DenseBoolArrayAttr">:$discharged,
+  Type:$type
 )> {
   let cBuilder = "BindParamsAttr::getFromBytecode($_args)";
 }
@@ -628,7 +622,6 @@ def KGENDialectAttributes : DialectAttributes<"kgen"> {
     ParamListGetAttr,
     ParamListConcatAttr,
     UnknownAttr,
-    UnboundAttr,
     NoneAttr,
     ParamDeclRefAttr,
     ParamIndexRefAttr,

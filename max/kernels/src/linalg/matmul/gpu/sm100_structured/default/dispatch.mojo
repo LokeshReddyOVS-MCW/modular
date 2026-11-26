@@ -14,7 +14,8 @@
 
 Selects between GEMV, split-K GEMV, small-MN GEMMs, heuristic outlier configs,
 and the warp-specialized TMA/UMMA tile GEMM based on problem shape and dtype,
-falling back to vendor BLAS only for untuned or low-performance shapes.
+falling back to vendor BLAS only for untuned or low-performance shapes and for
+operands that are not 16-byte aligned.
 """
 from std.math import align_up, ceildiv
 from std.sys import (
@@ -183,7 +184,13 @@ def _small_MN_gemms_impl[
                 pdl_level=pdl_level,
             ]
             ctx.enqueue_function[kernel](
-                GridBlockAttributeLaunchConfig(
+                c,
+                a.as_imm(),
+                b.as_imm(),
+                Int32(m),
+                Int32(n),
+                Int32(k),
+                execution_config=GridBlockAttributeLaunchConfig(
                     grid_dim=(
                         ceildiv(m, config.tile_m),
                         ceildiv(n, config.tile_n),
@@ -191,12 +198,6 @@ def _small_MN_gemms_impl[
                     block_dim=config.num_threads,
                     attributes=pdl_launch_attributes(pdl_level),
                 ),
-                c,
-                a.as_imm(),
-                b.as_imm(),
-                Int32(m),
-                Int32(n),
-                Int32(k),
                 host_args=(epilogue_fn,),
             )
         elif has_compute_fn:
@@ -221,7 +222,13 @@ def _small_MN_gemms_impl[
                 pdl_level=pdl_level,
             ]
             ctx.enqueue_function[kernel](
-                GridBlockAttributeLaunchConfig(
+                c,
+                a.as_imm(),
+                b.as_imm(),
+                Int32(m),
+                Int32(n),
+                Int32(k),
+                execution_config=GridBlockAttributeLaunchConfig(
                     grid_dim=(
                         ceildiv(m, config.tile_m),
                         ceildiv(n, config.tile_n),
@@ -229,12 +236,6 @@ def _small_MN_gemms_impl[
                     block_dim=config.num_threads,
                     attributes=pdl_launch_attributes(pdl_level),
                 ),
-                c,
-                a.as_imm(),
-                b.as_imm(),
-                Int32(m),
-                Int32(n),
-                Int32(k),
                 host_args=(compute_fn,),
             )
         else:
@@ -258,7 +259,13 @@ def _small_MN_gemms_impl[
                 pdl_level=pdl_level,
             ]
             ctx.enqueue_function[kernel](
-                GridBlockAttributeLaunchConfig(
+                c,
+                a.as_imm(),
+                b.as_imm(),
+                Int32(m),
+                Int32(n),
+                Int32(k),
+                execution_config=GridBlockAttributeLaunchConfig(
                     grid_dim=(
                         ceildiv(m, config.tile_m),
                         ceildiv(n, config.tile_n),
@@ -266,12 +273,6 @@ def _small_MN_gemms_impl[
                     block_dim=config.num_threads,
                     attributes=pdl_launch_attributes(pdl_level),
                 ),
-                c,
-                a.as_imm(),
-                b.as_imm(),
-                Int32(m),
-                Int32(n),
-                Int32(k),
             )
 
 
@@ -455,8 +456,9 @@ def matmul_dispatch_sm100[
     Routes the problem to GEMV for M=1 or N=1 shapes, to the IEEE-fp32 split-K
     GEMV for precise float32, or to the dtype-specific SM100 dispatcher (bf16,
     fp8, fp32) for general shapes, falling back to vendor BLAS when no Mojo
-    SM100 config applies. In autotuning mode, launches a single
-    compile-time-configured kernel from environment defines.
+    SM100 config applies or an operand is not 16-byte aligned. In autotuning
+    mode, launches a single compile-time-configured kernel from environment
+    defines.
 
     Parameters:
         c_type: Output element type (inferred).
@@ -653,6 +655,23 @@ def _matmul_dispatch_sm100_impl[
             > 0 else None,
         ](c, a, b, ctx)
 
+    # The GEMVs and TMA need 16-byte-aligned operands, and a graph can pass one
+    # that starts inside a larger buffer, such as one row of a column slice.
+    # Vendor BLAS takes any address, but it rounds fp32 to TF32 and its compute
+    # pass needs an aligned `c`, so those cases keep the paths below.
+    comptime if use_tf32 or a_type != .float32:
+        var c_aligned = Int(c.unsafe_ptr()) % 16 == 0
+        if (
+            Int(a.unsafe_ptr()) % 16 != 0
+            or Int(b.unsafe_ptr()) % 16 != 0
+            or not c_aligned
+        ) and (c_aligned or not has_compute_fn):
+            return _vendor_blas_matmul_sm100[
+                transpose_b=transpose_b,
+                has_epilogue_fn=has_epilogue_fn,
+                has_compute_fn=has_compute_fn,
+            ](c, a, b, epilogue_fn, compute_fn, ctx)
+
     # M = 1 (or N = 1): dispatch to the GEMV, which routes the (N, K) shapes
     # in `SM100_GEMV_SHAPES` back to the SM100 GEMM.
     comptime if a_type in (DType.bfloat16, DType.float8_e4m3fn):
@@ -679,8 +698,10 @@ def _matmul_dispatch_sm100_impl[
     # (~ceildiv(M, tile_m) * N*K) at the cost of a larger per-thread
     # [tile_m, tile_n] accumulator and warp-reduce tail, so the optimum is
     # M-dependent and non-monotone (grid quantization). The bucket boundaries
-    # below are the swept winners on B200; crossover to the tile GEMM is M=64
-    # (its tensor-core weight reuse wins for larger M). KERN-3076.
+    # below are the swept winners on B200; crossover to the tile GEMM is
+    # max(64, min(256, 8192 // N)) rows: 64 at N=128 (its tensor-core weight
+    # reuse wins for larger M), later for a narrower N, which leaves the tile
+    # GEMM a CTA or two. KERN-3076.
     #
     # Gate is conservative so FP32 shapes the tile GEMM serves better are not
     # diverted: static_N<=256 (weight dominates; wider N favors MMA) and
@@ -707,6 +728,8 @@ def _matmul_dispatch_sm100_impl[
     )
 
     comptime if has_precise_f32_gemv:
+        comptime gemv_max_m = max(64, min(256, 8192 // static_N))
+
         # tile_m is a comptime kernel param, so each bucket instantiates a
         # distinct gemv_split_k; the runtime `m` selects the bucket.
         def _dispatch_split_k[tile_m: Int]() raises {imm}:
@@ -724,11 +747,11 @@ def _matmul_dispatch_sm100_impl[
         elif m <= 12:
             _dispatch_split_k[2]()
             return
-        # m > 64 normally crosses over to the UMMA tile GEMM, which truncates
-        # fp32 operands to TF32's 10-bit mantissa (accumulation stays fp32).
+        # Past gemv_max_m the UMMA tile GEMM takes over, which truncates fp32
+        # operands to TF32's 10-bit mantissa (accumulation stays fp32).
         # use_tf32=False keeps every M on this IEEE-fp32 GEMV instead
         # (KERN-3151), giving up tensor-core weight reuse at large M.
-        elif m <= 64 or not use_tf32:
+        elif m <= gemv_max_m or not use_tf32:
             _dispatch_split_k[4]()
             return
 
@@ -1601,16 +1624,16 @@ def _vendor_blas_matmul_sm100[
                     b_engine=type_of(b).Engine,
                 ]
                 ctx.enqueue_function[kernel](
-                    GridBlockLaunchConfig(
-                        grid_dim=grid_dim,
-                        block_dim=(BLOCK_DIM, BLOCK_DIM),
-                    ),
                     c,
                     a,
                     b,
                     Int32(m),
                     Int32(n),
                     Int32(k),
+                    execution_config=GridBlockLaunchConfig(
+                        grid_dim=grid_dim,
+                        block_dim=(BLOCK_DIM, BLOCK_DIM),
+                    ),
                     host_args=(epilogue_fn,),
                 )
             elif has_compute_fn:
@@ -1629,16 +1652,16 @@ def _vendor_blas_matmul_sm100[
                     b_engine=type_of(b).Engine,
                 ]
                 ctx.enqueue_function[kernel](
-                    GridBlockLaunchConfig(
-                        grid_dim=grid_dim,
-                        block_dim=(BLOCK_DIM, BLOCK_DIM),
-                    ),
                     c,
                     a,
                     b,
                     Int32(m),
                     Int32(n),
                     Int32(k),
+                    execution_config=GridBlockLaunchConfig(
+                        grid_dim=grid_dim,
+                        block_dim=(BLOCK_DIM, BLOCK_DIM),
+                    ),
                     host_args=(compute_fn,),
                 )
             else:
@@ -1656,16 +1679,16 @@ def _vendor_blas_matmul_sm100[
                     b_engine=type_of(b).Engine,
                 ]
                 ctx.enqueue_function[kernel](
-                    GridBlockLaunchConfig(
-                        grid_dim=grid_dim,
-                        block_dim=(BLOCK_DIM, BLOCK_DIM),
-                    ),
                     c,
                     a,
                     b,
                     Int32(m),
                     Int32(n),
                     Int32(k),
+                    execution_config=GridBlockLaunchConfig(
+                        grid_dim=grid_dim,
+                        block_dim=(BLOCK_DIM, BLOCK_DIM),
+                    ),
                 )
         return
 

@@ -45,6 +45,9 @@ from max._driver.max_license.device_context_dispatch.device_function import (
     DeviceExternalFunction,
     DeviceFunction,
 )
+from max._driver.max_license.device_context_dispatch.backend_selection import (
+    HAL_DEVICE_CONTEXT,
+)
 from max.runtime.async_value import AnyAsyncValueRef
 
 from .device_context import (
@@ -706,6 +709,10 @@ struct LegacyDeviceGraph(ImplicitlyCopyable, Writable):
             ctx.synchronize()
         ```
         """
+        comptime __guard not HAL_DEVICE_CONTEXT else:
+            raise Error(
+                "device graphs are unsupported by the HAL DeviceContext"
+            )
         # const char *AsyncRT_DeviceGraph_replay(DeviceGraph *graph)
         _checked(
             external_call[
@@ -749,6 +756,10 @@ struct LegacyDeviceGraph(ImplicitlyCopyable, Writable):
             If publishing a slot, enqueuing a wait, replaying a graph, or
             synchronizing a context fails.
         """
+        comptime __guard not HAL_DEVICE_CONTEXT else:
+            raise Error(
+                "device graphs are unsupported by the HAL DeviceContext"
+            )
         for graph in graphs:
             graph._patch_stable_addresses()
 
@@ -884,6 +895,10 @@ struct LegacyDeviceGraph(ImplicitlyCopyable, Writable):
             ctx.synchronize()
         ```
         """
+        comptime __guard not HAL_DEVICE_CONTEXT else:
+            raise Error(
+                "device graphs are unsupported by the HAL DeviceContext"
+            )
         var result = Array[Optional[LegacyDeviceGraph], N]()
 
         # Slots are keyed by the collective alone: every device's graph, in
@@ -994,6 +1009,10 @@ struct LegacyDeviceGraph(ImplicitlyCopyable, Writable):
             ctx.synchronize()
         ```
         """
+        comptime __guard not HAL_DEVICE_CONTEXT else:
+            raise Error(
+                "device graphs are unsupported by the HAL DeviceContext"
+            )
         var ctxs: Array[DeviceContext[], 1] = [ctx.assert_default_target()]
 
         def collective_key[n: Int]() {imm} -> String:
@@ -1071,6 +1090,10 @@ struct LegacyDeviceGraph(ImplicitlyCopyable, Writable):
             ctx.synchronize()
         ```
         """
+        comptime __guard not HAL_DEVICE_CONTEXT else:
+            raise Error(
+                "device graphs are unsupported by the HAL DeviceContext"
+            )
         var result: _DeviceGraphBuilderPtr[mut=True] = {}
 
         # const char *AsyncRT_DeviceContext_createGraphBuilder(
@@ -1675,10 +1698,6 @@ struct LegacyDeviceGraphBuilder[arena_origin: ImmOrigin](Movable):
             block_dim, location=call_location()
         )
 
-        var inferred_func_attribute = self._ctx._func_attribute_for_launch(
-            func_attribute, shared_mem_bytes
-        )
-
         var gpu_kernel = self.context().compile_function[
             func,
             dump_asm=dump_asm,
@@ -1686,7 +1705,7 @@ struct LegacyDeviceGraphBuilder[arena_origin: ImmOrigin](Movable):
             link_options=link_options,
             _dump_sass=_dump_sass,
             _ptxas_info_verbose=_ptxas_info_verbose,
-        ](func_attribute=inferred_func_attribute)
+        ](func_attribute=func_attribute)
 
         return self.add_function(
             gpu_kernel,

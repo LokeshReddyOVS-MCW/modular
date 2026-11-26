@@ -417,6 +417,17 @@
             },
             {
               "type": "category",
+              "label": "ep",
+              "link": {
+                "type": "doc",
+                "id": "api/python/nn.ep"
+              },
+              "items": [
+                "__AUTOGEN:max.nn.ep__"
+              ]
+            },
+            {
+              "type": "category",
               "label": "kv_cache",
               "link": {
                 "type": "doc",
@@ -505,6 +516,7 @@
                 "api/python/pipelines.architectures.kimik2_5",
                 "api/python/pipelines.architectures.laguna",
                 "api/python/pipelines.architectures.lfm2",
+                "api/python/pipelines.architectures.lfm2_vl",
                 "api/python/pipelines.architectures.lfm3",
                 "api/python/pipelines.architectures.lfm3_audio",
                 "api/python/pipelines.architectures.lfm3_omni",
@@ -1192,6 +1204,7 @@
         "gpu/hardware-compatibility",
         "gpu/architecture",
         "gpu/fundamentals",
+        "gpu/memory",
         "gpu/block-and-warp",
         "gpu/debugging",
         {

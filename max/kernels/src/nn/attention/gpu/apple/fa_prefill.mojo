@@ -50,7 +50,7 @@ from max.gpu.compute.arch.mma_apple import (
     _apple_frag_layout,
     _mma_apple_transposable,
 )
-from max.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext, GridBlockLaunchConfig
 from max.gpu.primitives.warp import shuffle_xor
 from std.math import ceildiv, exp2
 from std.math.constants import log2e
@@ -990,6 +990,7 @@ def fa_prefill_apple[
         comptime D = di * MMA_DIM
         if depth == D:
 
+            @__allow_legacy_any_origin_fields
             def _enqueue[sg: Int]() raises {var}:
                 comptime core_kernel = fa_prefill_apple_core[
                     q_type,
@@ -1030,8 +1031,10 @@ def fa_prefill_apple[
                     Int32(num_heads),
                     Int32(depth),
                     Int32(group),
-                    grid_dim=(num_q_tiles, num_heads, batch_size),
-                    block_dim=sg * WARP_SIZE,
+                    execution_config=GridBlockLaunchConfig(
+                        grid_dim=(num_q_tiles, num_heads, batch_size),
+                        block_dim=sg * WARP_SIZE,
+                    ),
                 )
 
             def _dispatch[sg: Int]() raises {var}:

@@ -30,6 +30,7 @@ fields a `std.testing._ffi.CField` annotation that names a different C field
 or the field's C type.
 """
 
+from std.builtin.rebind import downcast
 from std.ffi import external_call
 from std.reflection.type_info import _unqualified_type_name
 from std.sys import align_of, size_of
@@ -228,8 +229,12 @@ def _c_field_name[T: AnyType, index: Int]() -> String:
 def struct_checks[T: AnyType]() raises -> String:
     """Returns the reporters for a struct and all of its fields.
 
+    A bare mirror is named verbatim after its C counterpart and spelled
+    `struct <name>` in C. An `AbiTypedefLike` entry supplies its own C name,
+    spelled as is, which covers a struct C only declares through a typedef.
+
     Parameters:
-        T: The Mojo mirror struct.
+        T: The Mojo mirror struct, or an `AbiTypedefLike` entry for one.
 
     Returns:
         One `MOJO_CHECK_CABI_LAYOUT` line, one `MOJO_CHECK_CABI_FIELD` line
@@ -257,7 +262,7 @@ def struct_checks[T: AnyType]() raises -> String:
         )
         var c_type = _cfield_of[T, i]().c_type
         match c_type:
-            case .default:
+            case .default():
                 out += _implied_type_check[types[i]](name, field)
             case _:
                 out += String(
@@ -279,14 +284,14 @@ def _c_type_decl(c_type: CType) raises -> String:
         array type.
 
     Raises:
-        If `c_type` is `.default`, which spells no type.
+        If `c_type` is `.default()`, which spells no type.
     """
     match c_type:
         case .type(name):
             return String(t"{name} *ptr")
         case .array(name, count):
             return String(t"{name} (*ptr)[{count}]")
-        case .default:
+        case .default():
             raise Error("CType.default spells no C type")
 
 
@@ -376,7 +381,8 @@ def emit_cabi_checks_for(
     Args:
         includes: The headers that declare the C side, each spelled as it
             is included (for example `<netinet/in.h>`).
-        structs: The struct mirrors to check.
+        structs: The struct mirrors to check, bare or as `AbiTypedefLike`
+            entries.
         typedefs: The type aliases to check.
         constants: The constants to check.
 
@@ -512,7 +518,7 @@ def assert_cabi_struct[T: AnyType]() raises:
     per-field checks, and a `CField` annotation can rename a C field.
 
     Parameters:
-        T: The Mojo mirror struct.
+        T: The Mojo mirror struct, or an `AbiTypedefLike` entry for one.
 
     Raises:
         When the size, alignment, or any field's offset or size differs.
@@ -544,7 +550,8 @@ def assert_cabi_checks_for[
     are the ones that function generates for the same declarations.
 
     Parameters:
-        structs: The struct mirrors to check.
+        structs: The struct mirrors to check, bare or as `AbiTypedefLike`
+            entries.
         typedefs: The type aliases to check.
         constants: The constants to check.
 

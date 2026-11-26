@@ -273,16 +273,16 @@ public:
   ///   evaluated statically (e.g., generic parameters)
   ///
   /// If concreteType is provided, its parameter bindings are used to evaluate
-  /// conditional trait conformances. If callerAssumptions is non-empty, those
-  /// where-clause assumptions are used to prove unfoldable constraints.
+  /// conditional trait conformances. The `callerAssumptions` set is used to
+  /// prove unfoldable constraints.
   TriBool doesNominalTypeConformTo(TraitType trait, ASTType concreteType,
-                                   ArrayRef<ConstraintAttr> callerAssumptions);
+                                   TypedAttr callerAssumptions);
 
   /// Same, additionally collecting the problematic constraints so a diagnosing
   /// caller can name them.
-  ConstraintResult doesNominalTypeConformToWithDetails(
-      TraitType trait, ASTType concreteType,
-      ArrayRef<ConstraintAttr> callerAssumptions);
+  ConstraintResult
+  doesNominalTypeConformToWithDetails(TraitType trait, ASTType concreteType,
+                                      TypedAttr callerAssumptions);
 
   /// Find all extensions in this scope that target a specific struct.
   /// If filterTrait is provided, only returns extensions that implement that
@@ -387,14 +387,9 @@ public:
   void setExplicitParamScope() { isExplicitParamScope = true; }
   bool getIsExplicitParamScope() const { return isExplicitParamScope; }
 
-  /// Get the set of assumptions for this decl and all its parent decls.
-  void getKnownAssumptionsIncludingParents(
-      SmallVectorImpl<ConstraintAttr> &assumptions) const;
-
-  /// If scope is non-null, returns its assumptions (including parents);
-  /// otherwise returns an empty vector.
-  static llvm::SmallVector<ConstraintAttr>
-  getAssumptionsFromScope(const ASTDecl *scope);
+  /// Returns the assumption set (see `LIT::buildAssumptions`) of this decl and
+  /// all its parent decls.
+  TypedAttr getScopeAssumptions() const;
 
   /// Insert a set of assumptions into this decl.
   void insertKnownAssumptions(ArrayRef<ConstraintAttr> assumptions);
@@ -539,10 +534,9 @@ private:
   /// @__doc_inline.
   std::unique_ptr<llvm::DenseSet<mlir::StringAttr>> docInlineNames;
 
-  /// This is the set of constraints that can be assumed to be true inside
-  /// this declaration. It may reference parameter declarations from this
-  /// ASTDecl or its parent ASTDecls.
-  std::unique_ptr<llvm::SetVector<ConstraintAttr>> knownAssumptions;
+  /// The conjunction of facts assumed inside this decl, including those of
+  /// all parent decls. Null means the same as the parent's.
+  TypedAttr scopeAssumptions;
 };
 
 /// An AST declaration backed by an MLIR operation through shared storage.
@@ -782,11 +776,24 @@ public:
   LogicalResult resolveBody(Lexer &lexer) override;
   LogicalResult resolveSyntheticBody() override;
 
+  /// The namespace components, outermost first, that this package is bound
+  /// under while it is parsed as a source package that gets precompiled
+  /// under `--namespace`. Empty otherwise: a loaded precompiled package
+  /// carries its namespace as parent decls instead.
+  ArrayRef<std::string> getNamespaceComponents() const {
+    return namespaceComponents;
+  }
+  void setNamespaceComponents(ArrayRef<StringRef> components) {
+    namespaceComponents.assign(components.begin(), components.end());
+  }
+
 private:
   friend class M::BumpAllocator;
   friend class DeclResolver;
 
   LogicalResult resolvePackage();
+
+  std::vector<std::string> namespaceComponents;
 
   PackageASTDecl(SharedState &shared, PackageOp packageOp, llvm::SMLoc loc,
                  ASTDecl *parentDecl, LexerCursor cursor, LexerCursor endCursor,
@@ -863,6 +870,20 @@ public:
   /// only by this function's IR signature.
   void createIRSignatureDecls(DeclResolver &resolver);
 
+  void setAllowLegacyAnyOriginCaptures() {
+    allowLegacyAnyOriginCaptures = true;
+  }
+
+  /// Returns true if `@__allow_legacy_any_origin_fields` is on this function
+  /// or on a function that encloses it.
+  bool allowsLegacyAnyOriginCaptures() const {
+    for (const ASTDecl *cur = this; cur; cur = cur->getParentDecl())
+      if (auto *def = dyn_cast<DefASTDecl>(cur))
+        if (def->allowLegacyAnyOriginCaptures)
+          return true;
+    return false;
+  }
+
 private:
   friend class M::BumpAllocator;
   friend class DeclResolver;
@@ -873,6 +894,7 @@ private:
              ssize_t indentation);
 
   FnOp operation;
+  bool allowLegacyAnyOriginCaptures = false;
 };
 
 /// The AST representation of an anonymous function type.

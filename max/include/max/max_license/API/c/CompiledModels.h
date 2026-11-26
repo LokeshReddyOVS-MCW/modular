@@ -170,7 +170,7 @@ private:
 /// that are loaded from the compiled MEF but not yet initialized.
 struct UninitializedModel {
   UninitializedModel(M::BufferRef buffer, ModelList models,
-                     RCRef<MEFFile> handle)
+                     RCRef<MLRT::MEFFile> handle)
       : compiledModelBuffer(std::move(buffer)), models(std::move(models)),
         mefHandle(std::move(handle)) {}
 
@@ -195,7 +195,7 @@ private:
 
   M::BufferRef compiledModelBuffer;
   ModelList models;
-  RCRef<MEFFile> mefHandle;
+  RCRef<MLRT::MEFFile> mefHandle;
 };
 
 /// The internal type created when compiling one or more models from the public
@@ -221,6 +221,14 @@ struct CompiledModels {
   /// The buffer must satisfy `maxAttributeAlignment()` (file mappings
   /// always do).
   static MODULAR_CXX_EXPORT ErrorOr<CompiledModels> read(BufferRef buffer);
+
+  /// The portable digest of what an in-memory source would compile to, named
+  /// as the cache names its entries, without compiling it. A caller holding an
+  /// artifact compares this against the digest it recorded, which is what
+  /// `create` would have compiled for the same graph.
+  static MODULAR_CXX_EXPORT ErrorOr<std::string>
+  computeContentDigest(M::ContextRef context, const CompilationRequest &compCfg,
+                       void *source, FileFormat format);
 
   const SourceModel &getSourceModel() const { return sourceModel; }
   size_t getNumModels() const { return uninitializedModel.getNumModels(); }

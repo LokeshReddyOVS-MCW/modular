@@ -47,7 +47,7 @@ from nn.attention.gpu.nvidia.common import (
     q_tma_fused,
     q_tma_prefill,
 )
-from nn.attention.mha_mask import MHAMask, TileMaskStatus
+from nn.attention.mha_mask import CausalMask, MHAMask, TileMaskStatus
 from nn.attention.mha_operand import MHAOperand
 from nn.attention.gpu.nvidia.mha_tile_scheduler import TransientScheduler
 from nn.attention.mha_utils import (
@@ -641,6 +641,7 @@ def mha_sm100_dispatch[
     var batch_size: UInt32 = UInt32(batch_size_arg)
 
     @inline(.always)
+    @__allow_legacy_any_origin_fields
     def with_fa4_config[
         NumPartitionsType: OptionallyStaticInt,
         PartitionType: MHAPartitionScheme,
@@ -754,7 +755,7 @@ def mha_sm100_dispatch[
             UInt32(
                 fa4_config.num_kv_heads if fuse_gqa else fa4_config.num_q_heads
             ),
-            flip_prompt_idx=MaskType.get_type_name() == "CausalMask",
+            flip_prompt_idx=MaskType == CausalMask,
             pair_cta=fa4_config.pair_cta,
             splitk_partitions=UInt32(fa4_config.splitk_partitions),
         ]
@@ -986,7 +987,21 @@ def mha_sm100_dispatch[
                         # `kernel` entry (split-K is compiled once per static P).
                         comptime if fa4_config.cluster_size() > 1:
                             ctx.enqueue_function[kernel](
-                                ClusterAttributeLaunchConfig(
+                                q_tma_op,
+                                k_tma_op,
+                                v_tma_op,
+                                ragged_tma_store,
+                                k,
+                                scale,
+                                batch_size,
+                                max_cache_valid_length,
+                                pack,
+                                # Total query-row count, used only by the workspace
+                                # (traditional/unfused) split-K egress as the per-partition
+                                # `o_partial`/`lse_partial` row stride; harmless (unused)
+                                # for every other config.
+                                UInt32(num_rows_q),
+                                execution_config=ClusterAttributeLaunchConfig(
                                     grid_dim=grid_dim,
                                     block_dim=(num_threads, 1, 1),
                                     cluster_dim=Dim(
@@ -997,6 +1012,9 @@ def mha_sm100_dispatch[
                                         MHA_PDL_LEVEL
                                     ),
                                 ),
+                            )
+                        else:
+                            ctx.enqueue_function[kernel](
                                 q_tma_op,
                                 k_tma_op,
                                 v_tma_op,
@@ -1011,10 +1029,7 @@ def mha_sm100_dispatch[
                                 # `o_partial`/`lse_partial` row stride; harmless (unused)
                                 # for every other config.
                                 UInt32(num_rows_q),
-                            )
-                        else:
-                            ctx.enqueue_function[kernel](
-                                GridBlockAttributeLaunchConfig(
+                                execution_config=GridBlockAttributeLaunchConfig(
                                     grid_dim=grid_dim,
                                     block_dim=(num_threads, 1, 1),
                                     shared_mem_bytes=smem_use,
@@ -1022,20 +1037,6 @@ def mha_sm100_dispatch[
                                         MHA_PDL_LEVEL
                                     ),
                                 ),
-                                q_tma_op,
-                                k_tma_op,
-                                v_tma_op,
-                                ragged_tma_store,
-                                k,
-                                scale,
-                                batch_size,
-                                max_cache_valid_length,
-                                pack,
-                                # Total query-row count, used only by the workspace
-                                # (traditional/unfused) split-K egress as the per-partition
-                                # `o_partial`/`lse_partial` row stride; harmless (unused)
-                                # for every other config.
-                                UInt32(num_rows_q),
                             )
 
                     # --- ragged dispatch ---
@@ -1193,7 +1194,21 @@ def mha_sm100_dispatch[
                         # `kernel` entry (split-K is compiled once per static P).
                         comptime if fa4_config.cluster_size() > 1:
                             ctx.enqueue_function[kernel](
-                                ClusterAttributeLaunchConfig(
+                                q_tma_op,
+                                k_tma_op,
+                                v_tma_op,
+                                ragged_tma_store,
+                                k,
+                                scale,
+                                batch_size,
+                                max_cache_valid_length,
+                                pack,
+                                # Total query-row count, used only by the workspace
+                                # (traditional/unfused) split-K egress as the per-partition
+                                # `o_partial`/`lse_partial` row stride; harmless (unused)
+                                # for every other config.
+                                UInt32(num_rows_q),
+                                execution_config=ClusterAttributeLaunchConfig(
                                     grid_dim=grid_dim,
                                     block_dim=(num_threads, 1, 1),
                                     cluster_dim=Dim(
@@ -1204,6 +1219,9 @@ def mha_sm100_dispatch[
                                         MHA_PDL_LEVEL
                                     ),
                                 ),
+                            )
+                        else:
+                            ctx.enqueue_function[kernel](
                                 q_tma_op,
                                 k_tma_op,
                                 v_tma_op,
@@ -1218,10 +1236,7 @@ def mha_sm100_dispatch[
                                 # `o_partial`/`lse_partial` row stride; harmless (unused)
                                 # for every other config.
                                 UInt32(num_rows_q),
-                            )
-                        else:
-                            ctx.enqueue_function[kernel](
-                                GridBlockAttributeLaunchConfig(
+                                execution_config=GridBlockAttributeLaunchConfig(
                                     grid_dim=grid_dim,
                                     block_dim=(num_threads, 1, 1),
                                     shared_mem_bytes=smem_use,
@@ -1229,20 +1244,6 @@ def mha_sm100_dispatch[
                                         MHA_PDL_LEVEL
                                     ),
                                 ),
-                                q_tma_op,
-                                k_tma_op,
-                                v_tma_op,
-                                ragged_tma_store,
-                                k,
-                                scale,
-                                batch_size,
-                                max_cache_valid_length,
-                                pack,
-                                # Total query-row count, used only by the workspace
-                                # (traditional/unfused) split-K egress as the per-partition
-                                # `o_partial`/`lse_partial` row stride; harmless (unused)
-                                # for every other config.
-                                UInt32(num_rows_q),
                             )
 
                     # --- ragged dispatch ---
@@ -1642,13 +1643,13 @@ def mha_sm100_dispatch[
             # prefill), the same groups fuse into the 1Q BM=128 tile, which
             # holds 14 (group 9) or 21 (group 6) positions: one CTA per KV head
             # rather than one per q-head on the unfused BM=32 tile. Split-K is
-            # sized as on the 1Q carve below. Only 16-bit Q/KV is validated on
-            # this tile.
+            # sized as on the 1Q carve below. Only 16-bit and e4m3 Q/KV are
+            # validated on this tile.
             comptime fa4_config_1q_fused = fa4_config_2q.with_bm(
                 128, fuse_nondividing=True
             )
             comptime if (
-                KVType.dtype.is_half_float()
+                (KVType.dtype.is_half_float() or KVType.dtype == .float8_e4m3fn)
                 and fa4_config_ws_fused.fuse_nondividing
                 and fa4_config_1q_fused.fuse_nondividing
                 and fa4_config_1q_fused.supported()

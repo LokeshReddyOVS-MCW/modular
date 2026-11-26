@@ -316,6 +316,57 @@ sh_binary(
     tags = ["manual"],
 )
 
+# TerminalBench agentic-cost gate: Harbor + opencode against any
+# OpenAI-compatible endpoint, scored and optionally gated against a baseline.
+#   ./bazelw run //max/tests/integration/accuracy/model_evals:terminalbench_local -- \
+#     --baseline /path/to/approved/results.jsonl
+sh_binary(
+    name = "terminalbench_local",
+    testonly = True,
+    srcs = ["run_terminalbench_local.sh"],
+    data = [":terminalbench_score"],
+    tags = ["manual"],
+)
+
+# Stdlib-only: CI runs it with a bare python3, no bazel.
+modular_py_binary(
+    name = "terminalbench_score",
+    testonly = True,
+    srcs = ["terminalbench_score.py"],
+    imports = ["."],
+    main = "terminalbench_score.py",
+)
+
+modular_py_test(
+    name = "test_terminalbench_score",
+    size = "small",
+    srcs = ["test_terminalbench_score.py"],
+    deps = [
+        ":terminalbench_score",
+    ],
+)
+
+# Writes a TerminalBench run as exacto score.json, config.json and verdict
+# trajectory rows. Stdlib-only: the Buildkite step runs it with a bare python3.
+modular_py_binary(
+    name = "terminalbench_exacto",
+    testonly = True,
+    srcs = ["terminalbench_exacto.py"],
+    imports = ["."],
+    main = "terminalbench_exacto.py",
+    deps = [":terminalbench_score"],
+)
+
+modular_py_test(
+    name = "test_terminalbench_exacto",
+    size = "small",
+    srcs = ["test_terminalbench_exacto.py"],
+    deps = [
+        ":terminalbench_exacto",
+        ":terminalbench_score",
+    ],
+)
+
 # Job-summary renderer for the AutoExacto gate. Stdlib-only: the CI summary
 # step runs it with a bare python3, no bazel.
 modular_py_binary(
@@ -531,6 +582,23 @@ modular_py_test(
     size = "small",
     srcs = ["test_deepswe_score.py"],
     deps = [":deepswe_score"],
+)
+
+# Writes a MiniMax Provider Verifier run as uploader results. Stdlib only:
+# mcloudEvalMaxModel.yaml runs it with a bare python3.
+modular_py_binary(
+    name = "provider_verifier_score",
+    testonly = True,
+    srcs = ["provider_verifier_score.py"],
+    imports = ["."],
+    main = "provider_verifier_score.py",
+)
+
+modular_py_test(
+    name = "test_provider_verifier_score",
+    size = "small",
+    srcs = ["test_provider_verifier_score.py"],
+    deps = [":provider_verifier_score"],
 )
 
 # Scrubs the endpoint's API key from DeepSWE results; the agent can print it.

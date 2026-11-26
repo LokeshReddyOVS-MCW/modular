@@ -14,22 +14,28 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from max import functional as F
 from max.driver import CPU
 from max.dtype import DType
 from max.nn import Embedding, Linear, Module
 from max.nn.common_layers.kv_cache import PagedCacheValues, kv_input_values
+from max.nn.common_layers.linear import col_parallel
 from max.nn.common_layers.rotary_embedding import RotaryEmbedding
 from max.nn.kv_cache import KVCacheParams, MultiKVCacheParams
 from max.nn.norm import RMSNorm
 from max.nn.sequential import ModuleList
 from max.pipelines.lib import ModuleV3Outputs
+from max.pipelines.lib.role_contracts import VisionInputs
+from max.pipelines.lib.vlm_utils import F_merge_multimodal_embeddings
 from max.tensor import Tensor
 from max.tensor.compilation import as_subgraph
 
 from .layers.decoder import HYV4DecoderLayer
 from .layers.hyper_connection import HYV4HyperHead
-from .model_config import HYV4Config
+from .model_config import HYV4Config, HYV4VLConfig
+from .mrope import mla_rope_tables
 
 __all__ = ["HYV4"]
 
@@ -39,7 +45,7 @@ def _slot(index: int) -> Tensor:
 
 
 class HYV4TextModel(Module[..., Tensor]):
-    """Embedding, iHC decoder stack, iHC head, norm and fp32 ``lm_head``."""
+    """Embedding, iHC decoder stack, iHC head, norm and fp32-out ``lm_head``."""
 
     def __init__(self, config: HYV4Config) -> None:
         super().__init__()
@@ -63,19 +69,31 @@ class HYV4TextModel(Module[..., Tensor]):
             config.indexer_cache_layer(i) if kind == "full" else 0
             for i, kind in enumerate(config.indexer_types)
         )
+        # Hy4 VL rotates each token by its M-RoPE position, not by its
+        # cache position.
+        self.mrope_section = (
+            tuple(config.mrope_section)
+            if isinstance(config, HYV4VLConfig)
+            else None
+        )
         self.hc_head = HYV4HyperHead(config)
-        self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.norm = RMSNorm(
+            config.hidden_size, config.rms_norm_eps, multiply_before_cast=True
+        )
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def shard(self) -> None:
-        """Splits attention by heads and the routed experts by expert.
+        """Splits attention, the routed experts, the MLPs and ``lm_head``.
 
-        Both split over the one-axis mesh the model was built on. Everything
-        else stays replicated, the iHC weights, indexers, routers, norms,
-        embedding and ``lm_head`` included.
+        Attention splits by heads, the routed experts by expert, the dense
+        MLP and shared experts by width, and ``lm_head`` by vocabulary row,
+        all over the one-axis mesh the model was built on. Everything else
+        stays replicated, the iHC weights, indexers, routers, norms and
+        embedding included.
         """
         for layer in self.layers:
             layer.shard()
+        col_parallel(self.lm_head)
 
     def forward(
         self,
@@ -84,6 +102,8 @@ class HYV4TextModel(Module[..., Tensor]):
         indexer_kv_collection: PagedCacheValues,
         input_row_offsets: Tensor,
         batch_context_length: Tensor,
+        token_positions: Tensor | None = None,
+        vision: VisionInputs[Tensor] | None = None,
     ) -> Tensor:
         streams = self.streams(
             tokens,
@@ -91,6 +111,8 @@ class HYV4TextModel(Module[..., Tensor]):
             indexer_kv_collection,
             input_row_offsets,
             batch_context_length,
+            token_positions,
+            vision,
         )
         last = F.gather(streams, input_row_offsets[1:] - 1, axis=0)
         return self.logits(self.head(last))
@@ -102,22 +124,64 @@ class HYV4TextModel(Module[..., Tensor]):
         indexer_kv_collection: PagedCacheValues,
         input_row_offsets: Tensor,
         batch_context_length: Tensor,
+        token_positions: Tensor | None = None,
+        vision: VisionInputs[Tensor] | None = None,
     ) -> Tensor:
         """Returns the ``[tokens, hc_mult, hidden]`` iHC streams.
 
         ``batch_context_length`` is the host ``[1]`` int32 prefill buffer
         length every attention block hands the MLA kernel.
+        ``token_positions`` are Hy4 VL's ``[3, tokens]`` M-RoPE positions,
+        and ``vision`` its image rows, which replace the placeholder tokens'
+        embeddings.
+        """
+        streams, _ = self.tapped_streams(
+            tokens,
+            kv_collection,
+            indexer_kv_collection,
+            input_row_offsets,
+            batch_context_length,
+            token_positions,
+            vision,
+        )
+        return streams
+
+    def tapped_streams(
+        self,
+        tokens: Tensor,
+        kv_collection: PagedCacheValues,
+        indexer_kv_collection: PagedCacheValues,
+        input_row_offsets: Tensor,
+        batch_context_length: Tensor,
+        token_positions: Tensor | None = None,
+        vision: VisionInputs[Tensor] | None = None,
+        topk_layers: Sequence[int] = (),
+    ) -> tuple[Tensor, list[Tensor]]:
+        """Returns :meth:`streams` and the top-k of each of ``topk_layers``.
+
+        Each top-k is ``[tokens, index_topk]`` int32 physical cache rows.
         """
         h = self.embed_tokens(tokens)
+        if vision is not None:
+            h = F_merge_multimodal_embeddings(
+                h, vision.embeddings, vision.scatter_indices
+            )
         streams = F.broadcast_to(
             h.unsqueeze(1), [h.shape[0], self.hc_mult, h.shape[1]]
         )
         freqs_cis = self.rope.freqs_cis.to(h.mesh)
+        token_rope: Tensor | None = None
+        if self.mrope_section is not None:
+            assert token_positions is not None
+            freqs_cis, token_rope = mla_rope_tables(
+                freqs_cis, token_positions, self.mrope_section
+            )
         # Layers of one indexer and MLP kind share a subgraph, so their cache
         # slots are inputs rather than constants traced from the first one.
         # A shared layer reuses the top-k of the most recent full layer;
         # layer 0 is always full, so no shared layer reads None.
         topk: Tensor | None = None
+        taps: dict[int, Tensor] = {}
         for idx, layer in enumerate(self.layers):
             indexer, mlp = self.layer_kinds[idx]
             streams, topk = as_subgraph(layer, name=f"{indexer}_{mlp}_layer")(
@@ -130,15 +194,27 @@ class HYV4TextModel(Module[..., Tensor]):
                 input_row_offsets,
                 None if indexer == "full" else topk,
                 batch_context_length,
+                token_rope,
             )
-        return streams
+            if idx in topk_layers:
+                taps[idx] = topk
+        return streams, [taps[i] for i in topk_layers]
 
     def head(self, streams: Tensor) -> Tensor:
         """Collapses the streams to the final normalized hidden state."""
         return self.hc_head(streams, self.norm)
 
     def logits(self, h: Tensor) -> Tensor:
-        return self.lm_head(h).cast(DType.float32)
+        """Returns the float32 logits of ``h``, whole on the first device.
+
+        The GEMM always writes its float32 accumulator, which matches the
+        ``enable_lm_head_fp32`` that Hy4 checkpoints set. A split head
+        gathers its rank-ordered vocabulary columns.
+        """
+        logits = F.matmul(h, self.lm_head.weight.T, out_dtype=DType.float32)
+        if logits.is_distributed:
+            logits = F.allgather(logits, tensor_axis=-1).local_shards[0]
+        return logits
 
 
 class HYV4(Module[..., ModuleV3Outputs]):

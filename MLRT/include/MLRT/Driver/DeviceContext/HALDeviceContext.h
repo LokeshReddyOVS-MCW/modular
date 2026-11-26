@@ -57,8 +57,8 @@
 #include <vector>
 
 // Opaque handles to the heap allocated wrapped Mojo values the MojoHAL_*
-// exports create and release. The Mojo side types the same handles as
-// `_DeviceContextBoxPtr` etc. in hal_device_context_exports.mojo.
+// exports create and release; the exports are declared in
+// MLRT/lib/Driver/DeviceContext/HAL/MojoHALExports.h.
 struct MojoHALContextBox;
 struct MojoHALBufferBox;
 struct MojoHALScopeBox;
@@ -151,7 +151,7 @@ public:
   API api() const { return api_; }
   int id() const { return id_; }
   /// Whether this is a virtual (compile-only) device.
-  bool isVirtual() const { return compilationDevice_ != nullptr; }
+  bool isVirtual() const { return virtualArch_.has_value(); }
   ErrorOr<const char *> getArchName() const;
   const std::string &name() const { return name_; }
   ErrorOrSuccess isCompatible() const;
@@ -178,7 +178,9 @@ public:
   /// report false.
   ErrorOr<bool> isHostUnified() const;
 
-  /// Creates a new context (with its own stream) on this device.
+  /// Creates a new context (with its own stream) on this device. A device
+  /// whose plugin reports `max_contexts_per_device` of 1 shares this Device's
+  /// own context instead.
   ErrorOr<DeviceContextRef> createContext();
 
   /// DLPack device descriptor for this device. Mirrors the legacy
@@ -197,26 +199,22 @@ public:
 
 private:
   friend class DeviceContext;
-  Device(MojoHALContextBox *mojoCtx, API api, std::string apiStr, int id,
-         std::string name)
-      : mojoCtx_(mojoCtx), api_(api), apiStr_(std::move(apiStr)), id_(id),
-        name_(std::move(name)) {}
+  Device(MojoHALContextBox *mojoCtx, API api, int id, std::string name)
+      : mojoCtx_(mojoCtx), api_(api), id_(id), name_(std::move(name)) {}
 
   /// Virtual (compile-only) device: no Mojo HAL box, every device query
-  /// answered from `compilationDevice` or a constant.
-  Device(std::unique_ptr<CompilationDevice> compilationDevice, API api,
-         std::string apiStr, int id, std::string name)
-      : mojoCtx_(nullptr), api_(api), apiStr_(std::move(apiStr)), id_(id),
-        name_(std::move(name)),
-        compilationDevice_(std::move(compilationDevice)) {}
+  /// answered from `virtualArch` or a constant.
+  Device(std::string virtualArch, API api, int id, std::string name)
+      : mojoCtx_(nullptr), api_(api), id_(id), name_(std::move(name)),
+        virtualArch_(std::move(virtualArch)) {}
 
   MojoHALContextBox *mojoCtx_; // DeviceContext owned by this Device.
   API api_;
-  std::string apiStr_; // Plugin api string as passed to create().
   int id_;
   std::string name_;
   mutable std::string archName_;
-  std::unique_ptr<CompilationDevice> compilationDevice_;
+  /// The target arch of a virtual device; empty for a real one.
+  std::optional<std::string> virtualArch_;
 };
 
 // Numeric device attributes, by CUDA-style `CUdevice_attribute` code. Mirrors
@@ -290,7 +288,8 @@ public:
 
   void *ptr() const { return ptr_; }
   /// Relinquishes ownership of the underlying allocation to the caller and
-  /// returns its pointer; destroying the buffer then frees nothing.
+  /// returns its pointer; destroying the buffer then frees nothing. Returns
+  /// null, and keeps ownership, if the driver plugin refuses to release it.
   void *releasePtr();
 
   /// Wraps a heap-boxed Mojo `DeviceBuffer` surrendered by the Mojo side (the
@@ -819,13 +818,6 @@ public:
       reportNoMojoHandle();
     return mojoCtx_;
   }
-
-  /// Adopts a heap-boxed Mojo `DeviceContext` produced by the Mojo
-  /// a boxed Mojo `DeviceContext` (the reverse of `mojoHandle()`): the returned
-  /// C++ context takes ownership of `mojoBox` and releases it when its
-  /// refcount reaches zero. Used by the graph runtime to materialize a C++
-  /// `DeviceContext` from the opaque handle a kernel hands back.
-  static ErrorOr<DeviceContextRef> adoptMojoBox(void *mojoBox);
 
 private:
   friend class Device;

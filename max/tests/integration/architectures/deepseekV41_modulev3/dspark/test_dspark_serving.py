@@ -94,6 +94,7 @@ from max.pipelines.lib.pipeline_variants.spec_decode_pipeline_model import (
     spec_decode_architecture,
 )
 from max.pipelines.lib.registration_draft import TargetHiddenStates
+from max.pipelines.lib.weight_transform import WeightTransform
 from max.pipelines.sampling import SamplingConfig
 from max.pipelines.speculative import proposers
 from max.pipelines.speculative import spec_adapters as registry
@@ -286,8 +287,9 @@ def test_dspark_pairs_the_modulev3_trunk_with_its_modulev3_draft() -> None:
     assert issubclass(paired.pipeline_model, SpecDecodePipelineModel)
     assert paired.weight_adapters == deepseekV41_modulev3_arch.weight_adapters
     assert paired.checkpoint_draft_width is dspark_draft_width
-    # The trunk captures no device graph, so neither does the pairing.
-    assert not paired.supports_device_graph_capture
+    # The pairing captures its decode steps, as the trunk and draft do.
+    assert paired.supports_device_graph_capture
+    assert dspark_deepseekV41_modulev3_draft_arch.supports_device_graph_capture
     assert (
         ARCH_LOOKUP.find("DSparkDeepseekV41DraftModel", prefer_module_v3=True)
         is dspark_deepseekV41_modulev3_draft_arch
@@ -327,8 +329,15 @@ def test_the_pairing_reserves_vision_cache_only_with_its_encoder() -> None:
     assert plan is not None
 
 
+@pytest.mark.parametrize(
+    ("adapter", "raw_checkpoint_weights"),
+    [(None, False), (WeightTransform(()), True)],
+    ids=["pretransformed", "raw-checkpoint"],
+)
 def test_the_modulev3_stages_are_a_registered_block_draft(
     monkeypatch: pytest.MonkeyPatch,
+    adapter: WeightTransform | None,
+    raw_checkpoint_weights: bool,
 ) -> None:
     """The stages construct through the draft registration, with the RoPE
     the trunk's checkpoint names."""
@@ -339,8 +348,11 @@ def test_the_modulev3_stages_are_a_registered_block_draft(
     assert arch.draft.create_proposer is None
     assert arch.pipeline_model is None
     assert not hasattr(arch.config, "build_module")
-    config = configure_dspark_draft(_dp_context(monkeypatch), {})
+    context = _dp_context(monkeypatch)
+    context.adapter = adapter
+    config = configure_dspark_draft(context, {})
     assert config.rope is not None
+    assert config.raw_checkpoint_weights is raw_checkpoint_weights
 
 
 def test_the_graph_api_pairing_is_unchanged() -> None:
@@ -506,11 +518,11 @@ def _dp_context(monkeypatch: pytest.MonkeyPatch) -> Any:
         ),
         "engram_static_inputs": lambda tables, token_map, device: {},
         "build_ep_config": lambda *args: Mock(),
-        "EPBatchManager": lambda ep_config: Mock(),
     }.items():
         monkeypatch.setattr(model_module, name, value)
     return SimpleNamespace(
         pipeline_config=SimpleNamespace(
+            artifact_export=False,
             speculative=SpeculativeConfig(
                 speculative_method="dspark", num_speculative_tokens=BLOCK
             ),
@@ -524,8 +536,10 @@ def _dp_context(monkeypatch: pytest.MonkeyPatch) -> Any:
         max_seq_len=64,
         target_layer_ids=tuple(arch_config.dspark_target_layer_ids),
         kv_params=None,
+        # ModelLoadContext always carries its adapter, including no adapter.
+        adapter=None,
         weights={},
-        start_ep=lambda ep_config: None,
+        start_ep=lambda ep_config: ep_config,
     )
 
 

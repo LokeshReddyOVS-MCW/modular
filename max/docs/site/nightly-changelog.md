@@ -10,6 +10,9 @@ This version is still a work in progress.
 
 ## Models
 
+- LiquidAI LFM2-VL checkpoints now serve through the new
+  `Lfm2VlForConditionalGeneration` architecture.
+
 - Qwen 3.5 models served with MTP or DFlash2 speculative decoding now read the
   images and videos in a request. They used to answer without them.
 
@@ -153,7 +156,36 @@ This version is still a work in progress.
   deprecation warning. Result files record the option as `warmup_multiturn`
   under `client_args`.
 
+- `max benchmark` starts a rate-paced multi-turn run at the population its
+  `--request-rate` holds open, `ceil(rate x mean session lifetime)` sessions
+  (Little's law), instead of at the conversation cap; `--warmup-count`
+  overrides it. Pre-warmed sessions phase-spread their first turn over that
+  turn's occupancy window so the population's submits arrive at the offered
+  rate. Closed-loop runs keep their previous start behavior, and a rate-paced
+  workload with neither an inter-turn delay nor `--warmup-delay-estimated-*`
+  still pre-warms nothing.
+
 ## Python API
+
+- `max.functional.random.gaussian` and `max.graph.ops.random.gaussian` on the
+  CPU now draw the stream of PyTorch's CPU generator. For a given seed, a
+  float32 or float64 tensor equals
+  `torch.empty(shape).normal_(mean, std, generator=torch.Generator().manual_seed(seed))`
+  bit for bit on x86. float16 and bfloat16 samples are the float32 stream
+  rounded to that type. CPU values for a given seed differ from earlier
+  releases, so refresh any stored CPU samples. GPU results are unchanged.
+
+- `GGUFWeights` now reads checkpoints through MAX's own GGUF parser instead of
+  the `gguf` Python package, so loading no longer needs that dependency. The
+  parser skips tokenizer metadata, whose payload dominates a typical file, and
+  reads tensors from the file's own offsets. Quantized tensors are still
+  exposed as `uint8` blocks with their `QuantizationEncoding`. The same
+  binding writes checkpoints: `max._core.gguf.GGUFWriter` records string,
+  integer, float and boolean metadata plus float, integer and block-quantized
+  tensors, and `write()` emits the file.
+
+- `KVConnector.offload()` takes a keyword-only `placement_key`, the same for
+  every offload of one request. Custom connectors must accept it.
 
 - `AutoModel(eager=True)`, `AutoPipeline(eager=True)` and `max generate --eager`
   run the decoder op by op instead of as a compiled graph, so `pdb` stopped
@@ -364,7 +396,26 @@ This version is still a work in progress.
 
 ## C API
 
+- `M_loadGGUF()` loads GGUF checkpoints the way `M_loadSafetensors()` loads
+  Safetensors ones, with `M_getGGUFCount()`, `M_getGGUFData()`,
+  `M_getGGUFDtype()`, `M_getGGUFShape()` and
+  `M_newWeightsRegistryFromGGUF()` to inspect and use the tensors.
+  Block-quantized tensors are exposed as `uint8` data whose last dimension
+  counts quantization blocks, and `M_getGGUFQuantization()` names the
+  scheme. `M_newGGUFWriter()`, `M_setGGUFMetadata*()`, `M_addGGUFTensor()` and
+  `M_writeGGUF()` write checkpoints the same way.
+
 ## Kernels and GPU programming
+
+- A custom op's shape function, registered with
+  `@extensibility.register_shape_function`, can now return its output shape
+  as a `Coord` as well as an `IndexList`. A shape function that passes an
+  input's shape through can return `input.shape()` directly, declared as
+  `-> type_of(input.shape())`, without converting it to an `IndexList`.
+
+- A custom op's `elementwise` function that reads the element's position now
+  takes it as a trailing `Coord` argument. A trailing `IndexList` argument is
+  no longer recognized as the position; change its type to `Coord`.
 
 - A custom op's `execute` method no longer accepts `ManagedTensorSlice`
   arguments (`InputTensor`, `OutputTensor` and their fused, mutable and
@@ -459,13 +510,35 @@ This version is still a work in progress.
 
 - `DeviceContext.enqueue_function()` accepts a `GridBlockLaunchConfig` (grid,
   block, dynamic shared memory) or `ClusterLaunchConfig` (plus thread block
-  clusters) from `max.gpu.host` as its first argument. A cluster launch on a
-  GPU without clusters fails to compile; generic code checks
+  clusters) from `max.gpu.host` as a keyword-only `execution_config` argument
+  after the kernel arguments. A cluster launch on a GPU without clusters fails
+  to compile; generic code checks
   `conforms_to(DeviceContext[].ExecutionConfigType, ClusterExecutionConfig)`.
   On NVIDIA GPUs, `GridBlockAttributeLaunchConfig` and
   `ClusterAttributeLaunchConfig` from `max.gpu.host.nvidia` also carry launch
   attributes, such as the ones `pdl_launch_attributes()` returns for
   programmatic dependent launch.
+
+- Renamed the closure overloads of `DeviceContext.compile_function()` and
+  `DeviceContext.enqueue_function()` to `compile_closure()` and
+  `enqueue_closure()`. Kernels that capture state from their enclosing scope
+  now use the `*_closure()` methods, and `compile_function()` and
+  `enqueue_function()` take only kernels that are plain functions. The old
+  closure overloads are removed, so a call that passes a closure to
+  `enqueue_function()` no longer compiles:
+
+  ```mojo
+  var scale: Float32 = 2.0
+
+  def scale_kernel() {var scale}:
+      ...
+
+  # Before:
+  ctx.enqueue_function(scale_kernel, grid_dim=1, block_dim=256)
+
+  # After:
+  ctx.enqueue_closure(scale_kernel, grid_dim=1, block_dim=256)
+  ```
 
 - A bare `DeviceContext` is now an unbound parameterized type, not a concrete
   type.
@@ -476,10 +549,12 @@ This version is still a work in progress.
   Prefer to accept generic `DeviceContext` as input instead of restricting an
   implementation to the default parameter values.
 
-- The `load_fn`, `compute_fn` and `compute_finalize_fn` callbacks of
-  `stencil()` and `stencil_gpu()` in `max.algorithm` now take a `Coord`
-  instead of an `IndexList[rank]`. `map_fn` still takes and returns
-  `IndexList`. The coordinate holds the same values as before:
+- `stencil()` and `stencil_gpu()` in `max.algorithm` now take a `Coord` where
+  they took an `IndexList[rank]`: the `shape` and `input_shape` arguments, and
+  the point passed to the `load_fn`, `compute_fn` and `compute_finalize_fn`
+  callbacks. A shape `Coord` keeps its static dimensions on the way to the
+  kernel. Wrap an existing `IndexList` shape with `Coord(shape)`. The point
+  holds the same values as before:
 
   ```mojo
   # was: def load_fn[...](point: IndexList[rank, ...]) -> ...
@@ -489,6 +564,36 @@ This version is still a work in progress.
       return input.load[width=simd_width](point)
   ```
 
+  `map_fn` now takes and returns `DynamicCoord[DType.int, stencil_rank]`
+  instead of `IndexList[stencil_rank]`, and the `stencil_axis` parameter is
+  gone: it only accepted the spatial axes `(1, 2)`, which both backends
+  assume. Drop `stencil_axis` from the parameter list:
+
+  ```mojo
+  comptime StencilPoint = DynamicCoord[DType.int, stencil_rank]
+
+  def map_fn(point: StencilPoint) -> Tuple[StencilPoint, StencilPoint]:
+      var lower = StencilPoint(point[0] * stride, point[1] * stride)
+      var upper = StencilPoint(lower[0] + window_h, lower[1] + window_w)
+      return lower, upper
+  ```
+
+- `parallelize_over_rows()` in `max.algorithm` and `trace_arg()` in
+  `max.runtime.tracing` no longer accept an `IndexList` shape. Pass a `Coord`
+  instead, for example `Coord(shape)` or a tensor's `shape_coord()`.
+
+- Removed `trace_slice_arg()` from `extensibility`. Call
+  `trace_arg(name, tensor.shape_coord(), tensor.dtype)` from
+  `max.runtime.tracing` instead.
+
+- On DGX Spark, GPU kernels doing random reads or atomics on large host
+  buffers run up to 150x faster.
+
+- Launching an NVIDIA kernel with more than 48 KB of dynamic shared memory
+  now needs only `shared_mem_bytes`.
+  `FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES` is no longer needed and has
+  no effect.
+
 ## Tools
 
 - Added the ability to install `max-serve` and `max-benchmark` as Conda extras,
@@ -496,6 +601,18 @@ This version is still a work in progress.
   `max[extras=[all]]` installs both plus `mojo`.
 
 ## Fixes
+
+- Reusing precompiled MEFs (`InferenceSession(precompiled_mefs=...)`,
+  `--precompiled-mefs`, and `max.tensor.support.set_precompiled_mefs`) now
+  checks that each artifact was built from the graph claiming it: its body,
+  the contents of its kernel libraries, its compile options, and the MAX build
+  that exported it. Before, only the graph's name and its input and output
+  types were compared, so editing a graph or a custom op and reusing an
+  artifact silently ran the old program. A mismatch raises
+  `ArtifactBodyMismatch`. A caller that knowingly builds different graphs than
+  it recorded, such as a test harness compiling under virtual devices, passes
+  `MefStore.for_import(..., verify_body=False)`, `InferenceSession(verify_body=
+  False)`, or `--no-precompiled-mefs-verify-body` to skip the check.
 
 - Loading a model on a device that reports no free memory now fails with a
   "Model size exceeds available memory" error. Memory planning used to treat

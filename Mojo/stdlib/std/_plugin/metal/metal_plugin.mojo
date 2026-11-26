@@ -190,7 +190,7 @@ struct MetalPlugin(StdPlugin):
 
 
 struct MetalPluginHooks[target: CompilationTarget](PluginHooks):
-    comptime device_kind = TargetDeviceKind.gpu
+    comptime device_kind = TargetDeviceKind.gpu()
 
     comptime gpu_id_fn[name: StaticString, dim: StaticString]: OptionalReg[
         _GPUIdPluginHookFnType
@@ -226,4 +226,4 @@ struct MetalPluginHooks[target: CompilationTarget](PluginHooks):
         address_space
     ]
 
-    comptime default_atomic_ordering: Ordering = Ordering.RELAXED
+    comptime default_atomic_ordering: Ordering = Ordering.relaxed

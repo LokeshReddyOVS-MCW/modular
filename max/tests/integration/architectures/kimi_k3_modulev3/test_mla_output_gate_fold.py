@@ -18,10 +18,10 @@ latent MLA step twice -- once with the gate passed to the op and once with the
 layer's own multiply -- runs both over the same weights, cache and input, and
 requires their outputs to match bit for bit.
 
-The decode cases (4 rows, and 32 rows as four requests of eight) use K3's FP8
-latent cache, which is the arm that routes a multi-token batch to the decode
-branch, where the gate rides the ``w_uv`` projection's store through the
-sliced, row-strided view of the fused input projection. The prefill case uses
+The decode case (32 rows as four requests of eight) uses K3's FP8 latent
+cache, which is the arm that routes a multi-token batch to the decode branch,
+where the gate rides the ``w_uv`` projection's store through the sliced,
+row-strided view of the fused input projection. The prefill case uses
 a BF16 cache and a six-token request, which the kernel routes to its prefill
 branch; there it applies the same multiply in one pass of its own.
 
@@ -91,20 +91,16 @@ def _params(device: Accelerator, cache_dtype: DType) -> MLAKVCacheParams:
 
 
 def _weights(seed: int) -> dict[str, np.ndarray]:
-    """Draws the layer's six weights at the layer's small-Gaussian scale."""
+    """Draws the layer's weights at the layer's small-Gaussian scale."""
     rng = np.random.default_rng(seed)
 
     def draw(*shape: int) -> np.ndarray:
         return (rng.standard_normal(shape) * 0.02).astype(np.float32)
 
     return {
-        "qkv_a_g": draw(
-            _Q_LORA_RANK
-            + _KV_LORA_RANK
-            + _QK_ROPE_HEAD_DIM
-            + _NUM_HEADS * _V_HEAD_DIM,
-            _HIDDEN,
-        ),
+        "q_a": draw(_Q_LORA_RANK, _HIDDEN),
+        "kv_a": draw(_KV_LORA_RANK + _QK_ROPE_HEAD_DIM, _HIDDEN),
+        "g": draw(_NUM_HEADS * _V_HEAD_DIM, _HIDDEN),
         "q_a_norm": np.ones(_Q_LORA_RANK, dtype=np.float32),
         "q_b": draw(
             _NUM_HEADS * (_QK_NOPE_HEAD_DIM + _QK_ROPE_HEAD_DIM), _Q_LORA_RANK
@@ -120,16 +116,12 @@ def _weights(seed: int) -> dict[str, np.ndarray]:
 def _weight_layouts(device: Device) -> dict[str, TensorLayout]:
     """The layouts of the weights `_weights` draws, in its order."""
     return {
-        "qkv_a_g": TensorLayout(
-            DType.bfloat16,
-            [
-                _Q_LORA_RANK
-                + _KV_LORA_RANK
-                + _QK_ROPE_HEAD_DIM
-                + _NUM_HEADS * _V_HEAD_DIM,
-                _HIDDEN,
-            ],
-            device,
+        "q_a": TensorLayout(DType.bfloat16, [_Q_LORA_RANK, _HIDDEN], device),
+        "kv_a": TensorLayout(
+            DType.bfloat16, [_KV_LORA_RANK + _QK_ROPE_HEAD_DIM, _HIDDEN], device
+        ),
+        "g": TensorLayout(
+            DType.bfloat16, [_NUM_HEADS * _V_HEAD_DIM, _HIDDEN], device
         ),
         "q_a_norm": TensorLayout(DType.bfloat16, [_Q_LORA_RANK], device),
         "q_b": TensorLayout(
@@ -213,7 +205,9 @@ def _compile_step(
     cache_types = _cache_layouts(params, device, widths)
 
     def forward(
-        w_qkv_a_g: Tensor,
+        w_q_a: Tensor,
+        w_kv_a: Tensor,
+        w_g: Tensor,
         w_q_a_norm: Tensor,
         w_q_b: Tensor,
         w_kv_a_norm: Tensor,
@@ -244,7 +238,9 @@ def _compile_step(
             kv_params=params,
             layer_idx=0,
         )
-        layer.qkv_a_g_proj.weight = w_qkv_a_g
+        layer.q_a_proj.weight = w_q_a
+        layer.kv_a_proj_with_mqa.weight = w_kv_a
+        layer.g_proj.weight = w_g
         layer.q_a_layernorm.weight = w_q_a_norm
         layer.q_b_proj.weight = w_q_b
         layer.kv_a_layernorm.weight = w_kv_a_norm
@@ -397,24 +393,25 @@ def _compare_arms(
     return outs[0], outs[1]
 
 
-@pytest.mark.parametrize(
-    "batch,tokens",
-    [(4, 1), (4, 8)],
-    ids=["decode-4-rows", "verify-32-rows"],
-)
 def test_the_folded_gate_matches_the_unfused_chain_on_decode(
-    batch: int, tokens: int, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The decode branch's gated projection store is bit-exact.
 
     An FP8 latent cache keeps an eight-token request on the decode branch,
-    so both of K3's serve shapes exercise ``has_output_gate``, the gate's
-    sliced row stride and the fold itself.
+    which is K3's verify width, and the case exercises ``has_output_gate``,
+    the gate's sliced row stride and the fold itself. It is the only decode
+    width here because each case compiles the whole MLA step twice, once per
+    arm, and an eager compile of this layer costs about a minute of MI355
+    time: the kernel's gate fold at the other widths is swept directly by
+    ``//max/kernels/test/gpu/nn:test_mla_gated_w_uv.mojo.test``, and what the
+    layer adds on top -- the plan, the cache, the gate's row stride -- does
+    not vary with the batch or token count.
     """
     device = Accelerator()
     fused, unfused = _compare_arms(
         device,
-        widths=[tokens] * batch,
+        widths=[8] * 4,
         cache_dtype=DType.float8_e4m3fn,
         monkeypatch=monkeypatch,
     )

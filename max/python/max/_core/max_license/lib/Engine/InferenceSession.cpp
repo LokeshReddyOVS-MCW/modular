@@ -20,7 +20,7 @@
 #include "Kernels/max_license/WeightsRegistry.h"
 #include "Support/Filesystem/Paths.h"
 #include "Support/Profiling/Ranges.h"
-#include "Support/max_license/Tracy/Tracy.h"
+#include "Support/max_license/Profiling/ProfileRange.h"
 #include "_core/DLPack/Utils.h"
 #include "_core/Driver/Buffer.h"
 #include "_core/Engine/DebugConfig.h"
@@ -451,7 +451,7 @@ static void validateInputSpecList(
 // Entrypoint for executing Python DeviceTensors.
 std::vector<Driver::Python::Buffer> M::Core::ModelHandle::executeDeviceTensors(
     std::vector<Driver::Python::Buffer *> &inputTensors) {
-  TRACY_ZONE_SCOPED_NC("ModelHandle::executeDeviceTensors", TRACY_COLOR_YELLOW);
+  M_PROFILE_RANGE("ModelHandle::executeDeviceTensors", M_PROFILE_COLOR_YELLOW);
 
   if (!loadedModel)
     return {};
@@ -638,6 +638,25 @@ compileModel(const M::Engine::Context &runtimeContext,
     throw std::invalid_argument(error.get());
   }
   return compiledModels;
+}
+
+std::string M::Core::InferenceSession::computeContentDigest(
+    const nb::capsule &model,
+    std::vector<std::filesystem::path> &&customExtensions,
+    bool tileBasedFusion) {
+  CompilationRequest compileConfig =
+      populateCompileConfig(std::move(customExtensions));
+  compileConfig.setTileBasedFusion(tileBasedFusion);
+  // The compile adds these before it names its artifact; a digest has to see
+  // the same options or the two would disagree about one graph.
+  compileConfig.setDevices(runtimeContext->getConfig().getDevices());
+
+  auto digestOr = CompiledModels::computeContentDigest(
+      runtimeContext->maxContext, compileConfig, model.data(),
+      frameworkToFileFormat());
+  if (digestOr.isError())
+    throw std::invalid_argument(digestOr.takeError().get());
+  return digestOr.takeValue();
 }
 
 AsyncRT::AsyncValueRef<CompiledModels> M::Core::InferenceSession::compile(

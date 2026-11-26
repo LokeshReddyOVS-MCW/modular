@@ -22,6 +22,7 @@
 
 #include "Mojo/MojoParser/ASTDecl.h"
 #include "Mojo/MojoParser/ASTType.h"
+#include "Mojo/MojoParser/Constraints.h"
 #include "Mojo/MojoParser/DeclResolver.h"
 #include "Mojo/MojoParser/ExprNode.h"
 #include "Support/Compiler/OperationUtils.h"
@@ -611,7 +612,7 @@ bool ASTType::isTypeCheckErrorType() const {
 /// parameter, otherwise return null.
 TypedAttr ASTType::isOriginStruct() const {
   auto structType = sugarDynCast<LIT::StructType>(mlirType);
-  if (structType &&
+  if (structType && structType.getSymbol().getRootReference() == "std" &&
       structType.getSymbol().getLeafReference().strref() == "Origin" &&
       structType.getParamValues().size() == 2) {
     auto result = structType.getParamValues()[1];
@@ -769,7 +770,8 @@ bool ASTType::isTrivial(llvm::SMLoc loc, SharedState &shared) const {
 
 TriBool ASTType::isSpecialFunctionTrivial(llvm::SMLoc loc,
                                           SpecialFunctionKind kind,
-                                          SharedState &shared) const {
+                                          SharedState &shared,
+                                          ASTDecl &scope) const {
   // MLIR types and types conforming to AnyTrivialRegType are assumed to be
   // trivial for all purposes
   if (isTrivialRegisterType(loc, shared))
@@ -799,46 +801,41 @@ TriBool ASTType::isSpecialFunctionTrivial(llvm::SMLoc loc,
 
   // If it doesn't conform to the corresponding trait. Only return `no`
   // (provably non-trivial) when we can definitively prove non-conformance.
+  TypedAttr assumptions = scope.getScopeAssumptions();
   auto [conformanceResult, traitDecl] =
-      conformsToBuiltinTrait(traitName, loc, shared, {});
+      conformsToBuiltinTrait(traitName, loc, shared, assumptions);
   if (conformanceResult.isFalse())
     return TriBool::no();
 
-  if (!typeDecl->getParentDecl())
-    return TriBool::unknown();
+  MLIRContext *ctx = shared.getContext();
 
-  auto witnessName = StringAttr::get(shared.getContext(), isTrivialHook);
+  auto witnessName = StringAttr::get(ctx, isTrivialHook);
   auto traitSymbol = TraitSymbolAttr::get(traitDecl->getSymbolRef());
 
-  ASTType boolType =
-      shared.lookupBuiltinType("Bool", *typeDecl->getParentDecl(), loc);
+  ASTType boolType = shared.lookupBuiltinType("Bool", scope, loc);
   TypedAttr fieldIsTrivial =
       shared.getEvaluationContext().getAndFold<GetWitnessAttr>(
           PValue(*this), traitSymbol, witnessName, boolType);
 
-  auto structAttr = dyn_cast_if_present<LITStructAttr>(fieldIsTrivial);
-  if (!structAttr)
+  // A member that does not fold, as for a type parameter, can still be true
+  // in this scope because of a `where` clause.
+  if (!fieldIsTrivial)
     return TriBool::unknown();
+  TypedAttr isTrivialValue = LIT::StructExtractAttr::get(
+      fieldIsTrivial, StringAttr::get(ctx, "_mlir_value"),
+      SIMDAttr::getScalarBool(ctx, true).getType());
 
-  assert(structAttr.getType() == boolType);
-  auto structVals = structAttr.getValues();
-  if (structVals.size() != 1)
-    return TriBool::unknown();
-
-  if (auto &[name, boolVal] = structVals.front(); name == "_mlir_value") {
-    if (auto boolAttr = dyn_cast<SIMDAttr>(boolVal))
-      return boolAttr.getAsBool() ? TriBool::yes() : TriBool::no();
-  }
-
-  return TriBool::unknown();
+  TypedAttr proposition = getCanonicalAttr(deShortCircuitCond(isTrivialValue));
+  return isPropositionImplied(proposition, assumptions);
 }
 
 bool ASTType::isProvablyImplicitlyTriviallyCopyable(llvm::SMLoc loc,
                                                     SharedState &shared,
                                                     ASTDecl &scope) const {
   return isImplicitlyCopyable(loc, shared, scope) &&
-         isSpecialFunctionTrivial(loc, SpecialFunctionKind::kCopyCtor,
-                                  shared) == TriBool::yes();
+         isSpecialFunctionTrivial(loc, SpecialFunctionKind::kCopyCtor, shared,
+                                  scope)
+             .isTrue();
 }
 
 /// Return true if this type is a register-passable type that can be passed
@@ -878,7 +875,7 @@ bool ASTType::isCopyable(llvm::SMLoc loc, SharedState &shared, bool isImplicit,
   // depends on unresolved constraints (`unknown`), return false and let
   // the constraint system prove it in the appropriate context.
   return provenConformsToBuiltinTrait(traitName, typeDecl->getLoc(), shared,
-                                      ASTDecl::getAssumptionsFromScope(&scope));
+                                      scope.getScopeAssumptions());
 }
 
 /// Return true if this type is implicitly copyable, either because it is
@@ -915,7 +912,7 @@ bool ASTType::isMovable(llvm::SMLoc loc, SharedState &shared,
   // concrete parameter bindings are available to evaluate conditional
   // conformance constraints — matching isCopyable's behavior.
   return provenConformsToBuiltinTrait("Movable", typeDecl->getLoc(), shared,
-                                      ASTDecl::getAssumptionsFromScope(&scope));
+                                      scope.getScopeAssumptions());
 }
 
 TraitType ASTType::getProvidedTrait(SharedState &shared) {
@@ -938,9 +935,8 @@ TraitType ASTType::getProvidedTrait(SharedState &shared) {
   return evaluator.replace(trait);
 }
 
-TriBool
-ASTType::doesConformTo(TraitType trait, SharedState &shared,
-                       ArrayRef<ConstraintAttr> callerAssumptions) const {
+TriBool ASTType::doesConformTo(TraitType trait, SharedState &shared,
+                               TypedAttr callerAssumptions) const {
   // FIXME: this seems pretty wrong, `getDecl` is type depth insensitive,
   // meaning that it is true for `meta<meta<!struct>> conforms_to AnyType`...
   ASTDecl *typeDecl = getDecl(shared);
@@ -949,9 +945,9 @@ ASTType::doesConformTo(TraitType trait, SharedState &shared,
   return typeDecl->doesNominalTypeConformTo(trait, *this, callerAssumptions);
 }
 
-ConstraintResult ASTType::doesConformToWithDetails(
-    TraitType trait, SharedState &shared,
-    ArrayRef<ConstraintAttr> callerAssumptions) const {
+ConstraintResult
+ASTType::doesConformToWithDetails(TraitType trait, SharedState &shared,
+                                  TypedAttr callerAssumptions) const {
   ASTDecl *typeDecl = getDecl(shared);
   if (!typeDecl)
     return ConstraintResult::no({});
@@ -962,9 +958,10 @@ ConstraintResult ASTType::doesConformToWithDetails(
 /// Given a standard trait like Copyable, look up the conformance.  On
 /// success, the ASTDecl of the trait itself is returned, it is otherwise
 /// null.
-std::pair<TriBool, ASTDecl *> ASTType::conformsToBuiltinTrait(
-    StringRef traitName, llvm::SMLoc loc, SharedState &shared,
-    ArrayRef<ConstraintAttr> callerAssumptions) const {
+std::pair<TriBool, ASTDecl *>
+ASTType::conformsToBuiltinTrait(StringRef traitName, llvm::SMLoc loc,
+                                SharedState &shared,
+                                TypedAttr callerAssumptions) const {
   TraitASTDecl *traitDecl = shared.lookupBuiltinTrait(traitName, loc);
   if (!traitDecl)
     return {TriBool::no(), {}};
@@ -980,9 +977,9 @@ std::pair<TriBool, ASTDecl *> ASTType::conformsToBuiltinTrait(
 
 /// This returns true if the current type unconditionally conforms to the
 /// specified builtin trait, e.g. "Movable".
-bool ASTType::provenConformsToBuiltinTrait(
-    StringRef traitName, llvm::SMLoc loc, SharedState &shared,
-    ArrayRef<ConstraintAttr> callerAssumptions) const {
+bool ASTType::provenConformsToBuiltinTrait(StringRef traitName, llvm::SMLoc loc,
+                                           SharedState &shared,
+                                           TypedAttr callerAssumptions) const {
   auto [conformanceResult, traitDecl] =
       conformsToBuiltinTrait(traitName, loc, shared, callerAssumptions);
   return conformanceResult.isTrue();

@@ -94,9 +94,12 @@ enum class CaptureConvention : uint8_t;
 /// for a borrowed argument reference, etc.
 class Capture {
 public:
-  Capture(CValue value, CaptureConvention kind, StringRef spelling)
-      : value(value), kind(kind), spelling(spelling) {}
+  Capture(CValue value, CaptureConvention kind, StringRef spelling,
+          llvm::SMLoc loc)
+      : value(value), kind(kind), spelling(spelling), loc(loc) {}
   CValue getValue() const { return value; }
+  /// The capture list entry, or the first use for an implicit capture.
+  llvm::SMLoc getLoc() const { return loc; }
   bool isRef() const;
   /// The name of the capture
   StringRef getSpelling() const { return spelling; }
@@ -108,6 +111,7 @@ private:
   CaptureConvention kind;
   /// Store the name of the capture so we can emit meaningful error messages.
   StringRef spelling;
+  llvm::SMLoc loc;
 };
 
 /// This enum indicates how much parsing and type checking has been done on
@@ -157,6 +161,10 @@ public:
   /// module-import paths in DeclResolver), so it serves as a cheap marker to
   /// skip extension lookups entirely in scopes that have none.
   const mlir::StringAttr extensionsScopeMarker;
+
+  /// The empty assumption set (True), built once since hot conversion and
+  /// conformance queries pass it on every call.
+  TypedAttr noAssumptions;
 
   /// Returns the name a scope registers extensions of `targetName` under
   /// ("extension:<targetName>"). Distinct targets with the same leaf name share
@@ -549,6 +557,7 @@ public:
   ASTDecl *getBuiltinRaisingCoroutineType(llvm::SMLoc loc);
   ASTType getStandardCollectionType(llvm::SMLoc loc, StringRef name);
   ASTType getBuiltinSliceType(llvm::SMLoc loc, StringRef name);
+  ASTType getBuiltinEnumType(llvm::SMLoc loc, StringRef name);
   ASTType getBuiltinStubsMLIRType(llvm::SMLoc loc);
 
   /// Look up a named type's declaration in the given module, caching the

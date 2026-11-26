@@ -1091,6 +1091,12 @@ def flash_attention_dispatch[
     var q_device = q.to_device_buffer(ctx)
     var output_device = output.to_device_buffer(ctx)
 
+    # Only the flash attention route reads a per-token mask sink; the naive
+    # kernel would drop it silently.
+    comptime assert (
+        not mask_t.has_token_sink or _is_flash_attention_applicable
+    ), "a per-token mask sink needs the flash attention route"
+
     comptime if _is_flash_attention_applicable:
         comptime is_sm90 = ctx.default_device_info == H100
         comptime is_sm100 = _is_sm10x_gpu(ctx.default_device_info)
@@ -1103,6 +1109,12 @@ def flash_attention_dispatch[
         comptime fa4_route = is_sm100 and mask_t.mask_safe_out_of_bounds and (
             dtype.is_float8()
             or (q_half_float and (ragged or not _use_valid_length))
+        )
+        comptime assert not mask_t.has_token_sink or (
+            fa4_route and depth != 256 and depth != 512
+        ), (
+            "a per-token mask sink is read only by the SM100 FA4 route at a"
+            " depth other than 256 or 512"
         )
         comptime if fa4_route:
             # Decode callers supply a graph-computed cache length; prefill does
@@ -1775,6 +1787,7 @@ def flash_attention_dispatch[
                     # the split-K launch go through this one ladder, so their
                     # instantiation sets cannot drift. Returns whether a launch
                     # happened.
+                    @__allow_legacy_any_origin_fields
                     def launch_mha_decoding[
                         out_dtype: DType
                     ](
@@ -3854,6 +3867,7 @@ def mha_single_batch_pipelined[
     #   ```
     # Only the last iteration is doing boundary check.
     @inline(.always)
+    @__allow_legacy_any_origin_fields
     def loop_over_kvcache[
         tile_size: Int, not_last_iter: Bool
     ](kv_tile_start_row: Int, end: Int) {
@@ -5662,6 +5676,7 @@ def mha_decoding_single_batch_pipelined[
     )
 
     @inline(.always)
+    @__allow_legacy_any_origin_fields
     def loop_over_kvcache[
         tile_size: Int, not_last_iter: Bool
     ](kv_tile_start_row: Int, seq_len: Int) {
@@ -6021,6 +6036,7 @@ def mha_splitk_reduce[
 
     # Keep captured Kahan state inlined across scalar-tail calls on Metal.
     @inline(.always)
+    @__allow_legacy_any_origin_fields
     def accum_fn[
         simd_width: Int
     ](partition_idx: Int) {
@@ -6209,7 +6225,7 @@ def mha_gpu_naive[
         comptime assert p_buffer.flat_rank >= coords.flat_rank
         return p_buffer.load[width=_simd_width](coords)
 
-    _softmax_gpu[p_type, 1, 3, sink=sink](
+    _softmax_gpu[p_type, 1, sink=sink](
         input_fn_device,
         Coord(batch_size * num_heads, max_prompt_len, num_keys),
         p_buffer,
@@ -6348,6 +6364,7 @@ def _bmm0_bs[
         )
         var accum_vec = SIMD[p_type, accum_width](0)
 
+        @__allow_legacy_any_origin_fields
         def accum_fn[
             width: Int
         ](offset: Int) {q, y, _num_heads, _depth, k_ptr, mut}:

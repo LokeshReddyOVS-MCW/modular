@@ -63,6 +63,7 @@ from std.benchmark import (
     ThroughputMeasure,
 )
 from std.memory.alloc import unsafe_alloc
+from algorithm.bisect import bisect_left
 from comm.sync import enable_p2p
 from max.gpu.host import DeviceBuffer, DeviceContext, default_accelerator
 from layout import Coord, TileTensor, Idx
@@ -190,15 +191,13 @@ def fill_topk_ids[
         if uniform:
             return Int32(Int(random_float64(0.0, Float64(n_experts))))
         var u = random_float64(0.0, 1.0)
-        var lo = 0
-        var hi = n_experts - 1
-        while lo < hi:
-            var mid = (lo + hi) // 2
-            if u <= cdf[mid]:
-                hi = mid
-            else:
-                lo = mid + 1
-        return Int32(lo)
+        return Int32(
+            bisect_left(
+                n_experts - 1,
+                u,
+                lambda (i: Int) {cdf} -> Float64: cdf[i],
+            )
+        )
 
     for tok in range(n_tokens):
         var row = topk_ids.unsafe_offset(tok * top_k)
@@ -630,6 +629,7 @@ def bench_combine[
     ]
 
     @inline(.always)
+    @__allow_legacy_any_origin_fields
     def run_dispatch_async(dev_idx: Int, slot_idx: Int) raises {imm}:
         var ctx = list_of_ctx[dev_idx]
         ctx.enqueue_function[dispatch_async](
@@ -646,6 +646,7 @@ def bench_combine[
         )
 
     @inline(.always)
+    @__allow_legacy_any_origin_fields
     def run_dispatch_async_wait(dev_idx: Int, slot_idx: Int) raises {imm}:
         var ctx = list_of_ctx[dev_idx]
         ctx.enqueue_function[dispatch_wait](
@@ -737,6 +738,7 @@ def bench_combine[
         var output_2_tensor = get_output_2_tensor(dev_idx, slot_idx)
 
         @inline(.always)
+        @__allow_legacy_any_origin_fields
         def store_output_2[
             dtype: DType, width: SIMDLength, *, alignment: Int = 1
         ](coords: Coord, val: SIMD[dtype, width]) {var output_2_tensor}:
@@ -773,6 +775,7 @@ def bench_combine[
         var output_2_tensor = get_output_2_tensor(dev_idx, slot_idx)
 
         @inline(.always)
+        @__allow_legacy_any_origin_fields
         def store_output_2[
             dtype: DType, width: SIMDLength, *, alignment: Int = 1
         ](coords: Coord, val: SIMD[dtype, width]) {var output_2_tensor}:

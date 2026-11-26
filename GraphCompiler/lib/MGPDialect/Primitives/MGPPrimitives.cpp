@@ -37,7 +37,7 @@
 #include "Support/ML/SizeUtils.h"
 #include "Support/ML/TensorShape.h"
 #include "Support/Threading/SpinWaiter.h"
-#include "Support/max_license/Tracy/Tracy.h"
+#include "Support/max_license/Profiling/ProfileRange.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallSet.h"
@@ -119,12 +119,15 @@ static void mgp_context_create(Result<StateContext> result,
 /// Packs pointers to the input and output async values (then the constant
 /// resources) into the array the kernel ABI expects.
 template <typename OperandTy, typename ResultTy>
-llvm::SmallVector<void *> getKernelInputs(OperandTy &operands,
-                                          ResultTy &results,
-                                          MEFListAttr constantResources) {
-  TRACY_ZONE_SCOPED_NC("getKernelInputs", TRACY_COLOR_TEAL);
+llvm::SmallVector<void *, 16> getKernelInputs(OperandTy &operands,
+                                              ResultTy &results,
+                                              MEFListAttr constantResources) {
+  M_PROFILE_TRACY_ZONE("getKernelInputs", M_PROFILE_COLOR_TEAL);
 
-  llvm::SmallVector<void *> kernelInputs;
+  // SmallVector<void *> holds six elements inline by default, and a kernel's
+  // inputs are one per operand and result plus two per constant resource, so
+  // anything beyond a handful of operands allocates on every launch.
+  llvm::SmallVector<void *, 16> kernelInputs;
   kernelInputs.reserve(results.size() + operands.size() +
                        constantResources.size());
 
@@ -143,19 +146,20 @@ llvm::SmallVector<void *> getKernelInputs(OperandTy &operands,
         const_cast<void *>(reinterpret_cast<const void *>(attr.get())));
 
     size_t byteCount = 1;
-    if (attr.getAttrKind() == MEF::AttributeKind::kString) {
-      byteCount = M::decodeMEFArrayLength(attr.get());
+    if (attr.getAttrKind() == MLRT::MEF::AttributeKind::kString) {
+      byteCount = M::MLRT::decodeMEFArrayLength(attr.get());
     } else if (((uint8_t)attr.getAttrKind()) &
-               ((uint8_t)MEF::AttributeKind::mArrayType)) {
-      byteCount = M::decodeMEFArrayLength(attr.get()) *
-                  M::MEF::getWidthInBits(attr.getAttrKind()) / 8;
+               ((uint8_t)MLRT::MEF::AttributeKind::mArrayType)) {
+      byteCount = M::MLRT::decodeMEFArrayLength(attr.get()) *
+                  M::MLRT::MEF::getWidthInBits(attr.getAttrKind()) / 8;
     } else {
-      ASSERT_STREAM(attr.getAttrKind() != MEF::AttributeKind::kBool &&
-                        attr.getAttrKind() != MEF::AttributeKind::kDictionary &&
-                        attr.getAttrKind() != MEF::AttributeKind::kList &&
-                        attr.getAttrKind() != MEF::AttributeKind::kType &&
-                        attr.getAttrKind() != MEF::AttributeKind::kSymbolRef,
-                    "unhandled type of resources.");
+      ASSERT_STREAM(
+          attr.getAttrKind() != MLRT::MEF::AttributeKind::kBool &&
+              attr.getAttrKind() != MLRT::MEF::AttributeKind::kDictionary &&
+              attr.getAttrKind() != MLRT::MEF::AttributeKind::kList &&
+              attr.getAttrKind() != MLRT::MEF::AttributeKind::kType &&
+              attr.getAttrKind() != MLRT::MEF::AttributeKind::kSymbolRef,
+          "unhandled type of resources.");
     }
     kernelInputs.push_back(reinterpret_cast<void *>(byteCount));
   }
@@ -167,7 +171,7 @@ llvm::SmallVector<void *> getKernelInputs(OperandTy &operands,
 /// such context for pinning; otherwise kNoDevicePreference and null.
 static std::pair<int, M::Driver::DeviceContextRef>
 deviceHintAndContextFor(const RemainingArguments &operands) {
-  TRACY_ZONE_SCOPED_NC("deviceHintAndContextFor", TRACY_COLOR_TEAL);
+  M_PROFILE_TRACY_ZONE("deviceHintAndContextFor", M_PROFILE_COLOR_TEAL);
 
   llvm::SmallVector<M::Driver::DeviceContextRef, 8> acceleratorContexts;
 
@@ -203,8 +207,8 @@ mgp_generic_execute(StateContext &ctx, RemainingArguments operands,
                     MEFAttr<uint64_t> cFunctionIndex,
                     MEFAttr<StringRef> dSummary, MEFAttr<bool> eIsAsync,
                     MEFListAttr fConstantResources, CPUDevice &cpuDevice) {
-  TRACY_ZONE_SCOPED_NCT("mgp_generic_execute", TRACY_COLOR_TEAL,
-                        "(Summary: " + dSummary.get().str() + ")");
+  M_PROFILE_SPAN_TEXT("mgp_generic_execute", M_PROFILE_COLOR_TEAL,
+                      "(Summary: " + dSummary.get().str() + ")");
 
   M::MGP::KernelExecutionState &kernelExecutionState =
       ctx.getStateSlotPayload<M::MGP::KernelExecutionState>(
@@ -224,8 +228,8 @@ mgp_generic_execute(StateContext &ctx, RemainingArguments operands,
   // Async kernels always run out of line. Sync kernels run inline unless they
   // have task affinity and this is the wrong worker.
   if (eIsAsync.get() || !workQueue->shouldRunInlineForTask(taskId)) {
-    TRACY_ZONE_SCOPED_NCT("-> mgp_generic_execute (async)", TRACY_COLOR_TEAL,
-                          "(Summary: " + dSummary.get().str() + ")");
+    M_PROFILE_SPAN_TEXT("-> mgp_generic_execute (async)", M_PROFILE_COLOR_TEAL,
+                        "(Summary: " + dSummary.get().str() + ")");
 
     // GraphRT expects allocated results; only needed here because the task
     // outlives this function.
@@ -238,14 +242,15 @@ mgp_generic_execute(StateContext &ctx, RemainingArguments operands,
          takenOperands = operands.takeAsVector(),
          constantResources = std::move(fConstantResources), kernelPtr, dSummary,
          deviceCtx = std::move(deviceCtx)]() mutable {
-          TRACY_ZONE_SCOPED_NCT("runKernelAndExtendLifetimes", TRACY_COLOR_TEAL,
-                                "(Summary: " + dSummary.get().str() + ")");
+          M_PROFILE_SPAN_TEXT("runKernelAndExtendLifetimes",
+                              M_PROFILE_COLOR_TEAL,
+                              "(Summary: " + dSummary.get().str() + ")");
 
           // Results are published into `outResults` as the task's last action
           // so no downstream work starts before `kernelPtr` fully completes.
           llvm::SmallVector<AnyAsyncValueRef> localResults(outResults.size());
 
-          llvm::SmallVector<void *> kernelInputs =
+          llvm::SmallVector<void *, 16> kernelInputs =
               getKernelInputs(takenOperands, localResults, constantResources);
           MAYBE_LOG_ASYNC_KERNEL(*dSummary, takenOperands, localResults);
 
@@ -253,8 +258,8 @@ mgp_generic_execute(StateContext &ctx, RemainingArguments operands,
             (void)deviceCtx->bindToCurrentThread();
 
           {
-            TRACY_ZONE_SCOPED_NCT("Invoke Mojo function", TRACY_COLOR_ORANGE,
-                                  "(Summary: " + dSummary.get().str() + ")");
+            M_PROFILE_SPAN_TEXT("Invoke Mojo function", M_PROFILE_COLOR_ORANGE,
+                                "(Summary: " + dSummary.get().str() + ")");
             kernelPtr(reinterpret_cast<void **>(kernelInputs.data()));
           }
 
@@ -282,19 +287,19 @@ mgp_generic_execute(StateContext &ctx, RemainingArguments operands,
     AsyncRT::WorkItem workItem(std::move(runKernelAndExtendLifetimes));
     workQueue->addTask(std::move(workItem), taskId);
   } else {
-    TRACY_ZONE_SCOPED_NCT("-> mgp_generic_execute (sync kernel)",
-                          TRACY_COLOR_TEAL,
-                          "(Summary: " + dSummary.get().str() + ")");
+    M_PROFILE_SPAN_TEXT("-> mgp_generic_execute (sync kernel)",
+                        M_PROFILE_COLOR_TEAL,
+                        "(Summary: " + dSummary.get().str() + ")");
 
     if (deviceCtx.getPointer() != nullptr)
       (void)deviceCtx->bindToCurrentThread();
 
-    llvm::SmallVector<void *> kernelInputs =
+    llvm::SmallVector<void *, 16> kernelInputs =
         getKernelInputs(operands, outResults, fConstantResources);
     MAYBE_LOG_SYNC_KERNEL(*dSummary, operands, outResults.get());
     {
-      TRACY_ZONE_SCOPED_NCT("Invoke Mojo function", TRACY_COLOR_ORANGE,
-                            "(Summary: " + dSummary.get().str() + ")");
+      M_PROFILE_SPAN_TEXT("Invoke Mojo function", M_PROFILE_COLOR_ORANGE,
+                          "(Summary: " + dSummary.get().str() + ")");
 
       kernelPtr(reinterpret_cast<void **>(kernelInputs.data()));
     }
@@ -406,7 +411,7 @@ static void mgp_device_graph_collective_execute(RemainingArguments operands,
                                                 Result<Chain> outChain,
                                                 RemainingResults outputs,
                                                 EncodedLocation loc) {
-  TRACY_ZONE_SCOPED_NC("mgp_device_graph_collective_execute", TRACY_COLOR_TEAL);
+  M_PROFILE_RANGE("mgp_device_graph_collective_execute", M_PROFILE_COLOR_TEAL);
 
   SmallVector<M::Driver::DeviceGraph *, 8> graphs;
 
@@ -489,7 +494,7 @@ static void mgp_device_graph_collective_execute(RemainingArguments operands,
 
 static void mgp_list_append(List &inputList, AnyAsyncValueRef element,
                             Result<List> output) {
-  TRACY_ZONE_SCOPED_NC("mgp_list_append", TRACY_COLOR_TEAL);
+  M_PROFILE_TRACY_ZONE("mgp_list_append", M_PROFILE_COLOR_TEAL);
 
   if (element.isType<Tensor>()) {
     if (!inputList.getElements().empty() &&
@@ -510,7 +515,7 @@ static void mgp_list_append(List &inputList, AnyAsyncValueRef element,
 //===----------------------------------------------------------------------===//
 
 static void mgp_list_concat(List &lhs, List &rhs, Result<List> output) {
-  TRACY_ZONE_SCOPED_NC("mgp_list_concat", TRACY_COLOR_TEAL);
+  M_PROFILE_TRACY_ZONE("mgp_list_concat", M_PROFILE_COLOR_TEAL);
 
   List resultList = lhs.copy();
   resultList.getElements().insert(resultList.getElements().end(),
@@ -526,7 +531,7 @@ static void mgp_list_concat(List &lhs, List &rhs, Result<List> output) {
 
 static void mgp_list_create(RemainingArguments operands,
                             Result<List> outputList) {
-  TRACY_ZONE_SCOPED_NC("mgp_list_create", TRACY_COLOR_TEAL);
+  M_PROFILE_TRACY_ZONE("mgp_list_create", M_PROFILE_COLOR_TEAL);
 
   std::move(outputList).emplace(List{operands.copyAsVector()});
 }
@@ -537,7 +542,7 @@ static void mgp_list_create(RemainingArguments operands,
 
 static void mgp_list_get(List &inputList, Tensor &idxTensor,
                          RemainingResults outputs, EncodedLocation loc) {
-  TRACY_ZONE_SCOPED_NC("mgp_list_get", TRACY_COLOR_TEAL);
+  M_PROFILE_TRACY_ZONE("mgp_list_get", M_PROFILE_COLOR_TEAL);
 
   // We must unbox the index value from the tensor.
   // TODO: Should be ssize_t.
@@ -569,7 +574,7 @@ static void mgp_list_get(List &inputList, Tensor &idxTensor,
 
 static void mgp_list_insert(List &inputList, AnyAsyncValueRef element,
                             Tensor &idxTensor, Result<List> output) {
-  TRACY_ZONE_SCOPED_NC("mgp_list_insert", TRACY_COLOR_TEAL);
+  M_PROFILE_TRACY_ZONE("mgp_list_insert", M_PROFILE_COLOR_TEAL);
 
   // We must unbox the index value from the tensor.
   // TODO: Should be ssize_t.
@@ -602,7 +607,7 @@ static void mgp_list_insert(List &inputList, AnyAsyncValueRef element,
 static void mgp_list_slice(List &inputList, Tensor &startTensor,
                            Tensor &endTensor, Tensor &stepTensor,
                            Result<List> output) {
-  TRACY_ZONE_SCOPED_NC("mgp_list_slice", TRACY_COLOR_TEAL);
+  M_PROFILE_TRACY_ZONE("mgp_list_slice", M_PROFILE_COLOR_TEAL);
 
   auto sliceFunctor = [&](auto start, auto end, auto step) {
     List resultList;
@@ -673,7 +678,7 @@ static void mgp_list_slice(List &inputList, Tensor &startTensor,
 
 static void mgp_guard(Chain inChain, RemainingArguments inputs,
                       RemainingResults results) {
-  TRACY_ZONE_SCOPED_NC("mgp_guard", TRACY_COLOR_TEAL);
+  M_PROFILE_TRACY_ZONE("mgp_guard", M_PROFILE_COLOR_TEAL);
 
   assert(inputs.size() == results.size());
 
@@ -691,7 +696,7 @@ static void mgp_guard(Chain inChain, RemainingArguments inputs,
 //===----------------------------------------------------------------------===//
 
 static void mgp_model() {
-  TRACY_ZONE_SCOPED_NC("mgp_model", TRACY_COLOR_TEAL);
+  M_PROFILE_SPAN("mgp_model", M_PROFILE_COLOR_TEAL);
 
   ASSERT_STREAM(false, << "mgp.model should never be invoked");
 }
@@ -702,7 +707,7 @@ static void mgp_model() {
 
 // Runs once all operands are ready, keeping them alive until then.
 static void mgp_nop(RemainingArguments operands, Result<Chain> outChain) {
-  TRACY_ZONE_SCOPED_NC("mgp_nop", TRACY_COLOR_TEAL);
+  M_PROFILE_TRACY_ZONE("mgp_nop", M_PROFILE_COLOR_TEAL);
 
   std::move(outChain).emplace();
 }
@@ -714,7 +719,7 @@ static void mgp_nop(RemainingArguments operands, Result<Chain> outChain) {
 void mgp_runtime_create(Chain inChain, StateContext &theContext,
                         Result<Chain> outChain, MEFAttr<uint64_t> aRuntimeSlot,
                         CPUDevice &cpuDevice) {
-  TRACY_ZONE_SCOPED_NC("mgp_runtime_create", TRACY_COLOR_TEAL);
+  M_PROFILE_SPAN("mgp_runtime_create", M_PROFILE_COLOR_TEAL);
 
   // M::Context is not in the primitive invocation ABI; callers (engine, mt,
   // mo-opt) create it and it is retrieved here.
@@ -764,7 +769,7 @@ void mgp_runtime_create(Chain inChain, StateContext &theContext,
 static ErrorOr<M::Driver::DeviceContextRef>
 mgp_device_context_select_stream(M::Driver::DeviceContextRef &deviceContext,
                                  MEFAttr<uint64_t> streamId) {
-  TRACY_ZONE_SCOPED_NC("mgp_device_context_select_stream", TRACY_COLOR_TEAL);
+  M_PROFILE_SPAN("mgp_device_context_select_stream", M_PROFILE_COLOR_TEAL);
   return deviceContext->selectStream(static_cast<unsigned>(*streamId));
 }
 
@@ -777,7 +782,7 @@ static void mgp_buffer_cache(Chain inChain, StateContext &theContext,
                              Result<Chain> outChain,
                              MEFAttr<uint64_t> bBufferSlot,
                              CPUDevice &cpuDevice) {
-  TRACY_ZONE_SCOPED_NC("mgp_buffer_cache", TRACY_COLOR_TEAL);
+  M_PROFILE_SPAN("mgp_buffer_cache", M_PROFILE_COLOR_TEAL);
 
   auto &tensorStateSlot = theContext.emplaceStateSlot<TensorStateSlot>(
       static_cast<size_t>(*bBufferSlot));

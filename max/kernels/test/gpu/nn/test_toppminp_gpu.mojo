@@ -29,7 +29,6 @@ from nn.softmax import softmax_inline
 from nn.toppminp_gpu import min_p_sampling_gpu, top_p_sampling_gpu
 from std.testing import assert_almost_equal, assert_equal, assert_true
 
-from std.utils import IndexList
 
 comptime DEBUG_BENCH = False
 comptime PRINT_OUTPUT = False
@@ -217,11 +216,9 @@ def test_is_sorted_descending[
                     break
 
     comptime parallelism_grain_size = 1
-    # Create shape with batch_size as the second dimension
-    var shape = IndexList[1](
-        batch_size,
+    parallelize_over_rows(
+        process_rows, Coord(batch_size), 0, parallelism_grain_size
     )
-    parallelize_over_rows(process_rows, shape, 0, parallelism_grain_size)
 
     # Check if all batches are sorted by AND-ing all flags
     var all_sorted = True
@@ -256,7 +253,6 @@ def test_case_sampling(
     ],
 ) raises:
     print_test_case(test_case)
-    comptime rank = 2
     comptime dtype = test_case.dtype
     comptime out_idx_type = test_case.out_idx_type
     comptime is_top_p = test_case.is_top_p
@@ -328,7 +324,7 @@ def test_case_sampling(
     ](coords: Coord) {var in_logits_cpu_test} -> SIMD[dtype, width]:
         return in_logits_cpu_test.load[width=width, alignment=1](coords)
 
-    softmax_inline[dtype, simd_width=1, rank=rank](
+    softmax_inline[dtype, simd_width=1](
         input_fn,
         in_logits_cpu_test.layout.shape_coord(),
         probs_cpu_test,
@@ -503,7 +499,7 @@ def test_minp_max_threshold[
     def input_fn[width: Int](coords: Coord) {var logits} -> SIMD[dtype, width]:
         return logits.load[width=width, alignment=1](coords)
 
-    softmax_inline[dtype, simd_width=1, rank=2](
+    softmax_inline[dtype, simd_width=1](
         input_fn, logits.layout.shape_coord(), probs, axis=1
     )
     var probs_flat = probs.reshape(row_major(batch_size * vocab_size))

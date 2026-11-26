@@ -66,6 +66,7 @@ def llvm_intrinsic[
             intrin=intrin_kgen_string,
             _type=None,
             hasSideEffects=has_side_effect.__mlir_i1__(),
+            expandPackOperandIdx=__mlir_attr.`0 : index`,
         ](loaded_pack)
         return rebind[type](None)
 
@@ -74,6 +75,7 @@ def llvm_intrinsic[
             intrin=intrin_kgen_string,
             _type=type,
             hasSideEffects=has_side_effect.__mlir_i1__(),
+            expandPackOperandIdx=__mlir_attr.`0 : index`,
         ](loaded_pack)
 
 
@@ -279,14 +281,23 @@ struct PrefetchLocality(TrivialRegisterPassable):
 
     var value: Int32
     """The prefetch locality to use. It should be a value in [0, 3]."""
-    comptime NONE = PrefetchLocality(0)
+    comptime none = PrefetchLocality(0)
     """No locality."""
-    comptime LOW = PrefetchLocality(1)
+    comptime low = PrefetchLocality(1)
     """Low locality."""
-    comptime MEDIUM = PrefetchLocality(2)
+    comptime medium = PrefetchLocality(2)
     """Medium locality."""
-    comptime HIGH = PrefetchLocality(3)
+    comptime high = PrefetchLocality(3)
     """Extremely local locality (keep in cache)."""
+
+    comptime NONE = Self.none
+    """Alias for `none`."""
+    comptime LOW = Self.low
+    """Alias for `low`."""
+    comptime MEDIUM = Self.medium
+    """Alias for `medium`."""
+    comptime HIGH = Self.high
+    """Alias for `high`."""
 
     @inline(.nodebug)
     def __init__(out self, value: Int):
@@ -304,10 +315,15 @@ struct PrefetchRW(TrivialRegisterPassable):
 
     var value: Int32
     """The read-write prefetch. It should be in [0, 1]."""
-    comptime READ = PrefetchRW(0)
+    comptime read = PrefetchRW(0)
     """Read prefetch."""
-    comptime WRITE = PrefetchRW(1)
+    comptime write = PrefetchRW(1)
     """Write prefetch."""
+
+    comptime READ = Self.read
+    """Alias for `read`."""
+    comptime WRITE = Self.write
+    """Alias for `write`."""
 
     @inline(.nodebug)
     def __init__(out self, value: Int):
@@ -338,10 +354,15 @@ struct PrefetchCache(TrivialRegisterPassable):
 
     var value: Int32
     """The cache prefetch. It should be in [0, 1]."""
-    comptime INSTRUCTION = PrefetchCache(0)
+    comptime instruction = PrefetchCache(0)
     """The instruction prefetching option."""
-    comptime DATA = PrefetchCache(1)
+    comptime data = PrefetchCache(1)
     """The data prefetching option."""
+
+    comptime INSTRUCTION = Self.instruction
+    """Alias for `instruction`."""
+    comptime DATA = Self.data
+    """Alias for `data`."""
 
     @inline(.nodebug)
     def __init__(out self, value: Int):
@@ -760,9 +781,7 @@ def strided_store[
 
 
 struct _RegisterPackType[*Ts: TrivialRegisterPassable](TrivialRegisterPassable):
-    comptime _mlir_type = __mlir_type[
-        `!kgen.struct<`, ~Self.Ts.values, ` isParamPack>`
-    ]
+    comptime _mlir_type = __mlir_type[`!kgen.struct<`, ~Self.Ts.values, `>`]
 
     var _mlir_value: Self._mlir_type
 

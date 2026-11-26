@@ -834,8 +834,8 @@ def dispatch_mask[
     Args:
         mask_operands: The mask's graph operands: none for the masks that
             read none, the ids and row offsets for `"segment"`, the mask for
-            `"additive"`, the bias, cache lengths and row offsets for
-            `"relative_logits"`.
+            `"additive"`, the bias, cache lengths and row offsets, and
+            optionally per-token sink logits, for `"relative_logits"`.
         callback_fn: Parametric callback invoked with the resolved mask.
 
     Raises:
@@ -1027,14 +1027,6 @@ struct NonNullPointer[dtype_: DType, address_space_: AddressSpace = .GENERIC](
     ):
         encoder.encode_fields[Self](self, target)
 
-    @staticmethod
-    def get_type_name() -> String:
-        return "NonNullPointer"
-
-    @staticmethod
-    def get_device_type_name() -> String:
-        return Self.get_type_name()
-
     @inline(.always)
     def __init__(out self, ptr: Self.PtrType):
         self.ptr = ptr
@@ -1084,14 +1076,6 @@ struct NullPointer[dtype_: DType, address_space_: AddressSpace = .GENERIC](
         self, mut encoder: Some[DeviceTypeEncoder], target: MutOpaquePointer[_]
     ):
         encoder.encode_fields[Self](self, target)
-
-    @staticmethod
-    def get_type_name() -> String:
-        return "NullPointer"
-
-    @staticmethod
-    def get_device_type_name() -> String:
-        return Self.get_type_name()
 
     @inline(.always)
     def __init__(out self):

@@ -42,9 +42,7 @@ PIPELINES: Final[list[PipelineEntry]] = [
         instance_type="bm.gpu.b200.1",
         timeout=60,
     ),
-    # NVFP4 target with the DSpark draft at TP=2 on 2xB200. The shipped recipe
-    # (nemotron_h_modulev3/recipes/lightning_bf16_dspark.yaml) uses the BF16
-    # target; this lane swaps in the NVFP4 target.
+    # Mach only: the NVFP4 target with the DSpark draft, 7 speculative tokens.
     PipelineEntry(
         pipeline="nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4__dspark-tp2",
         model_path="nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4",
@@ -52,6 +50,7 @@ PIPELINES: Final[list[PipelineEntry]] = [
         gpu_flag="--devices gpu:0,1",
         instance_type="bm.gpu.b200.2",
         timeout=90,
+        mach_key="nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4__modulev3_dspark",
     ),
     PipelineEntry(
         pipeline="meta-models/Muse-Glimmer-30B",
@@ -60,9 +59,9 @@ PIPELINES: Final[list[PipelineEntry]] = [
         gpu_flag="--devices gpu:0",
         instance_type="bm.gpu.b200.1",
         timeout=90,
+        # Mach only.
+        mach_key="meta-models/Muse-Glimmer-30B",
     ),
-    # Mach serves the export artifact at TP2; MAX Serve runs the same
-    # checkpoint through the mimo_v2_modulev3 recipe.
     PipelineEntry(
         pipeline="XiaomiMiMo/MiMo-V2.6-Flash-RL",
         model_path="XiaomiMiMo/MiMo-V2.6-Flash-RL",
@@ -70,6 +69,9 @@ PIPELINES: Final[list[PipelineEntry]] = [
         gpu_flag="--devices gpu:0,1",
         instance_type="bm.gpu.b200.2",
         timeout=90,
+        # Mach only, serving the export artifact at TP2. MAX Serve declares
+        # no reasoning or tool parser for MiMo, so its lane fails on parsing.
+        mach_key="XiaomiMiMo/MiMo-V2.6-Flash-RL",
     ),
     PipelineEntry(
         pipeline="meta-models/Muse-Spark-Open-816B-A42B-NVFP4",
@@ -88,16 +90,19 @@ PIPELINES: Final[list[PipelineEntry]] = [
         gpu_flag="--devices gpu:0,1,2,3",
         instance_type="bm.gpu.b200.4",
         timeout=210,
-        # Mach only, with the DFlash2 drafter the model ships with.
+        # Mach only, serving the export artifact with the DFlash2 drafter the
+        # model ships with.
         mach_key="reflection/Beam-1.0-501B-A23B-NVFP4__dflash2",
     ),
     PipelineEntry(
-        pipeline="tencent/Hy4-preview-FP8-ep-tp-mtp",
-        model_path="tencent/Hy4-preview-FP8",
+        pipeline="tencent/Hy4-FP8",
+        model_path="tencent/Hy4-FP8",
         runner="modrunner-b200-efa-8x",
         gpu_flag="--devices gpu:0,1,2,3,4,5,6,7",
         instance_type="bm.gpu.b200.8",
         timeout=210,
+        # Mach only, serving the export artifact.
+        mach_key="tencent/Hy4-FP8",
     ),
     PipelineEntry(
         pipeline="minimax/MiniMax-M3-MXFP8-ep-tp",
@@ -118,17 +123,16 @@ PIPELINES: Final[list[PipelineEntry]] = [
         instance_type="bm.gpu.b200.8",
         timeout=90,
     ),
-    # Laguna S-2.1 on one B200: the gated lane, carrying the mixed NVFP4/bf16
-    # expert split. Joins the nightly schedule with both arms currently red:
-    # MAX Serve against a known-failure list derived from narrower Mach-vs-
-    # legacy control runs, Mach on seven ids MAX Serve passes. Accepted while
-    # Mach serving lands first.
+    # Mirrors the production MiniMax-M3.1-Flash recipe (kadabra-m31-prod-7):
+    # DP=2 x EP=8, NVFP4 KV, DSpark draft from the target repo's dspark/
+    # folder, with the tiered connector standing in for dKV. The longer
+    # timeout covers the draft model's warm-up on top of the target's.
     PipelineEntry(
-        pipeline="poolside/Laguna-S-2.1-NVFP4",
-        model_path="poolside/Laguna-S-2.1-NVFP4",
-        runner="modrunner-b200",
-        gpu_flag="--devices gpu:0",
-        instance_type="bm.gpu.b200.1",
+        pipeline="minimax/MiniMax-M3.1-Flash",
+        model_path="MiniMaxAI/MiniMax-M3.1-Flash",
+        runner="modrunner-b200-efa-8x",
+        gpu_flag="--devices gpu:0,1,2,3,4,5,6,7",
+        instance_type="bm.gpu.b200.8",
         timeout=120,
     ),
     # 8x B200: TP8 attention, EP8 MoE.

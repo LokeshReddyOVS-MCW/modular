@@ -72,28 +72,56 @@ struct Level(
 
     var _value: Int
 
-    comptime NOTSET = Self(0)
+    comptime notset = Self(0)
     """Lowest level, used when no level is set."""
 
-    comptime TRACE = Self(10)
+    comptime trace = Self(10)
     """Repetitive trace information, Indicates repeated execution or IO-coupled
     activity, typically only of interest when diagnosing hangs or ensuring a
     section of code is executing."""
 
-    comptime DEBUG = Self(20)
+    comptime debug = Self(20)
     """Detailed information, typically of interest only when diagnosing problems."""
 
-    comptime INFO = Self(30)
+    comptime info = Self(30)
     """Confirmation that things are working as expected."""
 
-    comptime WARNING = Self(40)
+    comptime warning = Self(40)
     """Indication that something unexpected happened, or may happen in the near future."""
 
-    comptime ERROR = Self(50)
+    comptime error = Self(50)
     """Due to a more serious problem, the software has not been able to perform some function."""
 
-    comptime CRITICAL = Self(60)
+    comptime critical = Self(60)
     """A serious error indicating that the program itself may be unable to continue running."""
+
+    @deprecated(use=notset)
+    comptime NOTSET = Self.notset
+    """Deprecated."""
+
+    @deprecated(use=trace)
+    comptime TRACE = Self.trace
+    """Deprecated."""
+
+    @deprecated(use=debug)
+    comptime DEBUG = Self.debug
+    """Deprecated."""
+
+    @deprecated(use=info)
+    comptime INFO = Self.info
+    """Deprecated."""
+
+    @deprecated(use=warning)
+    comptime WARNING = Self.warning
+    """Deprecated."""
+
+    @deprecated(use=error)
+    comptime ERROR = Self.error
+    """Deprecated."""
+
+    @deprecated(use=critical)
+    comptime CRITICAL = Self.critical
+    """Deprecated."""
 
     @inline(.always)
     def __eq__(self, other: Self) -> Bool:
@@ -124,17 +152,17 @@ struct Level(
         Returns:
             The corresponding Color of the level.
         """
-        if self == Self.TRACE:
+        if self == Self.trace:
             return Color.GREEN
-        if self == Self.DEBUG:
+        if self == Self.debug:
             return Color.GREEN
-        if self == Self.INFO:
+        if self == Self.info:
             return Color.YELLOW
-        if self == Self.WARNING:
+        if self == Self.warning:
             return Color.BLUE
-        if self == Self.ERROR:
+        if self == Self.error:
             return Color.MAGENTA
-        if self == Self.CRITICAL:
+        if self == Self.critical:
             return Color.RED
 
         return Color("")
@@ -151,20 +179,20 @@ struct Level(
         """
         var lname = name.lower()
         if lname == "notset":
-            return Self.NOTSET
+            return Self.notset
         if lname == "trace":
-            return Self.TRACE
+            return Self.trace
         if lname == "debug":
-            return Self.DEBUG
+            return Self.debug
         if lname == "info":
-            return Self.INFO
+            return Self.info
         if lname == "warning":
-            return Self.WARNING
+            return Self.warning
         if lname == "error":
-            return Self.ERROR
+            return Self.error
         if lname == "critical":
-            return Self.CRITICAL
-        return Self.NOTSET
+            return Self.critical
+        return Self.notset
 
     def write_to(self, mut writer: Some[Writer]):
         """Writes the string representation of this level to a writer.
@@ -173,20 +201,20 @@ struct Level(
             writer: The writer to write to.
         """
         match self:
-            case .NOTSET:
-                writer.write("NOTSET")
-            case .TRACE:
-                writer.write("TRACE")
-            case .DEBUG:
-                writer.write("DEBUG")
-            case .INFO:
-                writer.write("INFO")
-            case .WARNING:
-                writer.write("WARNING")
-            case .ERROR:
-                writer.write("ERROR")
-            case .CRITICAL:
-                writer.write("CRITICAL")
+            case .notset:
+                writer.write_string("notset")
+            case .trace:
+                writer.write_string("trace")
+            case .debug:
+                writer.write_string("debug")
+            case .info:
+                writer.write_string("info")
+            case .warning:
+                writer.write_string("warning")
+            case .error:
+                writer.write_string("error")
+            case .critical:
+                writer.write_string("critical")
             case _:
                 pass
 
@@ -239,7 +267,7 @@ struct Logger[level: Level = DEFAULT_LEVEL](ImplicitlyCopyable):
             True if logging at the target level is disabled, False otherwise.
         """
 
-        comptime if Self.level == Level.NOTSET:
+        comptime if Self.level == .notset:
             return True
         return Self.level > target_level
 
@@ -265,7 +293,7 @@ struct Logger[level: Level = DEFAULT_LEVEL](ImplicitlyCopyable):
                 (defaults to a newline).
             location: The location of the error (defaults to `call_location`).
         """
-        comptime target_level = Level.TRACE
+        comptime target_level = Level.trace
 
         comptime if not Self._is_disabled[target_level]():
             self._write_out[target_level](
@@ -297,7 +325,7 @@ struct Logger[level: Level = DEFAULT_LEVEL](ImplicitlyCopyable):
                 (defaults to a newline).
             location: The location of the error (defaults to `call_location`).
         """
-        comptime target_level = Level.DEBUG
+        comptime target_level = Level.debug
 
         comptime if not Self._is_disabled[target_level]():
             self._write_out[target_level](
@@ -329,7 +357,7 @@ struct Logger[level: Level = DEFAULT_LEVEL](ImplicitlyCopyable):
                 (defaults to a newline).
             location: The location of the error (defaults to `call_location`).
         """
-        comptime target_level = Level.INFO
+        comptime target_level = Level.info
 
         comptime if not Self._is_disabled[target_level]():
             self._write_out[target_level](
@@ -361,7 +389,7 @@ struct Logger[level: Level = DEFAULT_LEVEL](ImplicitlyCopyable):
                 (defaults to a newline).
             location: The location of the error (defaults to `call_location`).
         """
-        comptime target_level = Level.WARNING
+        comptime target_level = Level.warning
 
         comptime if not Self._is_disabled[target_level]():
             self._write_out[target_level](
@@ -393,7 +421,7 @@ struct Logger[level: Level = DEFAULT_LEVEL](ImplicitlyCopyable):
                 (defaults to a newline).
             location: The location of the error (defaults to `call_location`).
         """
-        comptime target_level = Level.ERROR
+        comptime target_level = Level.error
 
         comptime if not Self._is_disabled[target_level]():
             self._write_out[target_level](
@@ -426,7 +454,7 @@ struct Logger[level: Level = DEFAULT_LEVEL](ImplicitlyCopyable):
             location: The location of the error (defaults to `call_location`).
 
         """
-        comptime target_level = Level.CRITICAL
+        comptime target_level = Level.critical
 
         comptime if not Self._is_disabled[target_level]():
             self._write_out[target_level](

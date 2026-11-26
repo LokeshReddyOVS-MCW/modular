@@ -111,13 +111,13 @@ static void diagnoseFailedRefTypeConversion(MojoInflightDiag &diag,
         << ASTType::getAddressSpaceForDisplay(argType.getAddressSpace());
   } else if (!IREmitter::canZeroCostConvert(operandRefTy.getOriginType(),
                                             argType.getOriginType(), shared,
-                                            declScope)
+                                            declScope, shared.noAssumptions)
                   .isTrue()) {
     diag.attachNote(loc) << "operand mutability " << operandRefTy.isMutable()
                          << " doesn't match expected mutability "
                          << argType.isMutable();
   } else if (!IREmitter::canZeroCostConvert(operandRefTy, argType, shared,
-                                            declScope)
+                                            declScope, shared.noAssumptions)
                   .isTrue()) {
     auto operandO = operandRefTy.getOrigin();
     auto argO = argType.getOrigin();
@@ -156,6 +156,8 @@ void printUValueTypeInfo(const AnyValue &value, MojoInflightDiag &diag) {
     }
   } else if (value.getIfInferredBaseAttrRef()) {
     diag << "inferred attribute reference";
+  } else if (value.getIfLambda()) {
+    diag << "lambda expression";
   } else
     diag << "unknown overload";
 }
@@ -257,9 +259,7 @@ OverloadFitness::evaluateDirectCall(ASTDecl *candidate,
   ParamInf inference(paramBindings, signature.getInputParamTypes(),
                      signature.getParamListAttrs(),
                      /*allowImplicitConversions=*/true, candidate,
-                     /*discardError=*/true,
-                     /*deferredTypingContext=*/nullptr,
-                     callable.additionalAssumptions);
+                     /*discardError=*/true, callable.additionalAssumptions);
   // Don't yield constraint failure for a single overload failure: we want a
   // better error message diagnosed for the entire set.
   VerifiedParamBindings bindings = inference.inferForStruct();
@@ -273,7 +273,7 @@ OverloadFitness::evaluateDirectCall(ASTDecl *candidate,
 
   OverloadFitness fitness(
       std::move(bindings),
-      /*noArgsNeedingOrigins*/ OperandsNeedingOriginsList());
+      /*noArgsNeedingReEmission*/ OperandsNeedingReEmissionList());
   fitness.unprovableConstraints =
       std::move(inference.bodyUnprovableConstraints);
   return fitness;
@@ -353,7 +353,6 @@ OverloadFitness OverloadFitness::evaluateDirectCall(
       // index refs, so those match anything.
       bool ctxIsGenerator = sugarIsa<GeneratorAttr>(PValue(ctxType));
       auto isUnbound = [&](TypedAttr param) {
-        assert(!llvm::isa<UnboundAttr>(param));
         auto indexRef = dyn_cast<ParamIndexRefAttr>(param);
         return ctxIsGenerator && indexRef && indexRef.getDepth() == 0;
       };
@@ -386,14 +385,13 @@ OverloadFitness::evaluateIndirectCall(FnTypeGeneratorType signature,
   // inferred from the operands.
   ParamBindings noBindings(declScope, operands.callExpr);
   return evaluateImpl(signature, /*funcIfDirect=*/nullptr, noBindings,
-                      /*additionalAssumptions=*/{}, operands,
+                      declScope.getShared().noAssumptions, operands,
                       /*allowImplicitConversions=*/true);
 }
 
 OverloadFitness OverloadFitness::evaluateImpl(
     FnTypeGeneratorType signature, ASTDecl *funcIfDirect,
-    const ParamBindings &paramBindings,
-    ArrayRef<ConstraintAttr> additionalAssumptions,
+    const ParamBindings &paramBindings, TypedAttr additionalAssumptions,
     const CallOperands &operands, bool allowImplicitConversions) {
   SMLoc callLoc = paramBindings.getExprLoc();
   SharedState &shared = paramBindings.shared;
@@ -412,12 +410,12 @@ OverloadFitness OverloadFitness::evaluateImpl(
     return std::move(*stagedDiag);
 
   // Check that the signature can be rebound with this set of bindings.
-  OperandsNeedingOriginsList operandsNeedingOrigins;
+  OperandsNeedingReEmissionList operandsNeedingReEmission;
   CallParamInf inference(
       paramBindings, signature.getInputParamTypes(),
       signature.getParamListAttrs(), allowImplicitConversions, funcIfDirect,
       /*discardError=*/false, signature, operands, pogAssignment,
-      operandsNeedingOrigins, additionalAssumptions);
+      operandsNeedingReEmission, additionalAssumptions);
   VerifiedParamBindings verifiedBindings = inference.inferForCall();
   if (!verifiedBindings) {
     // Failed inference must have emitted a diagnostic.
@@ -434,7 +432,7 @@ OverloadFitness OverloadFitness::evaluateImpl(
 
   // This is the result we will return if we succeed.
   OverloadFitness result(std::move(verifiedBindings),
-                         std::move(operandsNeedingOrigins));
+                         std::move(operandsNeedingReEmission));
   result.unprovableConstraints = std::move(inference.bodyUnprovableConstraints);
 
   // Get the overload ranking metrics.

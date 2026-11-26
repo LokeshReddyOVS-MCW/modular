@@ -399,15 +399,6 @@ struct NullExpertLoad(ExpertLoadSink):
     ):
         pass
 
-    @staticmethod
-    def get_type_name() -> String:
-        """Returns the type name for runtime diagnostics.
-
-        Returns:
-            Always `"NullExpertLoad"`.
-        """
-        return "NullExpertLoad"
-
 
 struct ExpertLoadTally(ExpertLoadSink):
     """Running per-layer, per-local-expert token totals in device memory.
@@ -452,9 +443,7 @@ struct ExpertLoadTally(ExpertLoadSink):
             count: Tokens routed to the expert in this step.
         """
         var row = Int(self.layer_idx.unsafe_load())
-        _ = Atomic[UInt64, scope=DEVICE_SCOPE].fetch_add[
-            ordering=Ordering.RELAXED
-        ](
+        _ = Atomic[UInt64, scope=DEVICE_SCOPE].fetch_add[ordering=.relaxed](
             self.counts.unsafe_offset(row * n_local_experts + local_expert),
             UInt64(count),
         )
@@ -463,15 +452,6 @@ struct ExpertLoadTally(ExpertLoadSink):
         self, mut encoder: Some[DeviceTypeEncoder], target: MutOpaquePointer[_]
     ):
         encoder.encode_fields[Self](self, target)
-
-    @staticmethod
-    def get_type_name() -> String:
-        """Returns the type name for runtime diagnostics.
-
-        Returns:
-            Always `"ExpertLoadTally"`.
-        """
-        return "ExpertLoadTally"
 
 
 @inline(.always)
@@ -515,7 +495,7 @@ def _acquire_wait[
     else:
         while observed != sentinel:
             observed = ptr.unsafe_load[volatile=True]()
-    fence[ordering=Ordering.ACQUIRE, scope=scope]()
+    fence[ordering=.acquire, scope=scope]()
     return observed
 
 
@@ -545,7 +525,7 @@ def _publish_peer_stores[scope: StaticString = ""]() -> None:
         # no dirty lines for a `buffer_wbl2` to write back.
         s_waitcnt[vmcnt=0]()
     else:
-        fence[ordering=Ordering.RELEASE, scope=scope]()
+        fence[ordering=.release, scope=scope]()
 
 
 @inline(.always)
@@ -824,11 +804,11 @@ def block_prefix_sum[
         n_warps <= WARP_SIZE
     ), "Number of warps must be less than or equal to warp size"
 
-    var warp_prefix_sum = unsafe_stack_allocation[
-        n_warps,
-        Scalar[dtype],
-        address_space=.SHARED,
-    ]()
+    @__address_space(.SHARED)
+    var warp_prefix_sum_storage = Array[Scalar[dtype], n_warps](
+        uninitialized=True
+    )
+    var warp_prefix_sum = warp_prefix_sum_storage.unsafe_ptr()
 
     var val = Scalar[dtype](0)
     if ltid < num_elements:
@@ -980,7 +960,7 @@ def ep_signal_completion[
     With `ep_ord_r` (ORD-R) the routine implements rank-level completion
     instead, which a fused consumer needs when it acquires ONCE per source
     rank rather than per expert: the per-expert count word becomes a plain
-    progress store issued before an `ACQUIRE_RELEASE` election, and the
+    progress store issued before an `acquire_release` election, and the
     elected last producer release-stores a dedicated rank-completion flag.
 
     That election ordering is load-bearing correctness, not an optimization.
@@ -1076,11 +1056,11 @@ def ep_signal_completion[
             else:
                 # TODO(KERN-2792): AMD needs store-release even for words
                 # nothing spins on; mirror the legacy branch until resolved.
-                Atomic[scope=scope].store[ordering=Ordering.RELEASE](
+                Atomic[scope=scope].store[ordering=.release](
                     dst_p2p_ptr, signal
                 )
             var old_count = _counter_atomic.fetch_add[
-                ordering=Ordering.ACQUIRE_RELEASE
+                ordering=.acquire_release
             ](rank_completion_counter.unsafe_offset(Int(dst_p2p_rank)), 1)
             # The last expert for this destination rank is elected to publish
             # the rank-level arrival. `rank_completion_counter` is
@@ -1094,7 +1074,7 @@ def ep_signal_completion[
                 # never satisfy the next generation's wait. By the induction
                 # in the docstring this single release carries every
                 # producer's payload and count stores.
-                Atomic[scope=scope].store[ordering=Ordering.RELEASE](
+                Atomic[scope=scope].store[ordering=.release](
                     recv_count_ptrs[dst_p2p_rank].unsafe_offset(
                         rank_flag_offset
                     ),
@@ -1111,17 +1091,15 @@ def ep_signal_completion[
             # The same release store the `release_every` branches below issue
             # for this publication, without the `rank_completion_counter`
             # increment, comparison and reset, which nothing reads.
-            Atomic[scope=scope].store[ordering=Ordering.RELEASE](
-                dst_p2p_ptr, signal
-            )
+            Atomic[scope=scope].store[ordering=.release](dst_p2p_ptr, signal)
             return -1
 
         # Acquire-release, as in the ORD-R branch, so the last producer
         # happens-after every other one and its system-scope release below
         # carries every expert's payload, not only its own.
-        var old_count = _counter_atomic.fetch_add[
-            ordering=Ordering.ACQUIRE_RELEASE
-        ](rank_completion_counter.unsafe_offset(Int(dst_p2p_rank)), 1)
+        var old_count = _counter_atomic.fetch_add[ordering=.acquire_release](
+            rank_completion_counter.unsafe_offset(Int(dst_p2p_rank)), 1
+        )
 
         # If this is the last expert for this destination rank,
         # use a release store to flush all pending stores.
@@ -1136,15 +1114,13 @@ def ep_signal_completion[
                 # TODO(KERN-2792): Investigate why AMD GPUs require this to be
                 # store-release instead of a normal store as done above. Without
                 # store-release, the kernel can hang spinning on stale data.
-                Atomic[scope=scope].store[ordering=Ordering.RELEASE](
+                Atomic[scope=scope].store[ordering=.release](
                     dst_p2p_ptr, signal
                 )
         else:
             # The waiting kernels acquire every expert's word before reading
             # any payload, so this one release covers the whole rank.
-            Atomic[scope=scope].store[ordering=Ordering.RELEASE](
-                dst_p2p_ptr, signal
-            )
+            Atomic[scope=scope].store[ordering=.release](dst_p2p_ptr, signal)
             # Reset counter for next kernel invocation.
             rank_completion_counter[dst_p2p_rank] = 0
     else:
@@ -1211,6 +1187,25 @@ trait TokenFormat(Deinitable, DevicePassable):
     # Whether `copy_token_to_send_buf_warp` writes this format's message, so
     # the warp-per-token dispatch may take it.
     comptime one_warp_copy: Bool
+
+    # Whether `copy_token_to_output_rows` writes this format's rows, so the
+    # all-reduce mode's local dispatch (`shmem.ep_local`) may take it.
+    comptime local_rows: Bool = False
+
+    # Rows that `pad_expert_offsets` rounds each expert group up to, which the
+    # local dispatch rounds its groups up to as well.
+    comptime expert_m_padding: Int = 1
+
+    # Rows per block of a scale layout that starts each expert group on a new
+    # block (the NVFP4 grouped matmul's 128), or 0 when the format has no such
+    # layout. The local dispatch then gives each row its place in the blocks,
+    # writes the per-group block offsets and zeros each group's last-block
+    # tail, as the protocol dispatch does.
+    comptime scale_block_rows: Int = 0
+
+    # Scale atoms (`SF_ATOM_K` scales of 128 rows) in a row of that layout;
+    # the local dispatch zeros a group's tail one atom a warp.
+    comptime scale_atoms: Int = 0
 
     @inline(.always)
     @staticmethod
@@ -1298,6 +1293,64 @@ trait TokenFormat(Deinitable, DevicePassable):
             "this token format has no one-warp copy, so it cannot take the"
             " warp-per-token dispatch"
         )
+
+    @always_inline
+    def copy_token_to_output_rows[
+        src_type: DType,
+        width: Int,
+        per_thread: Int,
+        n_rows: Int,
+        //,
+        block_size: Int,
+    ](
+        self,
+        token: Array[SIMD[src_type, width], per_thread],
+        rows: Array[Int, n_rows],
+        scale_rows: Array[Int, n_rows],
+        input_scale: Float32,
+    ) -> None:
+        """Writes one token straight to its output rows.
+
+        The rows get the bytes and scales that copying the token's message
+        to them would give. The all-reduce mode's local dispatch calls it
+        only when `local_rows`, from every thread of a CTA at once: thread
+        `t` holds the token's vectors `t + v * block_size`, and those past
+        the token's end are skipped.
+
+        Parameters:
+            src_type: The type of the token's elements (inferred).
+            width: The elements of each vector (inferred).
+            per_thread: The vectors each thread holds (inferred).
+            n_rows: The entries of `rows` (inferred).
+            block_size: The threads of the CTA.
+
+        Args:
+            token: This thread's vectors of the token.
+            rows: The output rows to write; negative entries are skipped.
+            scale_rows: Each row's place in the blocked scale layout, read
+                only when `scale_block_rows > 0`.
+            input_scale: The input scale, as the protocol dispatch passes
+                `copy_token_to_send_buf`.
+        """
+        comptime assert src_type != src_type, (
+            "this token format has no local rows, so it cannot take the"
+            " all-reduce mode's local dispatch"
+        )
+
+    @always_inline
+    def zero_scale_atom(self, begin: Int, end: Int, atom: Int) -> None:
+        """Zeros scale atom `atom` of the blocked-layout rows `[begin, end)`,
+        which lie in one block.
+
+        The local dispatch calls it from every lane of a warp at once, for
+        each group's last-block tail, only when `scale_block_rows > 0`.
+
+        Args:
+            begin: The first row to zero.
+            end: One past the last row to zero.
+            atom: The atom of the rows to zero, below `scale_atoms`.
+        """
+        pass
 
     @always_inline
     @staticmethod
@@ -1431,6 +1484,7 @@ struct BF16TokenFormat[
     comptime dispatch_wait_tile_shape = (128, 1)
     comptime dispatch_smem_size = 0
     comptime one_warp_copy = False
+    comptime local_rows = True
 
     comptime TensorType = TileTensor[
         .bfloat16, Self.output_layout, MutUntrackedOrigin
@@ -1505,6 +1559,33 @@ struct BF16TokenFormat[
             thread_idx.x - thread_base,
         )
 
+    @always_inline
+    def copy_token_to_output_rows[
+        src_type: DType,
+        width: Int,
+        per_thread: Int,
+        n_rows: Int,
+        //,
+        block_size: Int,
+    ](
+        self,
+        token: Array[SIMD[src_type, width], per_thread],
+        rows: Array[Int, n_rows],
+        scale_rows: Array[Int, n_rows],
+        input_scale: Float32,
+    ) -> None:
+        comptime assert src_type == .bfloat16, "the rows hold the token as is"
+        comptime n_vecs = Self.hid_dim // width
+        comptime for k in range(n_rows):
+            if rows[k] >= 0:
+                comptime for v in range(per_thread):
+                    var i = thread_idx.x + v * block_size
+                    if i < n_vecs:
+                        self.output_tokens.store(
+                            (rows[k], i * width),
+                            rebind[SIMD[DType.bfloat16, width]](token[v]),
+                        )
+
     @inline(.always)
     def copy_msg_to_output_tensor[
         buf_addr_space: AddressSpace = .GENERIC,
@@ -1533,6 +1614,10 @@ struct BF16TokenFormat[
                     )
                 ),
             )
+
+
+comptime EP_BLOCKWISE_FP8_GROUP = 128
+"""Elements sharing one scale in `BlockwiseFP8TokenFormat`."""
 
 
 struct BlockwiseFP8TokenFormat[
@@ -1571,6 +1656,7 @@ struct BlockwiseFP8TokenFormat[
     comptime dispatch_wait_tile_shape = (128, 1)
     comptime dispatch_smem_size = 0
     comptime one_warp_copy = False
+    comptime local_rows = True
 
     comptime TensorType = TileTensor[
         Self.fp8_dtype, Self.output_layout, MutUntrackedOrigin
@@ -1581,7 +1667,7 @@ struct BlockwiseFP8TokenFormat[
     var output_tokens: Self.TensorType
     var output_scales: Self.ScalesTensorType
 
-    comptime group_size = 128
+    comptime group_size = EP_BLOCKWISE_FP8_GROUP
 
     comptime device_type: AnyType = Self
 
@@ -1690,6 +1776,31 @@ struct BlockwiseFP8TokenFormat[
         if tid < n_groups:
             row_offsets[tid + 1] = aligned_exp_end
 
+    @always_inline
+    @staticmethod
+    def _quantize_vec[
+        src_type: DType, width: Int, //, group_lanes: Int
+    ](vec: SIMD[src_type, width]) -> Tuple[
+        SIMD[Self.fp8_dtype, width], Scalar[Self.scales_dtype]
+    ]:
+        """Returns one vector of a token in FP8, and its group's scale.
+
+        The `group_lanes` adjacent lanes that hold a group's vectors call it
+        together: the scale is their shared maximum.
+        """
+        comptime fp8_max_t = Scalar[Self.fp8_dtype].MAX_FINITE.cast[
+            Self.scales_dtype
+        ]()
+        var loaded_vec = vec.cast[Self.scales_dtype]()
+        var thread_max = abs(loaded_vec).reduce_max()
+        var group_max = warp.lane_group_max[group_lanes](thread_max)
+
+        # 1e-4 is taken from DeepEP.
+        var scale_factor = max(group_max, 1e-4) / fp8_max_t
+        var output_vec = loaded_vec / scale_factor
+        output_vec = output_vec.clamp(-fp8_max_t, fp8_max_t)
+        return (output_vec.cast[Self.fp8_dtype](), scale_factor)
+
     @inline(.always)
     @staticmethod
     def copy_token_to_send_buf[
@@ -1705,11 +1816,6 @@ struct BlockwiseFP8TokenFormat[
         comptime src_width = simd_width_of[src_type]()
         comptime byte_width = src_width * size_of[Self.fp8_dtype]()
 
-        comptime fp8_max = Scalar[Self.fp8_dtype].MAX_FINITE
-        comptime fp8_max_t = Scalar[Self.fp8_dtype].MAX_FINITE.cast[
-            Self.scales_dtype
-        ]()
-
         comptime n_threads_per_group = Self.group_size // src_width
         comptime assert (
             WARP_SIZE % n_threads_per_group == 0
@@ -1718,20 +1824,14 @@ struct BlockwiseFP8TokenFormat[
         for i in range(
             thread_idx.x - thread_base, Self.hid_dim // src_width, block_size
         ):
-            var loaded_vec = src_p.unsafe_load[
-                width=src_width, alignment=Self.alignment, invariant=True
-            ](i * src_width).cast[Self.scales_dtype]()
-            var thread_max = abs(loaded_vec).reduce_max()
-            var group_max = warp.lane_group_max[n_threads_per_group](thread_max)
-
-            # 1e-4 is taken from DeepEP.
-            var scale_factor = max(group_max, 1e-4) / fp8_max_t
-            var output_vec = loaded_vec / scale_factor
-            output_vec = output_vec.clamp(-fp8_max_t, fp8_max_t)
+            var quant, scale_factor = Self._quantize_vec[n_threads_per_group](
+                src_p.unsafe_load[
+                    width=src_width, alignment=Self.alignment, invariant=True
+                ](i * src_width)
+            )
 
             buf_p.unsafe_store[alignment=byte_width](
-                i * byte_width,
-                bitcast[.uint8, byte_width](output_vec.cast[Self.fp8_dtype]()),
+                i * byte_width, bitcast[.uint8, byte_width](quant)
             )
 
             # The first thread in each group stores the scale factor.
@@ -1742,6 +1842,58 @@ struct BlockwiseFP8TokenFormat[
                     Self.scales_offset() + scale_idx * scale_bytes,
                     bitcast[.uint8, scale_bytes](scale_factor),
                 )
+
+    @always_inline
+    def copy_token_to_output_rows[
+        src_type: DType,
+        width: Int,
+        per_thread: Int,
+        n_rows: Int,
+        //,
+        block_size: Int,
+    ](
+        self,
+        token: Array[SIMD[src_type, width], per_thread],
+        rows: Array[Int, n_rows],
+        scale_rows: Array[Int, n_rows],
+        input_scale: Float32,
+    ) -> None:
+        comptime n_vecs = Self.hid_dim // width
+        comptime group_lanes = Self.group_size // width
+        comptime assert (
+            WARP_SIZE % group_lanes == 0
+        ), "Each warp must process a multiple of quantization groups"
+        comptime assert (
+            n_vecs % WARP_SIZE == 0 and block_size % WARP_SIZE == 0
+        ), (
+            "each warp must quantize whole groups at once, for the scale's"
+            " lane reduction"
+        )
+        # Every vector is quantized before any is stored, so the store loop
+        # keeps one row's addresses live at a time.
+        var quants = Array[SIMD[Self.fp8_dtype, width], per_thread](fill=0)
+        var scales = Array[Scalar[Self.scales_dtype], per_thread](fill=0)
+        comptime for v in range(per_thread):
+            if thread_idx.x + v * block_size < n_vecs:
+                var quant, scale_factor = Self._quantize_vec[group_lanes](
+                    token[v]
+                )
+                quants[v] = quant
+                scales[v] = scale_factor
+        var stores_scale = lane_id() % group_lanes == 0
+        comptime for k in range(n_rows):
+            if rows[k] >= 0:
+                comptime for v in range(per_thread):
+                    var i = thread_idx.x + v * block_size
+                    if i < n_vecs:
+                        self.output_tokens.store(
+                            (rows[k], i * width), quants[v]
+                        )
+                        if stores_scale:
+                            self.output_scales.store(
+                                (i * width // Self.group_size, rows[k]),
+                                scales[v],
+                            )
 
     @inline(.always)
     def copy_msg_to_output_tensor[
@@ -1949,6 +2101,20 @@ struct NVBlockScaledTokenFormat[
         and not Self.ep_copy_role_split
         and not Self.ep_prequantized
     )
+    # NVFP4 with the kernel-wide input scale, the variant the all-reduce mode
+    # dispatches; the protocol dispatch keeps the others. The local writer
+    # needs each NVIDIA warp's 16-byte BF16 vectors to cover whole rows
+    # (256 elements a warp); other widths fall back to the protocol.
+    comptime local_rows = (
+        Self.is_nvfp4
+        and not Self.nvfp4_dyn_global_scales
+        and not Self.ep_prequantized
+        and Self.sf_arena_rows == 0
+        and Self._hid_dim % 256 == 0
+    )
+    comptime scale_block_rows = SF_MN_GROUP_SIZE if Self.local_rows else 0
+    comptime _sf_atoms_per_row = Self._hid_dim // Self.group_size // SF_ATOM_K
+    comptime scale_atoms = Self._sf_atoms_per_row if Self.local_rows else 0
 
     comptime ScalesTMATensorTileType = TMATensorTile[
         Self.scales_dtype,
@@ -1963,6 +2129,9 @@ struct NVBlockScaledTokenFormat[
     var output_tokens: Self.TensorType
     var output_scales_offset: Self.ScalesOffsetTensorType
     var output_rowwise_scales: Self.RowwiseScalesTensorType
+    # The scale tiles the TMA descriptor addresses, which the local dispatch
+    # writes with plain stores.
+    var output_scales_ptr: MutPointer[UInt8, MutUntrackedOrigin]
 
     comptime device_type: AnyType = Self
 
@@ -2035,6 +2204,9 @@ struct NVBlockScaledTokenFormat[
             ),
             output_scales_offset.layout,
         }
+        self.output_scales_ptr = MutPointer[UInt8, MutUntrackedOrigin](
+            unsafe_from_address=Int(output_scales.unsafe_ptr())
+        )
         comptime if Self.nvfp4_dyn_global_scales:
             match output_rowwise_scales:
                 case .Some(rowwise_scales):
@@ -2469,33 +2641,9 @@ struct NVBlockScaledTokenFormat[
         var loaded_vec = src_p.unsafe_load[
             width=src_width, alignment=Self.alignment, invariant=True
         ](i * src_width)
-
-        # each thread finds maximum value in its local 8 elements
-        var thread_max = abs(loaded_vec).reduce_max().cast[DType.float32]()
-        # find the maximum value among all 16 elements
-        var group_max = warp.lane_group_max[num_lanes=NUM_THREADS_PER_SF](
-            thread_max
-        )
-
-        var scale_factor: Float32
-        comptime if Self.is_mxfp8:
-            scale_factor = group_max * recip(Float32(448.0))
-        elif Self.is_nvfp4:
-            scale_factor = input_scale * (group_max * recip(Float32(6.0)))
-        else:
-            scale_factor = group_max * recip(Float32(6.0))
-
-        # NOTE: NVFP4 uses FP8-UE4M3 format for the scale factor but we know that scale_factor is always positive, so we can use E4M3 instead of UE4M3.
-        var fp8_scale_factor = scale_factor.cast[Self.scales_dtype]()
-
-        var output_scale = Float32(0.0)
-        if group_max != 0:
-            comptime if Self.is_nvfp4:
-                output_scale = recip(
-                    fp8_scale_factor.cast[DType.float32]() * recip(input_scale)
-                )
-            else:
-                output_scale = recip(fp8_scale_factor.cast[DType.float32]())
+        var fp8_scale_factor, output_scale = Self._block_scale[
+            NUM_THREADS_PER_SF
+        ](loaded_vec, input_scale)
 
         # write back the scale factor
         comptime scale_bytes = size_of[Self.scales_dtype]()
@@ -2531,6 +2679,182 @@ struct NVBlockScaledTokenFormat[
                 i * byte_width,
                 bitcast[DType.uint8, byte_width](output_vector),
             )
+
+    @always_inline
+    @staticmethod
+    def _block_scale[
+        src_type: DType, width: Int, //, group_lanes: Int
+    ](vec: SIMD[src_type, width], input_scale: Float32) -> Tuple[
+        Scalar[Self.scales_dtype], Float32
+    ]:
+        """Returns one scale group's scale and the factor that quantizes it.
+
+        The `group_lanes` adjacent lanes that hold a group's vectors call it
+        together: the scale comes from their shared maximum.
+        """
+        # each thread finds maximum value in its local 8 elements
+        var thread_max = abs(vec).reduce_max().cast[DType.float32]()
+        # find the maximum value among all 16 elements
+        var group_max = warp.lane_group_max[num_lanes=group_lanes](thread_max)
+
+        var scale_factor: Float32
+        comptime if Self.is_mxfp8:
+            scale_factor = group_max * recip(Float32(448.0))
+        elif Self.is_nvfp4:
+            scale_factor = input_scale * (group_max * recip(Float32(6.0)))
+        else:
+            scale_factor = group_max * recip(Float32(6.0))
+
+        # NOTE: NVFP4 uses FP8-UE4M3 format for the scale factor but we know that scale_factor is always positive, so we can use E4M3 instead of UE4M3.
+        var fp8_scale_factor = scale_factor.cast[Self.scales_dtype]()
+
+        var output_scale = Float32(0.0)
+        if group_max != 0:
+            comptime if Self.is_nvfp4:
+                output_scale = recip(
+                    fp8_scale_factor.cast[DType.float32]() * recip(input_scale)
+                )
+            else:
+                output_scale = recip(fp8_scale_factor.cast[DType.float32]())
+        return (fp8_scale_factor, output_scale)
+
+    @always_inline
+    @staticmethod
+    def _sf_atom_offset(scale_row: Int, atom: Int) -> Int:
+        """Returns the byte offset of a row's `atom`-th scale atom in the
+        grouped matmul's 5D scale layout, which the scales TMA box writes."""
+        var block, u = divmod(scale_row, SF_MN_GROUP_SIZE)
+        var u_hi, u_lo = divmod(u, SF_ATOM_M[0])
+        return (
+            (block * Self._sf_atoms_per_row + atom) * SF_ATOM_ELEMS_LOCAL
+            + u_lo * SF_ROW_STRIDE_LOCAL
+            + u_hi * SF_ATOM_K
+        )
+
+    @always_inline
+    def copy_token_to_output_rows[
+        src_type: DType,
+        width: Int,
+        per_thread: Int,
+        n_rows: Int,
+        //,
+        block_size: Int,
+    ](
+        self,
+        token: Array[SIMD[src_type, width], per_thread],
+        rows: Array[Int, n_rows],
+        scale_rows: Array[Int, n_rows],
+        input_scale: Float32,
+    ) -> None:
+        Self.write_local_rows[block_size](
+            self.output_tokens._storage.unsafe_bitcast[UInt8](),
+            self.output_scales_ptr,
+            token,
+            rows,
+            scale_rows,
+            input_scale,
+        )
+
+    @always_inline
+    @staticmethod
+    def write_local_rows[
+        src_type: DType,
+        width: Int,
+        per_thread: Int,
+        n_rows: Int,
+        //,
+        block_size: Int,
+    ](
+        tokens_base: MutPointer[UInt8, _],
+        scales_base: MutPointer[UInt8, _],
+        token: Array[SIMD[src_type, width], per_thread],
+        rows: Array[Int, n_rows],
+        scale_rows: Array[Int, n_rows],
+        input_scale: Float32,
+    ) -> None:
+        """`copy_token_to_output_rows` on the rows at `tokens_base` and the
+        5D scale tiles at `scales_base`, for callers that hold no format."""
+        comptime assert Self.local_rows, "this variant writes no local rows"
+        comptime assert size_of[Self.scales_dtype]() == 1
+        comptime n_vecs = Self.hid_dim // width
+        comptime group_lanes = Self.group_size // width
+        comptime atom_lanes = group_lanes * SF_ATOM_K
+        comptime byte_width = width // 2
+        comptime assert (
+            Self.group_size % width == 0 and WARP_SIZE % atom_lanes == 0
+        ), "a warp must hold whole scale atoms"
+        comptime assert (
+            n_vecs % WARP_SIZE == 0 and block_size % WARP_SIZE == 0
+        ), "each warp must quantize whole groups at once"
+        # Every vector is quantized before any is stored, so the store loop
+        # keeps one row's addresses live at a time. The first lane of each
+        # atom gathers its four scales into one word.
+        var quants = Array[SIMD[DType.uint8, byte_width], per_thread](fill=0)
+        var atoms = Array[UInt32, per_thread](fill=0)
+        comptime for v in range(per_thread):
+            if thread_idx.x + v * block_size < n_vecs:
+                var scale, factor = Self._block_scale[group_lanes](
+                    token[v], input_scale
+                )
+                var scaled = token[v].cast[DType.float32]() * factor
+                quants[v] = bitcast[DType.uint8, byte_width](
+                    cast_fp32_to_fp4e2m1(scaled)
+                )
+                var byte = UInt32(bitcast[DType.uint8, 1](scale))
+                var word = byte
+                comptime for j in range(1, SF_ATOM_K):
+                    word |= warp.shuffle_down(
+                        byte, UInt32(j * group_lanes)
+                    ) << UInt32(8 * j)
+                atoms[v] = word
+        var stores_atom = lane_id() % atom_lanes == 0
+        comptime for k in range(n_rows):
+            if rows[k] >= 0:
+                comptime for v in range(per_thread):
+                    var i = thread_idx.x + v * block_size
+                    if i < n_vecs:
+                        tokens_base.unsafe_store[alignment=byte_width](
+                            rows[k] * Self.quant_size() + i * byte_width,
+                            quants[v],
+                        )
+                        if stores_atom:
+                            scales_base.unsafe_store[alignment=4](
+                                Self._sf_atom_offset(
+                                    scale_rows[k], i // atom_lanes
+                                ),
+                                bitcast[DType.uint8, 4](atoms[v]),
+                            )
+
+    @always_inline
+    def zero_scale_atom(self, begin: Int, end: Int, atom: Int) -> None:
+        Self.zero_scale_atom_at(self.output_scales_ptr, begin, end, atom)
+
+    @always_inline
+    @staticmethod
+    def zero_scale_atom_at(
+        scales_base: MutPointer[UInt8, _],
+        begin: Int,
+        end: Int,
+        atom: Int,
+    ) -> None:
+        """`zero_scale_atom` on the 5D scale tiles at `scales_base`."""
+        comptime assert SF_ATOM_M[0] == WARP_SIZE, "one lane a 16-byte chunk"
+        # Lane `l`'s 16-byte chunk holds rows `l + 32 q` (q < 4) of the atom;
+        # it is stored whole when all four rows are in range.
+        var lo = begin - begin % SF_MN_GROUP_SIZE + lane_id()
+        var base = Self._sf_atom_offset(lo, atom)
+        var hi = lo + (SF_ATOM_M[1] - 1) * SF_ATOM_M[0]
+        if lo >= begin and hi < end:
+            scales_base.unsafe_store[alignment=16](
+                base, SIMD[DType.uint8, 16](0)
+            )
+        else:
+            comptime for q in range(SF_ATOM_M[1]):
+                var r = lo + q * SF_ATOM_M[0]
+                if r >= begin and r < end:
+                    scales_base.unsafe_store[alignment=4](
+                        base + q * SF_ATOM_K, SIMD[DType.uint8, 4](0)
+                    )
 
     @inline(.always)
     def copy_msg_to_output_tensor[
@@ -3886,9 +4210,9 @@ struct EPDispatchKernel[
         Returns:
             The calling warp's expert's row count.
         """
-        var hist = unsafe_stack_allocation[
-            Self.n_warps, Int32, address_space=.SHARED
-        ]()
+        @__address_space(.SHARED)
+        var hist_storage = Array[Int32, Self.n_warps](uninitialized=True)
+        var hist = hist_storage.unsafe_ptr()
         if thread_idx.x < Self.n_warps:
             hist[thread_idx.x] = 0
         barrier()
@@ -3897,7 +4221,7 @@ struct EPDispatchKernel[
             var own = rebind[Int32](topk_ids_flat[i]) - first_expert
             if own >= 0 and own < Int32(Self.n_warps):
                 _ = Atomic[Int32, scope=BLOCK_SCOPE].fetch_add[
-                    ordering=Ordering.RELAXED
+                    ordering=.relaxed
                 ](hist.unsafe_offset(Int(own)), 1)
         barrier()
         return hist[warp_id()]
@@ -4181,7 +4505,7 @@ struct EPDispatchKernel[
             _publish_peer_stores()
             if lane_id() == 0:
                 for i in range(n_pend):
-                    _ = _counter_atomic.fetch_add[ordering=Ordering.RELAXED](
+                    _ = _counter_atomic.fetch_add[ordering=.relaxed](
                         expert_finished_counter.unsafe_offset(pend[i]), 1
                     )
                 comptime if TraceT.enabled:
@@ -4318,9 +4642,7 @@ struct EPDispatchKernel[
                             )
                     var slot_idx: Int32 = 0
                     if lane_id() == 0:
-                        slot_idx = _counter_atomic.fetch_add[
-                            ordering=Ordering.RELAXED
-                        ](
+                        slot_idx = _counter_atomic.fetch_add[ordering=.relaxed](
                             expert_reserved_counter.unsafe_offset(
                                 counter_offset
                             ),
@@ -4489,7 +4811,7 @@ struct EPDispatchKernel[
                         and my_p2p_world != dst_p2p_world
                     ):
                         var slot_idx = _counter_atomic.fetch_add[
-                            ordering=Ordering.RELAXED
+                            ordering=.relaxed
                         ](
                             expert_reserved_counter.unsafe_offset(
                                 counter_offset
@@ -4515,9 +4837,7 @@ struct EPDispatchKernel[
                             dst_rank,
                         )
 
-                        _ = _counter_atomic.fetch_add[
-                            ordering=Ordering.RELEASE
-                        ](
+                        _ = _counter_atomic.fetch_add[ordering=.release](
                             expert_finished_counter.unsafe_offset(
                                 counter_offset
                             ),
@@ -4672,7 +4992,7 @@ struct EPDispatchKernel[
             var slot = Int32(0)
             if lane < Self.top_k:
                 target_expert = rebind[Int32](topk_ids[token_idx, lane])
-                slot = _counter_atomic.fetch_add[ordering=Ordering.RELAXED](
+                slot = _counter_atomic.fetch_add[ordering=.relaxed](
                     expert_reserved_counter.unsafe_offset(
                         counter_of(target_expert)
                     ),
@@ -4798,7 +5118,7 @@ struct EPDispatchKernel[
             syncwarp()
             _publish_peer_stores()
             if lane < Self.top_k:
-                _ = _counter_atomic.fetch_add[ordering=Ordering.RELAXED](
+                _ = _counter_atomic.fetch_add[ordering=.relaxed](
                     expert_finished_counter.unsafe_offset(
                         counter_of(target_expert)
                     ),
@@ -4852,9 +5172,9 @@ struct EPDispatchKernel[
             n_scoped_threads=n_comm_threads,
             barrier_id=comm_barrier_id,
         ](Int32(1) if my_tiles > 0 else Int32(0))
-        var smem_sched_totals = unsafe_stack_allocation[
-            2, Int32, address_space=.SHARED
-        ]()
+        @__address_space(.SHARED)
+        var smem_sched_totals_storage = Array[Int32, 2](uninitialized=True)
+        var smem_sched_totals = smem_sched_totals_storage.unsafe_ptr()
         if tid == Self.n_local_experts - 1:
             smem_sched_totals[0] = tiles_upto
             smem_sched_totals[1] = active_upto
@@ -4941,12 +5261,20 @@ struct EPDispatchKernel[
         comptime sms_per_tile = Self.token_fmt_type.dispatch_wait_tile_shape[1]
         var tid = thread_idx.x - comm_thread_base
 
-        var prefix_sum_arr = unsafe_stack_allocation[
-            Self.n_experts, DType.uint32, address_space=.SHARED
-        ]()
-        var smem_expert_tiles = unsafe_stack_allocation[
-            Self.n_local_experts, Int32, address_space=.SHARED
-        ]()
+        @__address_space(.SHARED)
+        var prefix_sum_arr_storage = Array[UInt32, Self.n_experts](
+            uninitialized=True
+        )
+        var prefix_sum_arr = prefix_sum_arr_storage.unsafe_ptr()
+        @__address_space(.SHARED)
+        var smem_expert_tiles_storage = Array[Int32, Self.n_local_experts](
+            uninitialized=True
+        )
+        var smem_expert_tiles = (
+            smem_expert_tiles_storage.unsafe_ptr().unsafe_origin_cast[
+                MutUntrackedOrigin
+            ]()
+        )
 
         if tid < Self.n_local_experts + shared_expert_offset:
             expert_ids[tid] = Int32(tid)
@@ -5051,7 +5379,7 @@ struct EPDispatchKernel[
                 Self.cleanup_counter_offset,
                 Int32(n_active_offset_sms),
             )
-            _counter_atomic.store[ordering=Ordering.RELEASE](
+            _counter_atomic.store[ordering=.release](
                 atomic_counter.unsafe_offset(Self.ready_flag_offset),
                 Int32(EP_DATA_READY_FLAG),
             )
@@ -5228,28 +5556,28 @@ struct EPDispatchKernel[
 
         # Shared memory: rank prefix sums, per-tile token-to-rank map, and
         # the expert start / tile id / chosen-expert broadcast slots.
-        var rank_prefix = unsafe_stack_allocation[
-            Self.n_ranks, Int32, address_space=.SHARED
-        ]()
-        var tok_rank_map = unsafe_stack_allocation[
-            tile_size, Int32, address_space=.SHARED
-        ]()
+        @__address_space(.SHARED)
+        var rank_prefix_storage = Array[Int32, Self.n_ranks](uninitialized=True)
+        var rank_prefix = rank_prefix_storage.unsafe_ptr()
+        @__address_space(.SHARED)
+        var tok_rank_map_storage = Array[Int32, tile_size](uninitialized=True)
+        var tok_rank_map = tok_rank_map_storage.unsafe_ptr()
         # Under `token_recv`, each tile row's source token.
-        var tok_row_map = unsafe_stack_allocation[
-            tile_size if Self.token_recv else 1, Int32, address_space=.SHARED
-        ]()
-        var smem_vals = unsafe_stack_allocation[
-            3, Int32, address_space=.SHARED
-        ]()
+        @__address_space(.SHARED)
+        var tok_row_map_storage = Array[
+            Int32, tile_size if Self.token_recv else 1
+        ](uninitialized=True)
+        var tok_row_map = tok_row_map_storage.unsafe_ptr()
+        @__address_space(.SHARED)
+        var smem_vals_storage = Array[Int32, 3](uninitialized=True)
+        var smem_vals = smem_vals_storage.unsafe_ptr()
 
         @inline(.always)
         def fetch_tile_id(expert: Int) {imm} -> Int32:
             """Fetch the start of the next tile for `expert`. Should be called
             by a single thread.
             """
-            return Atomic[scope=DEVICE_SCOPE].fetch_add[
-                ordering=Ordering.ACQUIRE
-            ](
+            return Atomic[scope=DEVICE_SCOPE].fetch_add[ordering=.acquire](
                 atomic_counter.unsafe_offset(
                     Self.work_counter_offset
                 ).unsafe_offset(expert),
@@ -5475,7 +5803,7 @@ struct EPDispatchKernel[
                     var m_hi = ufloordiv(tile_end - 1, l1_release_token_block)
                     for _m in range(m_lo, m_hi + 1):
                         _ = Atomic[UInt32, scope=DEVICE_SCOPE].fetch_add[
-                            ordering=Ordering.RELEASE
+                            ordering=.release
                         ](
                             l1_arrival.unsafe_offset(
                                 (pool_base + _m) * l1_release_atomic_pad
@@ -5516,9 +5844,7 @@ struct EPDispatchKernel[
 
         # Cleanup: the last SM to finish resets the flag.
         if warp_id() - comm_warp_base == 0 and tid == 0:
-            var count = Atomic[scope=DEVICE_SCOPE].fetch_add[
-                ordering=Ordering.RELAXED
-            ](
+            var count = Atomic[scope=DEVICE_SCOPE].fetch_add[ordering=.relaxed](
                 atomic_counter.unsafe_offset(Self.cleanup_counter_offset),
                 Int32(-1),
             )
@@ -5576,7 +5902,7 @@ struct EPDispatchKernel[
 
             # Signal that this SM has started; the last one resets both counters.
             var started = Atomic[scope=DEVICE_SCOPE].fetch_add[
-                ordering=Ordering.RELAXED
+                ordering=.relaxed
             ](fused_se_counter.unsafe_offset(1), 1)
             if started == Int32(n_sms_for_shared) - 1:
                 fused_se_counter.unsafe_store(Int32(0))
@@ -5962,8 +6288,10 @@ struct EPCombineKernel[
 
     @staticmethod
     @inline(.always)
-    def recv_buf_layout(coord: Coord) -> Int32:
-        return Self._recv_layout[linear_idx_type=.int32](coord)
+    def recv_buf_layout(coord: Coord) -> Int64:
+        """The receive buffer's linear byte offset, 64-bit because the buffer
+        can exceed 2^31 bytes."""
+        return Self._recv_layout[linear_idx_type=.int64](coord)
 
     @staticmethod
     @inline(.always)
@@ -6142,20 +6470,28 @@ struct EPCombineKernel[
                 # `input_tokens`; `vbase` is the pair's first work unit within
                 # its destination rank, so a claimed unit maps back to a pair
                 # by a scan. Every block builds the same table.
-                var smem_start = unsafe_stack_allocation[
-                    Self.n_experts, Int32, address_space=.SHARED
-                ]()
-                var smem_count = unsafe_stack_allocation[
-                    Self.n_experts, Int32, address_space=.SHARED
-                ]()
-                var smem_vbase = unsafe_stack_allocation[
-                    Self.n_experts, Int32, address_space=.SHARED
-                ]()
+                @__address_space(.SHARED)
+                var smem_start_storage = Array[Int32, Self.n_experts](
+                    uninitialized=True
+                )
+                var smem_start = smem_start_storage.unsafe_ptr()
+                @__address_space(.SHARED)
+                var smem_count_storage = Array[Int32, Self.n_experts](
+                    uninitialized=True
+                )
+                var smem_count = smem_count_storage.unsafe_ptr()
+                @__address_space(.SHARED)
+                var smem_vbase_storage = Array[Int32, Self.n_experts](
+                    uninitialized=True
+                )
+                var smem_vbase = smem_vbase_storage.unsafe_ptr()
                 # Unit-space bounds, one per rank plus the grand total, so
                 # rank `r` owns `[smem_rank_base[r], smem_rank_base[r + 1])`.
-                var smem_rank_base = unsafe_stack_allocation[
-                    Self.n_ranks + 1, Int32, address_space=.SHARED
-                ]()
+                @__address_space(.SHARED)
+                var smem_rank_base_storage = Array[Int32, Self.n_ranks + 1](
+                    uninitialized=True
+                )
+                var smem_rank_base = smem_rank_base_storage.unsafe_ptr()
 
                 # Walk pairs in (rank, expert) order so each destination rank
                 # owns a contiguous run of work units.
@@ -6240,7 +6576,7 @@ struct EPCombineKernel[
                             var pr = Int(pend[i])
                             var cn = Int(smem_count[pr])
                             var prev = _counter_atomic.fetch_add[
-                                ordering=Ordering.RELAXED
+                                ordering=.relaxed
                             ](
                                 atomic_counter.unsafe_offset(
                                     Self.pair_done_offset
@@ -6249,7 +6585,7 @@ struct EPCombineKernel[
                             )
                             if Int(prev) + 1 == max(cn, 1):
                                 fence[
-                                    ordering=Ordering.ACQUIRE,
+                                    ordering=.acquire,
                                     scope=DEVICE_SCOPE,
                                 ]()
                                 atomic_counter.unsafe_store(
@@ -6353,15 +6689,15 @@ struct EPCombineKernel[
                 comptime assert (
                     Self.mx_msg or Self.msg_bytes % vec == 0
                 ), "flat send copies whole 16-byte units"
-                var f_start = unsafe_stack_allocation[
-                    FP, Int32, address_space=.SHARED
-                ]()
-                var f_cnt = unsafe_stack_allocation[
-                    FP, Int32, address_space=.SHARED
-                ]()
-                var f_dst = unsafe_stack_allocation[
-                    FP, Int32, address_space=.SHARED
-                ]()
+                @__address_space(.SHARED)
+                var f_start_storage = Array[Int32, FP](uninitialized=True)
+                var f_start = f_start_storage.unsafe_ptr()
+                @__address_space(.SHARED)
+                var f_cnt_storage = Array[Int32, FP](uninitialized=True)
+                var f_cnt = f_cnt_storage.unsafe_ptr()
+                @__address_space(.SHARED)
+                var f_dst_storage = Array[Int32, FP](uninitialized=True)
+                var f_dst = f_dst_storage.unsafe_ptr()
                 for pass_base in range(sm_id, Self.n_experts, n_send_sms * FP):
                     if Int(tid) < FP:
                         var g = pass_base + Int(tid) * n_send_sms
@@ -6517,9 +6853,7 @@ struct EPCombineKernel[
                                 )
                             var spins = 0
                             while (
-                                Atomic[UInt32].load[ordering=Ordering.ACQUIRE](
-                                    done
-                                )
+                                Atomic[UInt32].load[ordering=.acquire](done)
                                 < target
                             ):
                                 spins += 1
@@ -6695,12 +7029,12 @@ struct EPCombineKernel[
         # `n_send_sms` while other blocks are still reading region A, which
         # wipes the counts they need. Reaching `n_send_sms` here proves every
         # block is past its reads, so this cannot race and needs no spin.
-        var smem_done = unsafe_stack_allocation[
-            1, Int32, address_space=.SHARED
-        ]()
+        @__address_space(.SHARED)
+        var smem_done_storage = Array[Int32, 1](uninitialized=True)
+        var smem_done = smem_done_storage.unsafe_ptr()
         _scoped_barrier[Self.num_threads, comm_barrier_id]()
         if tid == 0:
-            var prev_b = _counter_atomic.fetch_add[ordering=Ordering.RELAXED](
+            var prev_b = _counter_atomic.fetch_add[ordering=.relaxed](
                 atomic_counter.unsafe_offset(Self.blocks_done_offset), 1
             )
             smem_done[0] = Int32(1) if Int(prev_b) + 1 == n_send_sms else Int32(
@@ -6759,7 +7093,7 @@ struct EPCombineKernel[
         # Once all the tokens have been received, set flags for other SMs to
         # copy the tokens to the output tensor. Seed only the active reduce SMs.
         if thread_idx.x < n_active_reduce_sms:
-            _counter_atomic.store[ordering=Ordering.RELEASE](
+            _counter_atomic.store[ordering=.release](
                 atomic_counter.unsafe_offset(Self.n_wait_sms).unsafe_offset(
                     thread_idx.x
                 ),
@@ -7189,6 +7523,33 @@ def combine_wait_kernel[
 # ===-----------------------------------------------------------------------===#
 
 
+@always_inline
+def ep_shared_expert_rows[
+    world_size: Int
+](n_tokens: UInt32, rank: UInt32) -> Tuple[UInt32, UInt32]:
+    """Returns a device's share of the shared expert's rows in all-reduce mode.
+
+    The all-reduce mode splits a step's tokens among its devices in
+    contiguous ranges, and each device runs the shared expert on its own
+    range. The first `n_tokens % world_size` ranges hold one token more than
+    the others.
+
+    Parameters:
+        world_size: Devices of the all-reduce.
+
+    Args:
+        n_tokens: Tokens in the step.
+        rank: The device's rank in the all-reduce.
+
+    Returns:
+        The `(begin, count)` of the device's tokens.
+    """
+    comptime world = UInt32(world_size)
+    var count = (n_tokens + world - rank - 1) // world
+    var begin = rank * (n_tokens // world) + min(rank, n_tokens % world)
+    return (begin, count)
+
+
 # Below this many tokens a rank the warp-per-token dispatch keeps the per-CTA
 # send: with a few tokens per CTA there is little queue to drain, and a
 # 1,024-thread quantize has a shorter latency than one warp's. Set for
@@ -7413,16 +7774,14 @@ def dispatch_kernel[
         token_recv=token_recv,
     ]
 
-    comptime _allreduce_world_size = UInt32(allreduce_world_size)
-
     var num_tokens = UInt32(input_tokens.dim(0))
     var shared_expert_token_count = UInt32(0)
     comptime if fused_shared_expert:
         shared_expert_token_count = num_tokens
         comptime if skip_a2a:
-            shared_expert_token_count = (
-                num_tokens + _allreduce_world_size - UInt32(my_rank) - 1
-            ) // _allreduce_world_size
+            shared_expert_token_count = ep_shared_expert_rows[
+                allreduce_world_size
+            ](num_tokens, UInt32(my_rank))[1]
 
     # The P2P small path ran this step already (`p2p_small_dispatch_kernel`).
     comptime if p2p_small_counter_words > 0:
@@ -7480,7 +7839,7 @@ def dispatch_kernel[
                     barrier()
                     if thread_idx.x == 0:
                         _ = Atomic[scope=DEVICE_SCOPE].fetch_add[
-                            ordering=Ordering.RELEASE
+                            ordering=.release
                         ](
                             wait_atomic_counter.unsafe_offset(
                                 dispatch_impl.send_buf_ready_offset
@@ -7509,12 +7868,9 @@ def dispatch_kernel[
             comptime if fused_shared_expert:
                 var _send_buf_p = send_buf_p
                 comptime if skip_a2a:
-                    var rank_offset = UInt32(my_rank) * (
-                        num_tokens // _allreduce_world_size
-                    ) + min(
-                        UInt32(my_rank),
-                        num_tokens % _allreduce_world_size,
-                    )
+                    var rank_offset = ep_shared_expert_rows[
+                        allreduce_world_size
+                    ](num_tokens, UInt32(my_rank))[0]
                     _send_buf_p = _send_buf_p.unsafe_offset(
                         rank_offset * UInt32(token_fmt_type.msg_size())
                     )
@@ -7668,7 +8024,6 @@ def combine_kernel[
             "has_router_weights. Cannot add shared expert "
             "output to non-reduced routed expert outputs."
         )
-    comptime _allreduce_world_size = UInt32(allreduce_world_size)
 
     comptime combine_impl = EPCombineKernel[
         num_threads,
@@ -7741,18 +8096,10 @@ def combine_kernel[
                     var shared_expert_val = SIMD[dtype, width]()
 
                     comptime if combine_impl.skip_a2a:
-                        var n_tokens = UInt32(num_tokens)
-                        var shared_expert_token_count = (
-                            n_tokens
-                            + _allreduce_world_size
-                            - UInt32(my_rank)
-                            - 1
-                        ) // _allreduce_world_size
-                        var rank_start = UInt32(my_rank) * (
-                            n_tokens // _allreduce_world_size
-                        ) + min(
-                            UInt32(my_rank),
-                            n_tokens % _allreduce_world_size,
+                        var rank_start, shared_expert_token_count = (
+                            ep_shared_expert_rows[allreduce_world_size](
+                                UInt32(num_tokens), UInt32(my_rank)
+                            )
                         )
 
                         if (
@@ -7882,7 +8229,7 @@ def _p2p_small_finish(
     barrier()
     if thread_idx.x == 0:
         var done = Atomic[UInt32, scope=DEVICE_SCOPE].fetch_add[
-            ordering=Ordering.ACQUIRE_RELEASE
+            ordering=.acquire_release
         ](small_words.unsafe_offset(1), 1)
         if done == UInt32(grid_dim.x - 1):
             small_words.unsafe_offset(1).unsafe_store[volatile=True](0)
@@ -7890,7 +8237,7 @@ def _p2p_small_finish(
                 UInt32(1) if small else UInt32(0)
             )
             small_words.unsafe_store[volatile=True](epoch)
-            fence[ordering=Ordering.RELEASE, scope=DEVICE_SCOPE]()
+            fence[ordering=.release, scope=DEVICE_SCOPE]()
 
 
 @always_inline
@@ -8089,25 +8436,27 @@ def p2p_small_dispatch_kernel[
         alignment=token_fmt_type.alignment,
         address_space=.SHARED,
     ]()
-    var dest_has = unsafe_stack_allocation[
-        W, DType.int32, address_space=.SHARED
-    ]()
-    var n_src = unsafe_stack_allocation[W, DType.int32, address_space=.SHARED]()
-    var has_msg = unsafe_stack_allocation[
-        n_slots, DType.int32, address_space=.SHARED
-    ]()
-    var local_expert = unsafe_stack_allocation[
-        max_entries, DType.int32, address_space=.SHARED
-    ]()
-    var group_rows = unsafe_stack_allocation[
-        n_groups, DType.int32, address_space=.SHARED
-    ]()
-    var offsets = unsafe_stack_allocation[
-        n_groups + 1, DType.uint32, address_space=.SHARED
-    ]()
-    var dst_rows = unsafe_stack_allocation[
-        top_k, DType.int32, address_space=.SHARED
-    ]()
+    @__address_space(.SHARED)
+    var dest_has_storage = Array[Int32, W](uninitialized=True)
+    var dest_has = dest_has_storage.unsafe_ptr()
+    @__address_space(.SHARED)
+    var n_src_storage = Array[Int32, W](uninitialized=True)
+    var n_src = n_src_storage.unsafe_ptr()
+    @__address_space(.SHARED)
+    var has_msg_storage = Array[Int32, n_slots](uninitialized=True)
+    var has_msg = has_msg_storage.unsafe_ptr()
+    @__address_space(.SHARED)
+    var local_expert_storage = Array[Int32, max_entries](uninitialized=True)
+    var local_expert = local_expert_storage.unsafe_ptr()
+    @__address_space(.SHARED)
+    var group_rows_storage = Array[Int32, n_groups](uninitialized=True)
+    var group_rows = group_rows_storage.unsafe_ptr()
+    @__address_space(.SHARED)
+    var offsets_storage = Array[UInt32, n_groups + 1](uninitialized=True)
+    var offsets = offsets_storage.unsafe_ptr()
+    @__address_space(.SHARED)
+    var dst_rows_storage = Array[Int32, top_k](uninitialized=True)
+    var dst_rows = dst_rows_storage.unsafe_ptr()
 
     var first_expert = Int32(my_rank) * Int32(n_local)
 
@@ -8207,7 +8556,7 @@ def p2p_small_dispatch_kernel[
         group_rows[tid] = 0
     barrier()
     # After the barrier, so it follows every thread's flag poll.
-    fence[ordering=Ordering.ACQUIRE]()
+    fence[ordering=.acquire]()
 
     for j in range(tid, max_entries, num_threads):
         var slot = j // top_k
@@ -8224,7 +8573,7 @@ def p2p_small_dispatch_kernel[
             e = Int32(line[(topk_addr & 15) // 2]) - first_expert
             if e >= 0 and e < Int32(n_local):
                 _ = Atomic[Int32, scope=BLOCK_SCOPE].fetch_add[
-                    ordering=Ordering.RELAXED
+                    ordering=.relaxed
                 ](group_rows.unsafe_offset(Int(e) + shared_offset), 1)
             else:
                 e = -1
@@ -8452,7 +8801,7 @@ def p2p_small_combine_kernel[
             )
             while p.unsafe_load[volatile=True]() != epoch:
                 pass
-        fence[ordering=Ordering.ACQUIRE]()
+        fence[ordering=.acquire]()
 
         var accum = SIMD[.float32, dst_simd_width](0)
         comptime for k in range(top_k):
@@ -8650,7 +8999,7 @@ def p2p_prefill_combine_prep_kernel[
     barrier()
     if tid == 0:
         var done = Atomic[UInt32, scope=DEVICE_SCOPE].fetch_add[
-            ordering=Ordering.ACQUIRE_RELEASE
+            ordering=.acquire_release
         ](small_words.unsafe_offset(5), 1)
         if done == UInt32(grid_dim.x - 1):
             small_words.unsafe_offset(5).unsafe_store[volatile=True](0)
@@ -8660,7 +9009,7 @@ def p2p_prefill_combine_prep_kernel[
                     Int(recv_buf_ptrs[d]) + L.counts + me * 8,
                     (UInt64(epoch) << 32) | UInt64(n_mine),
                 )
-            fence[ordering=Ordering.RELEASE, scope=DEVICE_SCOPE]()
+            fence[ordering=.release, scope=DEVICE_SCOPE]()
 
 
 @__llvm_metadata(
@@ -8749,8 +9098,10 @@ def p2p_prefill_combine_kernel[
     )
 
     comptime if phase == 0:
-        var n_src = unsafe_stack_allocation[
-            n_ranks, DType.int32, address_space=.SHARED
+        @__address_space(.SHARED)
+        var n_src_storage = Array[Int32, n_ranks](uninitialized=True)
+        var n_src = n_src_storage.unsafe_ptr().unsafe_origin_cast[
+            MutUntrackedOrigin
         ]()
         if tid < n_ranks:
             var p = MutPointer[UInt64, MutUntrackedOrigin](
@@ -8781,7 +9132,7 @@ def p2p_prefill_combine_kernel[
         var warp_hi = min(warp_lo + per_warp, total)
         comptime warp_stride = 1
         # The weights landed before the counts this CTA waited for.
-        fence[ordering=Ordering.ACQUIRE]()
+        fence[ordering=.acquire]()
 
         var first = warp_lo
         while first < warp_hi:
@@ -8882,7 +9233,7 @@ def p2p_prefill_combine_kernel[
                 while (flag >> 1) != epoch:
                     _p2p_backoff()
                     flag = p.unsafe_load[volatile=True]()
-            fence[ordering=Ordering.ACQUIRE]()
+            fence[ordering=.acquire]()
             for b in range(TOK_BATCH):
                 var token_idx = first + b * warp_stride
                 if token_idx >= n_tok:
@@ -9166,8 +9517,10 @@ def p2p_prefill_dispatch_count_kernel[
     var first_expert = me * n_local
 
     # The small dispatch already exchanged every device's count.
-    var n_src = unsafe_stack_allocation[
-        n_ranks, DType.int32, address_space=.SHARED
+    @__address_space(.SHARED)
+    var n_src_storage = Array[Int32, n_ranks](uninitialized=True)
+    var n_src = n_src_storage.unsafe_ptr().unsafe_origin_cast[
+        MutUntrackedOrigin
     ]()
     if tid < n_ranks:
         var v = MutPointer[UInt64, MutUntrackedOrigin](
@@ -9207,7 +9560,7 @@ def p2p_prefill_dispatch_count_kernel[
             var e = Int(ids[k]) - first_expert
             if 0 <= e < n_local:
                 _ = Atomic[Int32, scope=DEVICE_SCOPE].fetch_add[
-                    ordering=Ordering.RELAXED
+                    ordering=.relaxed
                 ](hist.unsafe_offset(e), 1)
 
 
@@ -9321,11 +9674,13 @@ def p2p_prefill_dispatch_place_kernel[
     )
     var first_expert = me * n_local
 
-    var offsets = unsafe_stack_allocation[
-        n_groups + 1, DType.uint32, address_space=.SHARED
-    ]()
-    var n_src = unsafe_stack_allocation[
-        n_ranks, DType.int32, address_space=.SHARED
+    @__address_space(.SHARED)
+    var offsets_storage = Array[UInt32, n_groups + 1](uninitialized=True)
+    var offsets = offsets_storage.unsafe_ptr()
+    @__address_space(.SHARED)
+    var n_src_storage = Array[Int32, n_ranks](uninitialized=True)
+    var n_src = n_src_storage.unsafe_ptr().unsafe_origin_cast[
+        MutUntrackedOrigin
     ]()
     var msgs = unsafe_stack_allocation[
         n_warps * msg_bytes,
@@ -9383,7 +9738,7 @@ def p2p_prefill_dispatch_place_kernel[
         total += Int(n_src[s])
     # The count launch saw every flag, so every message has landed; one
     # acquire lets plain loads read them.
-    fence[ordering=Ordering.ACQUIRE]()
+    fence[ordering=.acquire]()
     var msg = msgs.unsafe_offset(Int(warp_id()) * msg_bytes)
     for item in range(
         block_idx.x * n_warps + warp_id(), total, grid_dim.x * n_warps
@@ -9418,9 +9773,7 @@ def p2p_prefill_dispatch_place_kernel[
             if e >= 0 and e < Int32(n_local):
                 row = Int32(offsets[Int(e) + shared_offset]) + Atomic[
                     Int32, scope=DEVICE_SCOPE
-                ].fetch_add[ordering=Ordering.RELAXED](
-                    cursor.unsafe_offset(Int(e)), 1
-                )
+                ].fetch_add[ordering=.relaxed](cursor.unsafe_offset(Int(e)), 1)
                 src_info[Int(row), 0] = Int32(s * max_tokens_per_rank + t)
                 src_info[Int(row), 1] = Int32(lane)
         comptime for k in range(top_k):

@@ -16,13 +16,20 @@
 /// struct with deterministic stub behaviour:
 ///
 ///   - 2 mock devices, or 1 when MOCK_DEVICE_COUNT=1
+///   - implements the header's interface version, or the one that
+///     MOCK_VERSION_MAJOR and MOCK_VERSION_MINOR name
 ///   - status_message returns standard strings for all predefined codes
 ///   - no device pair is peer-accessible; enabling peer access is refused
 ///   - memory alloc returns malloc'd blocks; free calls free()
 ///   - queue/event/bundle/function operations succeed silently
+///   - MOCK_FAIL_CALL names an entry point to refuse with
+///     M_DRIVER_STATUS_UNSUPPORTED
+///   - MOCK_MAX_CONTEXTS_PER_DEVICE caps the live contexts on each device and
+///     reports the cap as `max_contexts_per_device`
 
 #include "HAL/M_driver_api.h"
 
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -39,7 +46,10 @@
 
 static int g_driver_sentinel;
 static int g_device_sentinels[MOCK_MAX_DEVICE_COUNT];
+// One handle per device, so tests can tell contexts on different devices
+// apart and destroying one tells which device it belonged to.
 static int g_context_sentinels[MOCK_MAX_DEVICE_COUNT];
+static _Atomic int64_t g_live_contexts[MOCK_MAX_DEVICE_COUNT];
 static int g_queue_sentinel;
 static int g_event_sentinel;
 static int g_bundle_sentinel;
@@ -83,6 +93,45 @@ static void mock_maybe_stall(const char *name) {
 /// to resolve out of this plugin; the runtime never calls it.
 M_DRIVER_API_EXPORT
 void M_driver_mock_arm_stall(void) { g_stall_armed = true; }
+
+/// Whether MOCK_FAIL_CALL names `name`, the entry point being called.
+static bool mock_refuses(const char *name) {
+  const char *target = getenv("MOCK_FAIL_CALL");
+  return target != NULL && strcmp(target, name) == 0;
+}
+
+/// The MOCK_MAX_CONTEXTS_PER_DEVICE cap, or 0 when there is none.
+static int64_t mock_max_contexts_per_device(void) {
+  const char *env = getenv("MOCK_MAX_CONTEXTS_PER_DEVICE");
+  return env != NULL ? atoll(env) : 0;
+}
+
+// ---------------------------------------------------------------------------
+// Version negotiation and create failure
+//
+// MOCK_VERSION_MAJOR and MOCK_VERSION_MINOR make the mock implement another
+// interface version, as a plugin built against another header would.
+// MOCK_VERSION_UNREPORTED=1 makes M_driver_create refuse the host's version
+// without writing back its own. MOCK_CREATE_FAIL=1 makes M_driver_create fail
+// and return a handle that only describes the failure, as the header allows.
+// ---------------------------------------------------------------------------
+
+#define MOCK_STATUS_CREATE_FAILED M_DRIVER_STATUS_CUSTOM_CODES_BASE
+
+static int g_failed_driver_sentinel;
+static int64_t g_live_failed_drivers;
+
+static uint32_t mock_version_part(const char *name, uint32_t fallback) {
+  const char *env = getenv(name);
+  return env != NULL ? (uint32_t)strtoul(env, NULL, 10) : fallback;
+}
+
+/// The number of failure handles M_driver_create returned that are not yet
+/// destroyed. Exported for tests; the runtime never calls it.
+M_DRIVER_API_EXPORT
+int64_t M_driver_mock_live_failed_drivers(void) {
+  return g_live_failed_drivers;
+}
 
 static int64_t mock_device_count(void) {
   const char *env = getenv("MOCK_DEVICE_COUNT");
@@ -164,6 +213,11 @@ M_driver_status_t M_driver_status_message(M_driver_driver_t driver,
   case M_DRIVER_STATUS_UNIMPLEMENTED:
     msg = "unimplemented";
     break;
+  case MOCK_STATUS_CREATE_FAILED:
+    if (driver != (M_driver_driver_t)&g_failed_driver_sentinel)
+      return M_DRIVER_STATUS_ARGUMENT_OUT_OF_RANGE;
+    msg = "mock create failed on request";
+    break;
   default:
     return M_DRIVER_STATUS_ARGUMENT_OUT_OF_RANGE;
   }
@@ -183,13 +237,25 @@ M_driver_status_t M_driver_create(M_driver_version *version,
   if (!version || !driver)
     return M_DRIVER_STATUS_INVALID_ARG;
 
-  if (version->major != M_DRIVER_INTERFACE_VERSION_MAJOR)
+  const char *unreported = getenv("MOCK_VERSION_UNREPORTED");
+  if (unreported != NULL && strcmp(unreported, "1") == 0)
     return M_DRIVER_STATUS_INCOMPATIBLE_VERSION;
 
-  // Write back the mock plugin's version.
-  version->major = M_DRIVER_INTERFACE_VERSION_MAJOR;
-  version->minor = M_DRIVER_INTERFACE_VERSION_MINOR;
+  uint32_t host_major = version->major;
+  version->major =
+      mock_version_part("MOCK_VERSION_MAJOR", M_DRIVER_INTERFACE_VERSION_MAJOR);
+  version->minor =
+      mock_version_part("MOCK_VERSION_MINOR", M_DRIVER_INTERFACE_VERSION_MINOR);
   version->patch = M_DRIVER_INTERFACE_VERSION_PATCH;
+  if (host_major != version->major)
+    return M_DRIVER_STATUS_INCOMPATIBLE_VERSION;
+
+  const char *fail = getenv("MOCK_CREATE_FAIL");
+  if (fail != NULL && strcmp(fail, "1") == 0) {
+    ++g_live_failed_drivers;
+    *driver = (M_driver_driver_t)&g_failed_driver_sentinel;
+    return MOCK_STATUS_CREATE_FAILED;
+  }
 
   *driver = (M_driver_driver_t)&g_driver_sentinel;
   return M_DRIVER_STATUS_SUCCESS;
@@ -198,7 +264,8 @@ M_driver_status_t M_driver_create(M_driver_version *version,
 M_DRIVER_API_EXPORT
 M_driver_status_t M_driver_destroy(M_driver_driver_t driver) {
   mock_maybe_stall(__func__);
-  (void)driver;
+  if (driver == (M_driver_driver_t)&g_failed_driver_sentinel)
+    --g_live_failed_drivers;
   return M_DRIVER_STATUS_SUCCESS;
 }
 
@@ -216,8 +283,10 @@ M_driver_status_t M_driver_property(M_driver_driver_t handle,
 
   if (strcmp(property_name, M_DRIVER_PROPERTY_VERSION) == 0) {
     M_driver_version *v = (M_driver_version *)value;
-    v->major = M_DRIVER_INTERFACE_VERSION_MAJOR;
-    v->minor = M_DRIVER_INTERFACE_VERSION_MINOR;
+    v->major = mock_version_part("MOCK_VERSION_MAJOR",
+                                 M_DRIVER_INTERFACE_VERSION_MAJOR);
+    v->minor = mock_version_part("MOCK_VERSION_MINOR",
+                                 M_DRIVER_INTERFACE_VERSION_MINOR);
     v->patch = M_DRIVER_INTERFACE_VERSION_PATCH;
     return M_DRIVER_STATUS_SUCCESS;
   }
@@ -269,6 +338,13 @@ M_driver_status_t M_driver_device_property(M_driver_device_t device,
     *(int64_t *)value = 0;
     return M_DRIVER_STATUS_SUCCESS;
   }
+  int64_t max_contexts = mock_max_contexts_per_device();
+  if (max_contexts > 0 &&
+      strcmp(property_name, M_DRIVER_DEVICE_PROPERTY_MAX_CONTEXTS_PER_DEVICE) ==
+          0) {
+    *(int64_t *)value = max_contexts;
+    return M_DRIVER_STATUS_SUCCESS;
+  }
   // Opt-in, so tests that expect no arch from the mock keep getting none.
   const char *arch = getenv("MOCK_DEVICE_ARCH");
   if (arch && strcmp(property_name, M_DRIVER_DEVICE_PROPERTY_ARCH) == 0 &&
@@ -316,11 +392,15 @@ M_driver_status_t M_driver_context_create(M_driver_device_t device,
   mock_maybe_stall(__func__);
   if (!context)
     return M_DRIVER_STATUS_INVALID_ARG;
-  // One handle per device, so tests can tell contexts on different devices
-  // apart.
   ptrdiff_t device_id = (int *)device - g_device_sentinels;
   if (device_id < 0 || device_id >= MOCK_MAX_DEVICE_COUNT)
     return M_DRIVER_STATUS_BAD_DEVICE;
+  if (mock_refuses(__func__))
+    return M_DRIVER_STATUS_UNSUPPORTED;
+  int64_t max_contexts = mock_max_contexts_per_device();
+  if (max_contexts > 0 && g_live_contexts[device_id] >= max_contexts)
+    return M_DRIVER_STATUS_UNSUPPORTED;
+  ++g_live_contexts[device_id];
   *context = (M_driver_context_t)&g_context_sentinels[device_id];
   return M_DRIVER_STATUS_SUCCESS;
 }
@@ -328,7 +408,9 @@ M_driver_status_t M_driver_context_create(M_driver_device_t device,
 M_DRIVER_API_EXPORT
 M_driver_status_t M_driver_context_destroy(M_driver_context_t context) {
   mock_maybe_stall(__func__);
-  (void)context;
+  if (!context)
+    return M_DRIVER_STATUS_BAD_CONTEXT;
+  --g_live_contexts[(int *)context - g_context_sentinels];
   return M_DRIVER_STATUS_SUCCESS;
 }
 
@@ -486,6 +568,8 @@ M_driver_status_t M_driver_memory_wrap(M_driver_context_t context,
   (void)size;
   if (!memory || address == 0)
     return M_DRIVER_STATUS_INVALID_ARG;
+  if (mock_refuses(__func__))
+    return M_DRIVER_STATUS_UNSUPPORTED;
   M_driver_memory_t m = malloc(sizeof(*m));
   if (!m)
     return M_DRIVER_STATUS_OUT_OF_MEMORY;
@@ -505,6 +589,8 @@ M_driver_status_t M_driver_memory_unwrap(M_driver_context_t context,
   (void)context;
   if (!memory || !address)
     return M_DRIVER_STATUS_INVALID_ARG;
+  if (mock_refuses(__func__))
+    return M_DRIVER_STATUS_UNSUPPORTED;
   memory->owning = false;
   *address = (uint64_t)(uintptr_t)memory->ptr;
   return M_DRIVER_STATUS_SUCCESS;

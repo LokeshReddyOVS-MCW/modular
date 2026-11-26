@@ -11,16 +11,15 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from std.sys.info import CompilationTarget
 from .._trait import HalPluginHooks
 from ..._machine import DeviceRef
-from ...execution_config._apple import ExecutionConfigForTarget
+from ...execution_config.gpu_execution_config import GPUExecutionConfiguration
 from ...extensions.metal import MetalHALExtensions
 
 
-struct MetalHalPluginHooks[target: CompilationTarget](HalPluginHooks):
-    comptime ExecutionConfigType[device: DeviceRef] = ExecutionConfigForTarget[
-        device.spec.name
+struct MetalHalPluginHooks(HalPluginHooks):
+    comptime ExecutionConfigType[device: DeviceRef] = GPUExecutionConfiguration[
+        has_constant_memory=True
     ]
     """Returns the execution configuration for the given device."""
 

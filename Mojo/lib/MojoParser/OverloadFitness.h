@@ -132,18 +132,19 @@ public:
 
   /// Return the set of args that need to be emitted to MValues to select this
   /// candidate.
-  const OperandsNeedingOriginsList &getOperandsNeedingOrigins() const {
-    return operandsNeedingOrigins;
+  const OperandsNeedingReEmissionList &getOperandsNeedingReEmission() const {
+    return operandsNeedingReEmission;
   }
 
 private:
   /// The checks shared by direct and indirect calls: assigns `operands` to the
   /// signature's arguments, infers its parameters, and ranks the result.
-  static OverloadFitness
-  evaluateImpl(FnTypeGeneratorType signature, ASTDecl *funcIfDirect,
-               const ParamBindings &paramBindings,
-               ArrayRef<ConstraintAttr> additionalAssumptions,
-               const CallOperands &operands, bool allowImplicitConversions);
+  static OverloadFitness evaluateImpl(FnTypeGeneratorType signature,
+                                      ASTDecl *funcIfDirect,
+                                      const ParamBindings &paramBindings,
+                                      TypedAttr additionalAssumptions,
+                                      const CallOperands &operands,
+                                      bool allowImplicitConversions);
 
   /// For valid candidates, this defines the parameter bindings to use.
   VerifiedParamBindings paramBindings;
@@ -155,7 +156,7 @@ private:
   /// If this candidate requires any arguments to be emitted (from a PValue or
   /// SValue to an MValue) so a origin can be inferred, the argument is tracked
   /// in this list.
-  const OperandsNeedingOriginsList operandsNeedingOrigins;
+  const OperandsNeedingReEmissionList operandsNeedingReEmission;
 
   /// Describes the metrics that can be used to compare candidates.
   struct Payload {
@@ -178,9 +179,9 @@ private:
   /// To create a kFunctionConstraintInconclusive fitness, just insert the
   /// constraints into `unprovableConstraints`.
   OverloadFitness(VerifiedParamBindings paramBindings,
-                  OperandsNeedingOriginsList &&operandsNeedingOrigins)
+                  OperandsNeedingReEmissionList &&operandsNeedingReEmission)
       : paramBindings(std::move(paramBindings)),
-        operandsNeedingOrigins(std::move(operandsNeedingOrigins)) {}
+        operandsNeedingReEmission(std::move(operandsNeedingReEmission)) {}
 };
 
 } // namespace M::KGEN::LIT

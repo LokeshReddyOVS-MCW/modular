@@ -39,8 +39,8 @@ public:
   ParamInf(const ParamBindings &paramBinding, ArrayRef<Type> declaredParamTypes,
            PogListAttr declaredParamPogs, bool allowImplicitConversions,
            ASTDecl *declIfDirect, bool discardError,
-           DeferredTypingContext *deferredTypingContext = nullptr,
-           ArrayRef<ConstraintAttr> additionalAssumptions = {});
+           TypedAttr additionalAssumptions,
+           DeferredTypingContext *deferredTypingContext = nullptr);
 
   // Infer the parameter binding for a struct given a (potentially incomplete)
   // parameter binding. On success, returns the verified bindings (which can be
@@ -84,8 +84,8 @@ private:
   // invoked after both parameter list and argument list has been scanned).
   LogicalResult inferFromDefaults();
 
-  // Finalize the inference by making any remaining uninferred parameter to
-  // UnboundAttr.
+  // Finalize the inference by leaving any remaining uninferred parameter
+  // unbound.
   LogicalResult finalizeWithUnbound();
 
   /// Infer still-unbound parameters from equality (`where a == b`) body
@@ -103,10 +103,10 @@ private:
     return paramBindings.getParameters();
   }
 
-  FailureOr<SmartVariant<CValue, ASTType>>
-  inferCValue(ASTExprAnd<AnyValue> operand, size_t argIdx, PogListAttr argPogs,
-              CallSyntax syntax, ASTType expectedType,
-              OperandsNeedingOriginsList *forwardedNeedingOrigins = nullptr);
+  FailureOr<SmartVariant<CValue, ASTType>> inferCValue(
+      ASTExprAnd<AnyValue> operand, size_t argIdx, PogListAttr argPogs,
+      CallSyntax syntax, ASTType expectedType,
+      OperandsNeedingReEmissionList *forwardedNeedingReEmission = nullptr);
 
   /// Core type matching logic for parameter inference, this matches expected
   /// type against the RValue type of the operand (which means this does not
@@ -114,7 +114,7 @@ private:
   LogicalResult inferFromRVType(
       ASTExprAnd<AnyValue> operand, size_t argIdx, ASTType expectedType,
       PogListAttr argPogs, CallSyntax syntax,
-      OperandsNeedingOriginsList *forwardedNeedingOrigins = nullptr);
+      OperandsNeedingReEmissionList *forwardedNeedingReEmission = nullptr);
 
   /// Infer and emit a single value for a parameter binding. This returns
   /// failure if it emits a diagnostic, otherwise is returns a parameter value
@@ -176,8 +176,8 @@ public:
                bool discardError, FnTypeGeneratorType calleeSignature,
                const CallOperands &callOperands,
                const CallOperands::PogAssignment &pogAssignment,
-               OperandsNeedingOriginsList &operandsNeedingOrigins,
-               ArrayRef<ConstraintAttr> additionalAssumptions = {});
+               OperandsNeedingReEmissionList &operandsNeedingReEmission,
+               TypedAttr additionalAssumptions);
 
   /// Given an incomplete parameter binding set and the arguments for a call to
   /// the specified signature, try to infer the verified parameter bindings. On
@@ -197,12 +197,12 @@ private:
   FnTypeGeneratorType calleeSignature;
   const CallOperands &callOperands;
   const CallOperands::PogAssignment &pogAssignment;
-  OperandsNeedingOriginsList &operandsNeedingOrigins;
+  OperandsNeedingReEmissionList &operandsNeedingReEmission;
 
   LogicalResult inferOptionalLiteralSize();
 
   LogicalResult inferResultSlot(RefType expectedRef, size_t argIdx,
-                                const ExprDest &dest);
+                                const CallOperands &operands);
 
   /// Infer parameters from an operand being passed into this function. This is
   /// only called on the top level function operands being matched up, not

@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import functools
 from dataclasses import dataclass
-from typing import Generic, TypeVar
+from typing import Generic, NamedTuple, TypeVar
 
 from max import functional as F
 from max import tree
@@ -45,8 +45,11 @@ from max.nn.kernels import (
     gated_delta_conv1d_fwd,
     gated_delta_conv1d_verify_fwd,
     kda_chunk,
+    kda_chunk_conv,
     kda_decode,
     kda_verify_ring,
+    kda_verify_ring_kgroup_conv,
+    kda_verify_ring_kgroup_conv_servable,
 )
 from max.tensor import Tensor
 from max.tensor.sharding import NamedMapping
@@ -157,6 +160,238 @@ def layer_rows(
 _chunk_predicate = F.functional(kda_chunk_predicate)
 
 
+class _KdaOperands(NamedTuple):
+    """The gate and row operands of the recurrence ops, in their dtypes."""
+
+    raw_gate: Tensor
+    beta_logits: Tensor
+    a_log: Tensor
+    dt_bias: Tensor
+    cu_seqlens: Tensor
+    state_indices: Tensor
+
+
+def _kda_operands(
+    raw_gate: Tensor,
+    beta_logits: Tensor,
+    a_log: Tensor,
+    dt_bias: Tensor,
+    input_row_offsets: Tensor,
+    recurrent_rows: Tensor,
+    layer: Tensor,
+    position: int | None,
+    head_shape: list[int],
+) -> _KdaOperands:
+    """Casts and shapes the operands the recurrence ops share.
+
+    Made outside the callers' conditionals: a weight first read inside one
+    branch is defined in that branch's region, and the other branch cannot
+    use it.
+    """
+    return _KdaOperands(
+        raw_gate=raw_gate.cast(DType.float32).reshape(head_shape),
+        beta_logits=beta_logits.cast(DType.float32),
+        a_log=a_log.cast(DType.float32),
+        dt_bias=dt_bias.reshape(head_shape[1:]),
+        cu_seqlens=input_row_offsets.cast(DType.int32),
+        state_indices=layer_rows(recurrent_rows, layer, position).cast(
+            DType.int32
+        ),
+    )
+
+
+def _split_heads(
+    conv_out: Tensor, head_shape: list[int]
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Splits the conv output into q, k and v, each in ``head_shape``."""
+    q, k, v = (
+        part.reshape(head_shape)
+        for part in conv_out.split([head_shape[1] * head_shape[2]] * 3, axis=-1)
+    )
+    return q, k, v
+
+
+def _capture_replay(
+    capture: CaptureSink[KdaReplayInputs] | None,
+    qkv: Tensor,
+    conv_weight: Tensor,
+    operands: _KdaOperands,
+    qkv_window: Tensor | None,
+) -> None:
+    """Appends the layer's replay inputs to ``capture``, if any."""
+    if capture is not None:
+        capture.items.append(
+            KdaReplayInputs(
+                qkv=qkv,
+                conv_weight=conv_weight,
+                raw_gate=operands.raw_gate,
+                beta_logits=operands.beta_logits,
+                qkv_window=qkv_window,
+            )
+        )
+
+
+def _chunk_core(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    operands: _KdaOperands,
+    recurrent_pool: Tensor,
+    gate_mode: KdaGateMode,
+    out_shape: list[DimLike],
+) -> Tensor:
+    """Runs ``kda_chunk`` on bf16 q, k and v; returns the float32 readout."""
+    # Both vendors' chunk ops take bf16 q/k/v, so this branch rounds at the op
+    # boundary and nowhere else. On NVIDIA, float32 q/k/v would fall back to
+    # the L1/L2/L3 pipeline instead of the fused compute-bound kernel.
+    chunk_output_dtype, use_computebound = kda_chunk_bf16_launch()
+    out = kda_chunk(
+        q,
+        k,
+        v,
+        operands.raw_gate,
+        operands.beta_logits,
+        operands.a_log,
+        operands.dt_bias,
+        operands.cu_seqlens,
+        recurrent_pool,
+        operands.state_indices,
+        output_dtype=chunk_output_dtype,
+        use_computebound=use_computebound,
+        gate_mode=gate_mode,
+        beta_mode="logits",
+        state_layout=STATE_LAYOUT,
+    ).cast(DType.float32)
+    return F.rebind(out, out_shape, "kda chunk output rebind")
+
+
+def _gated_norm(
+    core: Tensor,
+    norm_weight: Tensor,
+    norm_eps: float,
+    output_gate: Tensor,
+    head_shape: list[int],
+    dtype: DType,
+) -> Tensor:
+    """Normalizes, scales, and only then gates the recurrence readout."""
+    normed = F.rms_norm(
+        core,
+        norm_weight.cast(DType.float32),
+        norm_eps,
+        multiply_before_cast=False,
+    ) * F.sigmoid(output_gate.cast(DType.float32).reshape(head_shape))
+    return normed.cast(dtype).reshape([-1, head_shape[1] * head_shape[2]])
+
+
+def _kgroup_conv_verify(
+    qkv: Tensor,
+    conv_weight: Tensor,
+    conv_pool: Tensor,
+    conv_slots: Tensor,
+    raw_gate: Tensor,
+    beta_logits: Tensor,
+    a_log: Tensor,
+    dt_bias: Tensor,
+    recurrent_pool: Tensor,
+    recurrent_rows: Tensor,
+    ring_pool: Tensor,
+    ring_rows: Tensor,
+    input_row_offsets: Tensor,
+    layer: Tensor,
+    verify_width: Tensor,
+    head_shape: list[int],
+    gate_mode: KdaGateMode,
+    capture: CaptureSink[KdaReplayInputs] | None,
+    position: int | None,
+) -> Tensor:
+    """Runs a verify's conv and recurrence on the K-group conv op.
+
+    The op runs the conv in the ring kernel, so a verify with drafts takes
+    one launch for both. A draft-free prefill takes the chunk kernel, whose
+    bf16 q, k and v come out of one ``kda_chunk_conv`` launch. Both ops take
+    ``qkv`` in the model dtype and widen it themselves, which is exact, so
+    the layer casts none of it.
+    """
+    operands = _kda_operands(
+        raw_gate,
+        beta_logits,
+        a_log,
+        dt_bias,
+        input_row_offsets,
+        recurrent_rows,
+        layer,
+        position,
+        head_shape,
+    )
+    raw_gate, beta_logits, a_log, dt_bias, cu_seqlens, state_indices = operands
+    conv_offsets = input_row_offsets.cast(DType.uint32)
+    # Sliced outside the cond, as `kda_core` slices it.
+    ring_indices = layer_rows(ring_rows, layer, position)
+    out_shape: list[DimLike] = [qkv.shape[0], *head_shape[1:]]
+
+    def ring() -> list[Tensor]:
+        out, window = kda_verify_ring_kgroup_conv(
+            qkv,
+            conv_weight,
+            conv_pool,
+            conv_slots,
+            raw_gate,
+            beta_logits,
+            a_log,
+            dt_bias,
+            cu_seqlens,
+            recurrent_pool,
+            state_indices,
+            ring_pool,
+            ring_indices,
+            verify_width,
+        )
+        return [F.rebind(out, out_shape, "kda verify output rebind"), window]
+
+    def chunk() -> list[Tensor]:
+        q, k, v, window = kda_chunk_conv(
+            qkv,
+            conv_weight,
+            conv_pool,
+            conv_slots,
+            conv_offsets,
+            verify_width,
+            num_key_heads=head_shape[1],
+            num_value_heads=head_shape[1],
+            head_dim=head_shape[2],
+        )
+        core = _chunk_core(
+            q, k, v, operands, recurrent_pool, gate_mode, out_shape
+        )
+        return [core, window]
+
+    if kda_chunk_servable(head_shape[2], gate_mode, recurrent_pool.dtype):
+        # As in `kda_core`: a draft-free prefill takes the chunk kernel.
+        no_drafts = F.equal(F.shape_to_tensor(verify_width.shape)[0], 0)
+        total_tokens = F.shape_to_tensor(qkv.shape)[0]
+        batch_size = F.shape_to_tensor(input_row_offsets.shape)[0] - 1
+        device = DeviceRef.from_device(qkv.device)
+        window_rows = Dim(conv_slots.shape[0]) * (
+            Dim(verify_width.shape[0]) + 1
+        )
+        core, window = F.cond(
+            F.logical_and(
+                no_drafts,
+                _chunk_predicate(total_tokens, batch_size),
+            ),
+            [
+                TensorType(DType.float32, out_shape, device),
+                TensorType(DType.float32, [window_rows, qkv.shape[1]], device),
+            ],
+            chunk,
+            ring,
+        )
+    else:
+        core, window = ring()
+    _capture_replay(capture, qkv, conv_weight, operands, window)
+    return core
+
+
 def kda_core(
     q: Tensor,
     k: Tensor,
@@ -183,7 +418,6 @@ def kda_core(
     ring_rows: Tensor | None = None,
     verify_width: Tensor | None = None,
     capture: CaptureSink[KdaReplayInputs] | None = None,
-    pin_decode_fma: bool = False,
     position: int | None = None,
 ) -> Tensor:
     """Runs one device's heads: conv, recurrence, gated norm.
@@ -193,24 +427,51 @@ def kda_core(
     ``q``'s dtype, the input of the row-parallel ``o_proj``. Both pools are
     mutated in place, except under a verify (``verify_width`` set), which
     records the recurrence into ``ring_pool`` and appends its replay inputs
-    to ``capture`` for the rollback. ``pin_decode_fma`` pins the decode
-    kernel's fused multiply-adds, which only a test of decode against the
-    verify ring needs: a speculative graph never takes the decode branch.
+    to ``capture`` for the rollback.
     """
     dtype = q.dtype
     qkv_dim = int(q.shape[-1])
     head_shape = [-1, qkv_dim // head_dim, head_dim]
 
     # q, k, v in that order: the conv's channel layout.
-    qkv = F.concat([q, k, v], axis=-1).cast(DType.float32)
-    # The module holds each conv weight as the checkpoint's depthwise
-    # `[channels, 1, kernel]`.
+    qkv = F.concat([q, k, v], axis=-1)
+    # The module holds each conv weight as the checkpoint stores it: its
+    # dtype and depthwise `[channels, 1, kernel]` shape.
     conv_weight = (
         F.concat([q_conv, k_conv, v_conv], axis=0)
         .reshape([-1, q_conv.shape[-1]])
         .cast(DType.float32)
     )
     conv_slots = layer_rows(conv_rows, layer, position).cast(DType.uint32)
+    if verify_width is not None and kda_verify_ring_kgroup_conv_servable(
+        head_dim, gate_mode, recurrent_pool.dtype
+    ):
+        assert ring_pool is not None and ring_rows is not None
+        core = _kgroup_conv_verify(
+            qkv,
+            conv_weight,
+            conv_pool,
+            conv_slots,
+            raw_gate,
+            beta_logits,
+            a_log,
+            dt_bias,
+            recurrent_pool,
+            recurrent_rows,
+            ring_pool,
+            ring_rows,
+            input_row_offsets,
+            layer,
+            verify_width,
+            head_shape,
+            gate_mode,
+            capture,
+            position,
+        )
+        return _gated_norm(
+            core, norm_weight, norm_eps, output_gate, head_shape, dtype
+        )
+    qkv = qkv.cast(DType.float32)
     qkv_window: Tensor | None = None
     if verify_width is None:
         conv_out = gated_delta_conv1d_fwd(
@@ -232,33 +493,22 @@ def kda_core(
             rollback=False,
             silu=True,
         )
-    q, k, v = (
-        part.reshape(head_shape)
-        for part in conv_out.split([qkv_dim] * 3, axis=-1)
-    )
+    q, k, v = _split_heads(conv_out, head_shape)
 
-    raw_gate = raw_gate.cast(DType.float32).reshape(head_shape)
-    beta_logits = beta_logits.cast(DType.float32)
-    # Read here, outside the conditional below: a weight first read inside
-    # one branch is defined in that branch's region, and the other branch
-    # cannot use it.
-    a_log = a_log.cast(DType.float32)
-    dt_bias = dt_bias.reshape(head_shape[1:])
-    cu_seqlens = input_row_offsets.cast(DType.int32)
-    state_indices = layer_rows(recurrent_rows, layer, position).cast(
-        DType.int32
+    operands = _kda_operands(
+        raw_gate,
+        beta_logits,
+        a_log,
+        dt_bias,
+        input_row_offsets,
+        recurrent_rows,
+        layer,
+        position,
+        head_shape,
     )
+    raw_gate, beta_logits, a_log, dt_bias, cu_seqlens, state_indices = operands
     out_shape: list[DimLike] = [q.shape[0], *head_shape[1:]]
-    if capture is not None:
-        capture.items.append(
-            KdaReplayInputs(
-                qkv=qkv,
-                conv_weight=conv_weight,
-                raw_gate=raw_gate,
-                beta_logits=beta_logits,
-                qkv_window=qkv_window,
-            )
-        )
+    _capture_replay(capture, qkv, conv_weight, operands, qkv_window)
 
     def decode() -> Tensor:
         return kda_decode(
@@ -276,13 +526,11 @@ def kda_core(
             gate_mode=gate_mode,
             beta_mode="logits",
             state_layout=STATE_LAYOUT,
-            pin_fma=pin_decode_fma,
+            # The verify ring spells every multiply-add as an explicit fma, and
+            # MTP's tokens are this model's greedy tokens only if decode does
+            # the same. NVIDIA pins inside the kernel; AMD takes this flag.
+            pin_fma=True,
         )
-
-    # Both vendors' chunk ops take bf16 q/k/v, so this branch rounds at the op
-    # boundary and nowhere else. On NVIDIA, float32 q/k/v would fall back to
-    # the L1/L2/L3 pipeline instead of the fused compute-bound kernel.
-    chunk_output_dtype, use_computebound = kda_chunk_bf16_launch()
 
     def chunk(qkv_io: tuple[Tensor, Tensor, Tensor] | None = None) -> Tensor:
         q_io, k_io, v_io = qkv_io or (
@@ -290,24 +538,9 @@ def kda_core(
             k.cast(DType.bfloat16),
             v.cast(DType.bfloat16),
         )
-        out = kda_chunk(
-            q_io,
-            k_io,
-            v_io,
-            raw_gate,
-            beta_logits,
-            a_log,
-            dt_bias,
-            cu_seqlens,
-            recurrent_pool,
-            state_indices,
-            output_dtype=chunk_output_dtype,
-            use_computebound=use_computebound,
-            gate_mode=gate_mode,
-            beta_mode="logits",
-            state_layout=STATE_LAYOUT,
-        ).cast(DType.float32)
-        return F.rebind(out, out_shape, "kda chunk output rebind")
+        return _chunk_core(
+            q_io, k_io, v_io, operands, recurrent_pool, gate_mode, out_shape
+        )
 
     # Sliced here rather than in the branch: mo-symbolic-optimize merges the
     # layers' slices of one row table into a single split, which must not sit
@@ -356,7 +589,7 @@ def kda_core(
     ]
     if verify_width is None and chunked:
         (core,) = F.cond(
-            _chunk_predicate(total_tokens, batch_size, head_shape[1], head_dim),
+            _chunk_predicate(total_tokens, batch_size),
             out_types,
             lambda: [chunk()],
             lambda: [F.rebind(decode(), out_shape, "kda decode output rebind")],
@@ -367,48 +600,29 @@ def kda_core(
         # A draft-free prefill has nothing to roll back, so it takes the
         # forward's chunked kernel. A verify stays on the sequential
         # recurrence, whose arithmetic the ring records and the fold replays.
-        # TODO(KERN-3993): on NVIDIA this branch makes each verify step
-        # 0.16-0.27 ms slower: every KDA layer pays the bf16 cast below, and
-        # the compiler schedules its output-gate projections after the verify
-        # ring instead of beside it.
         no_drafts = F.equal(F.shape_to_tensor(verify_width.shape)[0], 0)
-        # TODO(KERN-3879): the bf16 cast is made outside the cond
-        # because, made inside a branch, mo-hoist-param-exprs leaves its
-        # result on the outer token dim and the graph fails to verify. Every
-        # verify computes and drops it. One cast of the whole conv output
-        # rides in the q/k/v split's kernel, where casting q, k and v apart
-        # launches two more kernels per layer. Move it into the branch once
-        # the pass is fixed.
+        # TODO(KERN-3993): every verify computes this bf16 cast, and only the
+        # chunk branch reads it. The cast alone cannot move into that branch:
+        # mo-hoist-param-exprs then leaves its result on the outer token dim
+        # and the graph fails to verify (KERN-3879). Make the conv inside each
+        # branch too, as `_kgroup_conv_verify` does. One cast of the whole
+        # conv output rides in the q/k/v split's kernel; casting q, k and v
+        # apart launches two more kernels per layer.
         conv_io = conv_out.cast(DType.bfloat16)
-
-        def qkv_io() -> tuple[Tensor, Tensor, Tensor]:
-            q_io, k_io, v_io = (
-                part.reshape(head_shape)
-                for part in conv_io.split([qkv_dim] * 3, axis=-1)
-            )
-            return q_io, k_io, v_io
-
         (core,) = F.cond(
             F.logical_and(
                 no_drafts,
-                _chunk_predicate(
-                    total_tokens, batch_size, head_shape[1], head_dim
-                ),
+                _chunk_predicate(total_tokens, batch_size),
             ),
             out_types,
-            lambda: [chunk(qkv_io())],
+            lambda: [chunk(_split_heads(conv_io, head_shape))],
             lambda: [verify_ring()],
         )
     else:
         core = verify_ring()
-    # Normalize, scale, and only then gate.
-    normed = F.rms_norm(
-        core,
-        norm_weight.cast(DType.float32),
-        norm_eps,
-        multiply_before_cast=False,
-    ) * F.sigmoid(output_gate.cast(DType.float32).reshape(head_shape))
-    return normed.cast(dtype).reshape([-1, qkv_dim])
+    return _gated_norm(
+        core, norm_weight, norm_eps, output_gate, head_shape, dtype
+    )
 
 
 class KimiDeltaAttention(Module[[Tensor, KdaStateAccess, Tensor], Tensor]):
@@ -432,9 +646,11 @@ class KimiDeltaAttention(Module[[Tensor, KdaStateAccess, Tensor], Tensor]):
         self.q_proj = head_rows(hidden, qkv_dim)
         self.k_proj = head_rows(hidden, qkv_dim)
         self.v_proj = head_rows(hidden, qkv_dim)
-        self.q_conv1d = _shard_rows(Tensor.zeros([qkv_dim, 1, kernel]))
-        self.k_conv1d = _shard_rows(Tensor.zeros([qkv_dim, 1, kernel]))
-        self.v_conv1d = _shard_rows(Tensor.zeros([qkv_dim, 1, kernel]))
+        conv_shape = [qkv_dim, 1, kernel]
+        conv_dtype = config.linear_conv_dtype
+        self.q_conv1d = _shard_rows(Tensor.zeros(conv_shape, dtype=conv_dtype))
+        self.k_conv1d = _shard_rows(Tensor.zeros(conv_shape, dtype=conv_dtype))
+        self.v_conv1d = _shard_rows(Tensor.zeros(conv_shape, dtype=conv_dtype))
 
         # The low-rank gate projections bottom out at `head_dim`, which is not
         # a head axis, so their down halves are replicated.
@@ -455,22 +671,25 @@ class KimiDeltaAttention(Module[[Tensor, KdaStateAccess, Tensor], Tensor]):
         self.o_proj = row_parallel(Linear(qkv_dim, hidden, bias=False))
         self.verify: KdaVerify | None = None
         """Set by the speculative target around its verify, else ``None``."""
-        self.pin_decode_fma = False
-        """Whether decode pins its fused multiply-adds so its state matches a
-        verify ring's bit for bit; the pinned kernel is slower on AMD."""
 
     def forward(
         self, x: Tensor, state: KdaStateAccess, input_row_offsets: Tensor
     ) -> Tensor:
         """Runs the delta attention over ``x`` and advances ``state``."""
-        head_split = NamedMapping(x.mesh, (None, TP))
+        # Each device's heads of every row under tensor parallelism; every
+        # head of its own replica's rows under data parallelism, where the
+        # ``tp`` specs resolve to replicated weights.
+        head_split = (
+            NamedMapping(x.mesh, (None, TP))
+            if TP in x.mesh.axis_names
+            else x.mapping
+        )
         verify = self.verify
         core = functools.partial(
             kda_core,
             head_dim=self.head_dim,
             norm_eps=self.norm_eps,
             gate_mode=self.gate_mode,
-            pin_decode_fma=self.pin_decode_fma,
             position=state.position,
         )
         normed = F.call_on_mesh(core, x.mesh, out_specs=head_split)(

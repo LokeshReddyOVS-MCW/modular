@@ -122,56 +122,6 @@ def MOComposite_ReduceSoftmaxOp : MO_CompositeOp<"reduce.softmax", [
 }
 
 //===----------------------------------------------------------------------===//
-// ReduceRMSNormRoPEOp
-//===----------------------------------------------------------------------===//
-
-def MOComposite_ReduceRMSNormRoPEOp : MO_CompositeOp<"rms_norm_rope", [
-  Pure,
-  MO_SingleDevice,
-  MO_ParamDeclaration,
-]> {
-  let hasVerifier = 1;
-  let summary = "Fused RMS normalization with Rotary Position Embedding";
-  let description = [{
-      normed = rms_norm(input, weight, epsilon, weight_offset)
-      x1, x2 = split(normed, axis=-1)
-      rotated = concat(-x2, x1, axis=-1)
-      result = normed * cos_vals + rotated * sin_vals
-
-    Example:
-
-    ```mlir
-      %result = mo.composite.rms_norm_rope(%input, %weight, %cos_vals,
-                                           %sin_vals)
-        {epsilon = #M.dense_array<9.99999997E-7> : tensor<f32>,
-         weight_offset = #M.dense_array<0.0> : tensor<f32>,
-         multiply_before_cast = false} :
-        (!mo.tensor<[2, 3, 128], bf16, gpu:0>, !mo.tensor<[128], bf16, gpu:0>,
-         !mo.tensor<[2, 3, 128], f32, gpu:0>, !mo.tensor<[2, 3, 128], f32, gpu:0>)
-        -> !mo.tensor<[2, 3, 128], bf16, gpu:0>
-    ```
-  }];
-
-  let arguments = (ins
-    MO_Tensor:$input,
-    MO_Tensor:$weight,
-    MO_Tensor:$cosVals,
-    MO_Tensor:$sinVals,
-    MO_F32ScalarAttr:$epsilon,
-    MO_F32ScalarAttr:$weight_offset,
-    BoolAttr:$multiply_before_cast,
-    MO_ParamDecls:$outputParamDecls
-  );
-  let results = (outs MO_Tensor:$result);
-  let assemblyFormat = [{
-    `` custom<ParamDecls>($outputParamDecls) `(` operands `)`
-    `{` `epsilon` `=` $epsilon `,` `weight_offset` `=` $weight_offset `,`
-    `multiply_before_cast` `=` $multiply_before_cast `}` attr-dict `:`
-    functional-type(operands, results)
-  }];
-}
-
-//===----------------------------------------------------------------------===//
 // RopeRaggedOp
 //===----------------------------------------------------------------------===//
 
@@ -272,54 +222,6 @@ def MOComposite_LayerNormRopeRaggedOp : MO_CompositeOp<"layer_norm_rope_ragged",
 }
 
 //===----------------------------------------------------------------------===//
-// ReduceRMSNormFusedResidualAddOp
-//===----------------------------------------------------------------------===//
-
-def MOComposite_ReduceRMSNormFusedResidualAddOp : MO_CompositeOp<"rms_norm_fused_residual_add", [
-  Pure,
-  MO_SingleDevice,
-  MO_ParamDeclaration,
-]> {
-  let summary = "Fused RMS norm with residual add operation";
-  let description = [{
-      intermediate = rms_norm(input, gamma1, epsilon1, weight_offset1) + residual_input
-      output = rms_norm(intermediate, gamma2, epsilon2, weight_offset2)
-
-    Example:
-
-    ```mlir
-      %output, %intermediate = mo.composite.rms_norm_fused_residual_add(
-          %input, %residual, %gamma1, %gamma2) {
-          epsilon1 = #M.dense_array<9.99999997E-7> : tensor<f32>, ...,
-          multiply_before_cast = false} :
-        (...) -> (!mo.tensor<[3, 2], f32>, !mo.tensor<[3, 2], f32>)
-    ```
-  }];
-
-  let arguments = (ins
-    MO_Tensor:$input,
-    MO_Tensor:$residualInput,
-    MO_Tensor:$gamma1,
-    MO_Tensor:$gamma2,
-    MO_F32ScalarAttr:$epsilon1,
-    MO_F32ScalarAttr:$epsilon2,
-    MO_F32ScalarAttr:$weight_offset1,
-    MO_F32ScalarAttr:$weight_offset2,
-    BoolAttr:$multiply_before_cast,
-    MO_ParamDecls:$outputParamDecls
-  );
-  let results = (outs MO_Tensor:$output, MO_Tensor:$intermediate);
-  let assemblyFormat = [{
-    `` custom<ParamDecls>($outputParamDecls) `(` operands `)`
-    `{` `epsilon1` `=` $epsilon1 `,` `epsilon2` `=` $epsilon2 `,`
-    `weight_offset1` `=` $weight_offset1 `,`
-    `weight_offset2` `=` $weight_offset2 `,`
-    `multiply_before_cast` `=` $multiply_before_cast `}` attr-dict `:`
-    functional-type(operands, results)
-  }];
-}
-
-//===----------------------------------------------------------------------===//
 // RMSNormResidualAddOp
 //===----------------------------------------------------------------------===//
 
@@ -334,8 +236,7 @@ def MOComposite_RMSNormResidualAddOp : MO_CompositeOp<"rms_norm_residual_add", [
       output = rms_norm(intermediate, gamma, epsilon, weight_offset)
 
     The transformer/mamba pre-norm boundary, where `intermediate` is the next
-    block's residual. Unlike `rms_norm_fused_residual_add`, `input` is not
-    normalized first.
+    block's residual.
 
     Example:
 
@@ -605,7 +506,9 @@ def MOComposite_RMSNormFusedQuantizeDynamicScaledFP8Op
                  {multiply_before_cast = true}
       output, scale = quantize_dynamic_scaled_float8(normed, scale_ub)
 
-    `scale` is per-token. GPU only.
+    `scale` is per-token. GPU only. A target that registers a kernel for it
+    runs that kernel; elsewhere `mo-tmp-decompose-composites` replaces it
+    with the ops it is made of.
   }];
 
   let arguments = (ins

@@ -28,9 +28,14 @@ from std.benchmark import (
 )
 from std.compile import compile_info
 from max.gpu import block_dim, global_idx, grid_dim
-from max.gpu.host import DeviceBuffer, DeviceContext, DeviceFunction
+from max.gpu.host import (
+    DeviceBuffer,
+    DeviceContext,
+    DeviceFunction,
+    GridBlockLaunchConfig,
+)
 from std.random import Random
-from std.utils import IndexList
+from std.utils.coord import Coord, DynamicCoord
 
 
 struct InitializationType(
@@ -77,10 +82,6 @@ struct InitializationType(
         self, mut encoder: Some[DeviceTypeEncoder], target: MutOpaquePointer[_]
     ):
         encoder.encode_fields[Self](self, target)
-
-    @staticmethod
-    def get_type_name() -> String:
-        return "InitializationType"
 
     def __init__(out self, value: Int):
         self._value = Int64(value)
@@ -216,13 +217,13 @@ def get_defined_shape[name: StaticString, default: StaticString]() -> List[Int]:
     return materialize[shape]()
 
 
-def int_list_to_tuple[x: List[Int]]() -> IndexList[len(x)]:
-    var t = IndexList[len(x)]()
+def int_list_to_tuple[x: List[Int]]() -> DynamicCoord[DType.int, len(x)]:
+    var t = Array[Int, len(x)](fill=0)
 
     comptime for i in range(len(x)):
         comptime xi = x[i]
         t[i] = xi
-    return t
+    return Coord(t)
 
 
 def _get_arg(handle: String) -> Optional[String]:
@@ -397,6 +398,7 @@ def init_vector_gpu[
     var tid = global_idx.x
     var stride = grid_dim.x * block_dim.x
 
+    @__allow_legacy_any_origin_fields
     def apply(values: SIMD[dtype, 4]) {mut tid, imm}:
         comptime for i in range(4):
             # Every store is guarded, not just the last: the launch rounds the
@@ -460,8 +462,10 @@ def init_vector_launch[
         Int32(length),
         init_type,
         value.or_else(0),
-        grid_dim=(num_blocks),
-        block_dim=(block_dim),
+        execution_config=GridBlockLaunchConfig(
+            grid_dim=(num_blocks),
+            block_dim=(block_dim),
+        ),
     )
 
 
@@ -476,6 +480,7 @@ def _init_block_scaled_scales_gpu[
     var tid = global_idx.x
     var stride = grid_dim.x * block_dim.x
 
+    @__allow_legacy_any_origin_fields
     def apply(values: SIMD[dtype, 4]) {mut tid, imm}:
         comptime for i in range(4):
             # Same short-buffer guard as `init_vector_gpu`: the last store's
@@ -511,8 +516,10 @@ def _init_block_scaled_scales_launch[
     context.enqueue_function[kernel](
         out_device,
         Int32(length),
-        grid_dim=(num_blocks),
-        block_dim=(block_dim),
+        execution_config=GridBlockLaunchConfig(
+            grid_dim=(num_blocks),
+            block_dim=(block_dim),
+        ),
     )
 
 

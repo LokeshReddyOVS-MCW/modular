@@ -208,8 +208,10 @@ OptionalParseResult KGEN::parseOptionalSignatureValues(
   // for interfaces.
   auto effectsValue = impl::FnEffects::None;
   StringRef kw;
-  while (succeeded(p.parseOptionalKeyword(
-      &kw, {"throws", "async", "refresult", "register_passable", "cabi"}))) {
+  // Deliberately not parsing "unresolved" effect: those should not be leaked
+  // into IR.
+  while (succeeded(
+      p.parseOptionalKeyword(&kw, {"throws", "async", "refresult", "cabi"}))) {
     effectsValue |= *impl::symbolizeFnEffects(kw);
 
     // No vertical bar? We're done. It's not a parse error, but it does mean we
@@ -443,9 +445,6 @@ void KGENParamPrinter::printStructBody(AsmPrinter &p, StructType type) {
   }
 
   printIsMemoryOnly(p, type.getIsMemoryOnly());
-
-  if (type.getIsParamPack())
-    p << " isParamPack";
 
   if (type.isLayoutDomain() && !printsAsTypes)
     p << " layout";
@@ -1146,18 +1145,19 @@ ParseResult KGEN::parseParamsBindingArray(AsmParser &p, GeneratorType genType,
     if (failed(p.parseOptionalComma()))
       break;
     Type remappedDeclType = evaluator.getReboundType(inputType);
-    Type valueType;
-    TypedAttr value;
-    if (parseColonTypeOrDefault(p, valueType, remappedDeclType) ||
-        parseParamValue(p, value, valueType))
-      return failure();
-    if (::isa<UnboundAttr>(value)) {
+    // A '?' leaves the input unbound.
+    if (succeeded(p.parseOptionalQuestion())) {
       paramValues.push_back(TypedAttr());
       auto residual = ParamIndexRefAttr::get(
           /*depth=*/0, numUnboundParams++, remappedDeclType);
       evaluator.appendIndexBinding(residual);
       continue;
     }
+    Type valueType;
+    TypedAttr value;
+    if (parseColonTypeOrDefault(p, valueType, remappedDeclType) ||
+        parseParamValue(p, value, valueType))
+      return failure();
     paramValues.push_back(value);
     evaluator.appendIndexBinding(plusOneAdjuster.replace(value));
   }
@@ -1446,12 +1446,6 @@ ParseResult KGEN::parseParamValue(AsmParser &p, TypedAttr &value, Type type,
     return success();
   }
 
-  // A '?' represents an unknown parameter.
-  if (succeeded(p.parseOptionalQuestion())) {
-    value = UnboundAttr::get(type);
-    return success();
-  }
-
   // Barewords / MLIR keywords are implicitly parameter declaration references
   // or the start of a expression in function form.
   StringRef keyword;
@@ -1544,12 +1538,8 @@ ParseResult KGEN::parseParamValue(AsmParser &p, TypedAttr &value, Type type,
           return failure();
         if (p.parseRParen())
           return failure();
-        value =
-            BindParamsAttr::get(p.getContext(), generator, params, discharged);
-        if (!isEqualCanon(value.getType(), type))
-          return p.emitError(loc)
-                 << "bind_params result type mismatch: expected " << type
-                 << " but inferred " << value.getType();
+        value = BindParamsAttr::get(p.getContext(), generator, params,
+                                    discharged, type);
         return success();
       }
 
@@ -1870,11 +1860,6 @@ void KGENParamPrinter::printParamValueImpl(AsmPrinter &p, TypedAttr value,
 
   if (isa<SingletonAttr>(value)) {
     p << "*()";
-    return;
-  }
-
-  if (isa<UnboundAttr>(value)) {
-    p << '?';
     return;
   }
 

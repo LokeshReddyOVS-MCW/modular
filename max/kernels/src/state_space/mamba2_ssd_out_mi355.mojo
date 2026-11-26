@@ -57,7 +57,7 @@ from max.gpu import (
     thread_idx,
 )
 from max.gpu.compute.mma import mma
-from max.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext, GridBlockLaunchConfig
 from max.gpu.intrinsics import ds_read_tr16_b64
 from max.gpu.memory import AddressSpace, external_memory
 from max.gpu.sync import barrier, s_waitcnt
@@ -163,10 +163,6 @@ struct SsdMi355Params(DevicePassable, ImplicitlyCopyable):
         self, mut encoder: Some[DeviceTypeEncoder], target: MutOpaquePointer[_]
     ):
         encoder.encode_fields[Self](self, target)
-
-    @staticmethod
-    def get_type_name() -> String:
-        return "SsdMi355Params"
 
 
 @fieldwise_init
@@ -294,7 +290,7 @@ def tr_frag(base: Lds, row0: Int, row1: Int, pitch: Int, col: Int) -> Frag:
 def wait_count(word: LPtr[UInt32], target: Int):
     """Spins until the count reaches `target`, sleeping between polls so a
     waiting wave leaves the LDS and the issue slots to the working ones."""
-    while Int(LdsAtomic.load[ordering=Ordering.ACQUIRE](word)) < target:
+    while Int(LdsAtomic.load[ordering=.acquire](word)) < target:
         llvm_intrinsic["llvm.amdgcn.s.sleep", NoneType](Int32(1))
 
 
@@ -305,7 +301,7 @@ def arrive(word: LPtr[UInt32]):
     wave's operations in order, so device loads and stores stay in flight."""
     s_waitcnt[lgkmcnt=0]()
     if lane_id() == 0:
-        _ = LdsAtomic.fetch_add[ordering=Ordering.RELEASE](word, UInt32(1))
+        _ = LdsAtomic.fetch_add[ordering=.release](word, UInt32(1))
 
 
 struct Ring[depth: Int, producers: Int, consumers: Int](Movable):
@@ -807,5 +803,10 @@ def ssd_out_mi355(
         resident_workgroups[ssd_out_mi355_kernel](ctx, OUT_LDS),
     )
     ctx.enqueue_function[ssd_out_mi355_kernel](
-        params, grid_dim=grid, block_dim=THREADS, shared_mem_bytes=OUT_LDS
+        params,
+        execution_config=GridBlockLaunchConfig(
+            grid_dim=grid,
+            block_dim=THREADS,
+            shared_mem_bytes=OUT_LDS,
+        ),
     )

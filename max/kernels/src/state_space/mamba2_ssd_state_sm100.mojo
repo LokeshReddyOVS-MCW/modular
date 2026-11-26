@@ -150,10 +150,6 @@ struct SsdStateParams(DevicePassable, ImplicitlyCopyable):
     ):
         encoder.encode_fields[Self](self, target)
 
-    @staticmethod
-    def get_type_name() -> String:
-        return "SsdStateParams"
-
 
 comptime StPtr = Pointer[SsdStateParams, ImmUntrackedOrigin]
 
@@ -583,10 +579,10 @@ def ssd_state_sm100(
     )
     var items = slots * (nheads // HP)
     ctx.enqueue_function[ssd_state_sm100_kernel](
-        GridBlockLaunchConfig(
+        params,
+        execution_config=GridBlockLaunchConfig(
             grid_dim=min(SMS, items),
             block_dim=THREADS,
             shared_mem_bytes=SMEM_BYTES,
         ),
-        params,
     )

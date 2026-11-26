@@ -26,13 +26,12 @@ from layout import (
     Coord,
     Idx,
     TileTensor,
-    coord_to_index_list,
     row_major,
 )
 from max.gpu.host import DeviceContext
 from std.testing import assert_almost_equal
 
-from std.utils import IndexList
+from std.utils.coord import DynamicCoord
 from std.utils.numerics import min_or_neg_inf
 
 
@@ -64,18 +63,18 @@ def bench_stencil_avg_pool[
     comptime rank = 4
     comptime dilation = 1
     comptime stencil_rank = 2
+    comptime StencilPoint = DynamicCoord[DType.int, stencil_rank]
     comptime simd_width = 1
 
     comptime output_height = input_height - pool_window_h + 1
     comptime output_width = input_width - pool_window_w + 1
     comptime input_size = 1 * input_height * input_width * num_channels
     comptime output_size = 1 * output_height * output_width * num_channels
-    comptime dynamic_input_shape = (1, input_height, input_width, num_channels)
-    comptime dynamic_output_shape = (
-        1,
-        output_height,
-        output_width,
-        num_channels,
+    comptime dynamic_input_shape = Coord(
+        1, input_height, input_width, num_channels
+    )
+    comptime dynamic_output_shape = Coord(
+        1, output_height, output_width, num_channels
     )
 
     # Create host buffers
@@ -127,10 +126,10 @@ def bench_stencil_avg_pool[
     ctx.enqueue_copy(d_output_buf, h_output.ptr)
 
     def map_fn_gpu(
-        point: IndexList[stencil_rank, ...],
-    ) {} -> Tuple[IndexList[stencil_rank], IndexList[stencil_rank]]:
-        var lower_bound = IndexList[stencil_rank](point[0], point[1])
-        var upper_bound = IndexList[stencil_rank](
+        point: StencilPoint,
+    ) {} -> Tuple[StencilPoint, StencilPoint]:
+        var lower_bound = StencilPoint(point[0], point[1])
+        var upper_bound = StencilPoint(
             point[0] + pool_window_h, point[1] + pool_window_w
         )
         return lower_bound, upper_bound
@@ -167,22 +166,16 @@ def bench_stencil_avg_pool[
         var res = val / Scalar[dtype](pool_window_h * pool_window_w)
         d_output.store(point, res)
 
-    var out_shape = rebind[IndexList[rank]](
-        coord_to_index_list(d_output.layout.shape_coord())
-    )
-    var in_shape = rebind[IndexList[rank]](
-        coord_to_index_list(d_input.layout.shape_coord())
-    )
+    var out_shape = d_output.layout.shape_coord()
+    var in_shape = d_input.layout.shape_coord()
 
     @inline(.always)
     def kernel_launch(
         ctx: DeviceContext[],
     ) raises {imm}:
-        comptime stencil_axis = IndexList[stencil_rank](1, 2)
         stencil_gpu[
             rank,
             stencil_rank,
-            stencil_axis,
             simd_width,
             dtype,
         ](
@@ -202,10 +195,10 @@ def bench_stencil_avg_pool[
         bencher_iter_custom(b, kernel_launch, ctx)
 
     def map_fn_cpu(
-        point: IndexList[stencil_rank, ...],
-    ) {} -> Tuple[IndexList[stencil_rank], IndexList[stencil_rank]]:
-        var lower_bound = IndexList[stencil_rank](point[0], point[1])
-        var upper_bound = IndexList[stencil_rank](
+        point: StencilPoint,
+    ) {} -> Tuple[StencilPoint, StencilPoint]:
+        var lower_bound = StencilPoint(point[0], point[1])
+        var upper_bound = StencilPoint(
             point[0] + pool_window_h, point[1] + pool_window_w
         )
         return lower_bound, upper_bound
@@ -246,11 +239,9 @@ def bench_stencil_avg_pool[
     def bench_cpu(mut b: Bencher) {imm}:
         @inline(.always)
         def kernel_launch() {imm}:
-            comptime stencil_axis = IndexList[stencil_rank](1, 2)
             stencil[
                 rank,
                 stencil_rank,
-                stencil_axis,
                 simd_width,
                 dtype,
             ](
@@ -323,18 +314,18 @@ def bench_stencil_max_pool[
     comptime rank = 4
     comptime dilation = 1
     comptime stencil_rank = 2
+    comptime StencilPoint = DynamicCoord[DType.int, stencil_rank]
     comptime simd_width = 1
 
     comptime output_height = input_height - pool_window_h + 1
     comptime output_width = input_width - pool_window_w + 1
     comptime input_size = 1 * input_height * input_width * num_channels
     comptime output_size = 1 * output_height * output_width * num_channels
-    comptime dynamic_input_shape = (1, input_height, input_width, num_channels)
-    comptime dynamic_output_shape = (
-        1,
-        output_height,
-        output_width,
-        num_channels,
+    comptime dynamic_input_shape = Coord(
+        1, input_height, input_width, num_channels
+    )
+    comptime dynamic_output_shape = Coord(
+        1, output_height, output_width, num_channels
     )
 
     # Create host buffers
@@ -386,10 +377,10 @@ def bench_stencil_max_pool[
     ctx.enqueue_copy(d_output_buf, h_output.ptr)
 
     def map_fn_gpu(
-        point: IndexList[stencil_rank, ...],
-    ) {} -> Tuple[IndexList[stencil_rank], IndexList[stencil_rank]]:
-        var lower_bound = IndexList[stencil_rank](point[0], point[1])
-        var upper_bound = IndexList[stencil_rank](
+        point: StencilPoint,
+    ) {} -> Tuple[StencilPoint, StencilPoint]:
+        var lower_bound = StencilPoint(point[0], point[1])
+        var upper_bound = StencilPoint(
             point[0] + pool_window_h, point[1] + pool_window_w
         )
         return lower_bound, upper_bound
@@ -425,22 +416,16 @@ def bench_stencil_max_pool[
     ](point: Coord, val: SIMD[dtype, simd_width]) {var d_output,}:
         d_output.store(point, val)
 
-    var out_shape = rebind[IndexList[rank]](
-        coord_to_index_list(d_output.layout.shape_coord())
-    )
-    var in_shape = rebind[IndexList[rank]](
-        coord_to_index_list(d_input.layout.shape_coord())
-    )
+    var out_shape = d_output.layout.shape_coord()
+    var in_shape = d_input.layout.shape_coord()
 
     @inline(.always)
     def kernel_launch(
         ctx: DeviceContext[],
     ) raises {imm}:
-        comptime stencil_axis = IndexList[stencil_rank](1, 2)
         stencil_gpu[
             rank,
             stencil_rank,
-            stencil_axis,
             simd_width,
             dtype,
         ](
@@ -460,10 +445,10 @@ def bench_stencil_max_pool[
         bencher_iter_custom(b, kernel_launch, ctx)
 
     def map_fn_cpu(
-        point: IndexList[stencil_rank, ...],
-    ) {} -> Tuple[IndexList[stencil_rank], IndexList[stencil_rank]]:
-        var lower_bound = IndexList[stencil_rank](point[0], point[1])
-        var upper_bound = IndexList[stencil_rank](
+        point: StencilPoint,
+    ) {} -> Tuple[StencilPoint, StencilPoint]:
+        var lower_bound = StencilPoint(point[0], point[1])
+        var upper_bound = StencilPoint(
             point[0] + pool_window_h, point[1] + pool_window_w
         )
         return lower_bound, upper_bound
@@ -503,11 +488,9 @@ def bench_stencil_max_pool[
     def bench_cpu(mut b: Bencher) {imm}:
         @inline(.always)
         def kernel_launch() {imm}:
-            comptime stencil_axis = IndexList[stencil_rank](1, 2)
             stencil[
                 rank,
                 stencil_rank,
-                stencil_axis,
                 simd_width,
                 dtype,
             ](
@@ -577,6 +560,7 @@ def bench_stencil_avg_pool_padded[
 ](ctx: DeviceContext[], mut m: Bench) raises:
     comptime rank = 4
     comptime stencil_rank = 2
+    comptime StencilPoint = DynamicCoord[DType.int, stencil_rank]
     comptime simd_width = 1
     comptime dilation = 1
 
@@ -584,8 +568,8 @@ def bench_stencil_avg_pool_padded[
     comptime output_width = input_width - pool_window_w + pad_w * 2 + 1
     comptime input_size = 1 * input_height * input_width * 1
     comptime output_size = 1 * output_height * output_width * 1
-    var dynamic_input_shape = (1, input_height, input_width, 1)
-    comptime dynamic_output_shape = (1, output_height, output_width, 1)
+    var dynamic_input_shape = Coord(1, input_height, input_width, 1)
+    comptime dynamic_output_shape = Coord(1, output_height, output_width, 1)
 
     # Create host buffers
     var h_input_ptr = List(length=input_size, fill=Scalar[dtype](0))
@@ -626,12 +610,10 @@ def bench_stencil_avg_pool_padded[
     ctx.enqueue_copy(d_output_buf, h_output.ptr)
 
     def map_fn_gpu(
-        point: IndexList[stencil_rank, ...],
-    ) {} -> Tuple[IndexList[stencil_rank], IndexList[stencil_rank]]:
-        var lower_bound = IndexList[stencil_rank](
-            point[0] - pad_h, point[1] - pad_w
-        )
-        var upper_bound = IndexList[stencil_rank](
+        point: StencilPoint,
+    ) {} -> Tuple[StencilPoint, StencilPoint]:
+        var lower_bound = StencilPoint(point[0] - pad_h, point[1] - pad_w)
+        var upper_bound = StencilPoint(
             point[0] + pool_window_h - pad_h, point[1] + pool_window_w - pad_w
         )
         return lower_bound, upper_bound
@@ -668,22 +650,16 @@ def bench_stencil_avg_pool_padded[
         var res = val / Scalar[dtype](pool_window_h * pool_window_w)
         d_output.store(point, res)
 
-    var out_shape = rebind[IndexList[rank]](
-        coord_to_index_list(d_output.layout.shape_coord())
-    )
-    var in_shape = rebind[IndexList[rank]](
-        coord_to_index_list(d_input.layout.shape_coord())
-    )
+    var out_shape = d_output.layout.shape_coord()
+    var in_shape = d_input.layout.shape_coord()
 
     @inline(.always)
     def kernel_launch(
         ctx: DeviceContext[],
     ) raises {imm}:
-        comptime stencil_axis = IndexList[stencil_rank](1, 2)
         stencil_gpu[
             rank,
             stencil_rank,
-            stencil_axis,
             simd_width,
             dtype,
         ](
@@ -703,12 +679,10 @@ def bench_stencil_avg_pool_padded[
         bencher_iter_custom(b, kernel_launch, ctx)
 
     def map_fn_cpu(
-        point: IndexList[stencil_rank, ...],
-    ) {} -> Tuple[IndexList[stencil_rank], IndexList[stencil_rank]]:
-        var lower_bound = IndexList[stencil_rank](
-            point[0] - pad_h, point[1] - pad_w
-        )
-        var upper_bound = IndexList[stencil_rank](
+        point: StencilPoint,
+    ) {} -> Tuple[StencilPoint, StencilPoint]:
+        var lower_bound = StencilPoint(point[0] - pad_h, point[1] - pad_w)
+        var upper_bound = StencilPoint(
             point[0] + pool_window_h - pad_h, point[1] + pool_window_w - pad_w
         )
         return lower_bound, upper_bound
@@ -749,11 +723,9 @@ def bench_stencil_avg_pool_padded[
     def bench_cpu(mut b: Bencher) {imm}:
         @inline(.always)
         def kernel_launch() {imm}:
-            comptime stencil_axis = IndexList[stencil_rank](1, 2)
             stencil[
                 rank,
                 stencil_rank,
-                stencil_axis,
                 simd_width,
                 dtype,
             ](

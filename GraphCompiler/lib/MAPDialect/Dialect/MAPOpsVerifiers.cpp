@@ -214,26 +214,25 @@ static bool isPerRowShape(MOSH::ShapeAttr shape, MOSH::ShapeAttr full,
   return true;
 }
 
-// A store in a map phase writes a per-element tensor; one outside the phases
-// writes a per-row tensor at the row index. Folds check their own bodies.
+// A store in a phase that stores elements writes a per-element tensor; one
+// outside the phases writes a per-row tensor at the row index. Folds check
+// their own bodies.
 static LogicalResult verifyRowwiseStores(RowwiseOpInterface rowwise) {
   Operation *op = rowwise.getOperation();
   MOSH::ShapeAttr shape = rowwise.getShape();
   int64_t axis = rowwise.getAxis();
   BlockArgument row = rowwise.getRowArg();
   WalkResult result = op->getRegion(0).walk([&](StoreOp store) {
-    Operation *phase = store->getParentOp();
-    while (phase != op && !isa<RowwisePhaseOpInterface>(phase))
-      phase = phase->getParentOp();
-    if (isa<IterReduceOp>(phase))
+    auto phase = store->getParentOfType<RowwisePhaseOpInterface>();
+    if (phase && !phase->hasTrait<StoresElements>())
       return WalkResult::advance();
     MOSH::ShapeAttr target =
         MO::castFromTensorLike(store.getTensor().getType()).getShape();
-    if (isa<IterMapOp>(phase)) {
+    if (phase) {
       if (target == shape)
         return WalkResult::advance();
-      store.emitOpError() << "in a map phase must write a tensor of the "
-                             "rowwise shape";
+      store.emitOpError() << "in a map phase or a cache must write a tensor "
+                             "of the rowwise shape";
       return WalkResult::interrupt();
     }
     if (target == shape) {
@@ -445,15 +444,87 @@ LogicalResult IterTileLoadOp::verify() {
   return mlir::success();
 }
 
+// A phase that writes every element stores only at its own index.
+static LogicalResult verifyElementStores(RowwisePhaseOpInterface phase) {
+  WalkResult stores =
+      phase->getRegion(0).walk<WalkOrder::PreOrder>([&](StoreOp store) {
+        return store.getIndex() == phase.getIndexArg()
+                   ? WalkResult::advance()
+                   : WalkResult::interrupt();
+      });
+  if (stores.wasInterrupted())
+    return phase->emitOpError() << "must store at its own index";
+  return mlir::success();
+}
+
 LogicalResult IterMapOp::verify() {
   if (failed(verifyPhaseIndex(*this)))
     return mlir::failure();
-  WalkResult stores = getBody().walk([&](StoreOp store) {
-    return store.getIndex() == getIndexArg() ? WalkResult::advance()
-                                             : WalkResult::interrupt();
+  return verifyElementStores(*this);
+}
+
+//===----------------------------------------------------------------------===//
+// map.iter.cache
+//===----------------------------------------------------------------------===//
+
+LogicalResult IterCacheOp::verify() {
+  if (failed(verifyPhaseIndex(*this)))
+    return mlir::failure();
+  Block &body = getBody().front();
+  auto yield = body.empty() ? YieldOp() : llvm::dyn_cast<YieldOp>(body.back());
+  if (!yield || yield.getNumOperands() != 1 ||
+      yield.getOperand(0).getType() != getType())
+    return emitOpError() << "body must yield one value of the result type";
+  if (!isScalarType(getType()))
+    return emitOpError() << "must cache a scalar, got " << getType();
+  if (failed(verifyElementStores(*this)))
+    return mlir::failure();
+  // The Row API caches only in a body that folds the tile (one launch phase
+  // per such fold) and writes every element.
+  auto tileFold = [](Operation &op) {
+    auto fold = dyn_cast<IterReduceOp>(op);
+    return fold && !cast<RowwisePhaseOpInterface>(*fold).getReadCache();
+  };
+  Block *row = getOperation()->getBlock();
+  if (!llvm::any_of(
+          llvm::make_range(row->begin(), getOperation()->getIterator()),
+          tileFold))
+    return emitOpError() << "must follow a fold of the tile";
+  if (!llvm::any_of(llvm::make_range(std::next(getOperation()->getIterator()),
+                                     row->end()),
+                    llvm::IsaPred<IterMapOp>))
+    return emitOpError() << "must be followed by a map phase";
+  return mlir::success();
+}
+
+//===----------------------------------------------------------------------===//
+// map.iter.cache.load
+//===----------------------------------------------------------------------===//
+
+LogicalResult IterCacheLoadOp::verify() {
+  auto cache = getCache().getDefiningOp<IterCacheOp>();
+  if (!cache)
+    return emitOpError() << "reads a value that isn't a map.iter.cache";
+  auto phase = getOperation()->getParentOfType<RowwisePhaseOpInterface>();
+  if (!phase || isa<IterCacheOp>(*phase))
+    return emitOpError() << "must be in a fold or a map phase";
+  if (getIndex() != phase.getIndexArg())
+    return emitOpError() << "must read at its phase's index";
+  if (getOffset() != 0 && !cache.getShared())
+    return emitOpError() << "reads another element of a cache that isn't "
+                            "shared";
+  // The phase's closure gets either the tile or one cache as its argument.
+  WalkResult other = phase->walk<WalkOrder::PreOrder>([&](Operation *op) {
+    if (isa<IterTileLoadOp>(op))
+      return WalkResult::interrupt();
+    if (auto load = dyn_cast<IterCacheLoadOp>(op);
+        load && load.getCache() != getCache())
+      return WalkResult::interrupt();
+    return WalkResult::advance();
   });
-  if (stores.wasInterrupted())
-    return emitOpError() << "must store at its own index";
+  if (other.wasInterrupted())
+    return emitOpError() << "must be the only source of its phase: it reads "
+                            "the tile or another cache too";
   return mlir::success();
 }
 
@@ -523,7 +594,8 @@ LogicalResult SliceIndexOp::verify() {
 // own index, the tensor the kernel hands the epilogue; at a foreach's loop
 // index (the last argument, or the first once outlined), its loop shape; at a
 // select body's argument, that select's out-shape; at a concat select
-// region's argument, its input's shape. Null elsewhere.
+// region's argument, its input's shape; at a rowwise phase's index, the
+// rowwise shape. Null elsewhere.
 static MOSH::ShapeAttr getIndexedShape(Value index) {
   auto arg = llvm::dyn_cast<BlockArgument>(index);
   if (!arg)
@@ -539,8 +611,10 @@ static MOSH::ShapeAttr getIndexedShape(Value index) {
                                                         : MOSH::ShapeAttr();
   if (auto body = llvm::dyn_cast<IterElementwiseBodyOp>(owner))
     return arg.getArgNumber() == 0 ? body.getShape() : MOSH::ShapeAttr();
-  if (auto fold = llvm::dyn_cast<IterReduceOp>(owner)) {
-    Operation *rowwise = fold->getParentOp();
+  if (auto phase = llvm::dyn_cast<RowwisePhaseOpInterface>(owner)) {
+    if (arg != phase.getIndexArg())
+      return {};
+    Operation *rowwise = phase->getParentOp();
     if (auto op = llvm::dyn_cast<IterRowwiseOp>(rowwise))
       return op.getShape();
     if (auto body = llvm::dyn_cast<IterRowwiseBodyOp>(rowwise))
@@ -645,16 +719,16 @@ LogicalResult ConcatSelectOp::verify() {
 
   // The select runs at the loaded vector's first index, so the index must run
   // along the out-shape's innermost dim with the vector: a loop index, a
-  // fold's index or an enclosing select's argument, never one an index op
-  // computed.
+  // rowwise phase's index or an enclosing select's argument, never one an
+  // index op computed or an epilogue's.
   auto arg = dyn_cast<BlockArgument>(getIndex());
   MOSH::ShapeAttr indexed;
-  if (arg && isa<IterElementwiseOp, IterElementwiseBodyOp, IterReduceOp,
-                 SliceSelectOp, ConcatSelectOp>(arg.getOwner()->getParentOp()))
+  if (arg && !isa<IterEpilogueOp>(arg.getOwner()->getParentOp()))
     indexed = getIndexedShape(arg);
   if (!indexed)
-    return emitOpError() << "index must be its foreach's loop index, a fold's "
-                            "index or an enclosing select's argument";
+    return emitOpError() << "index must be its foreach's loop index, a "
+                            "rowwise phase's index or an enclosing select's "
+                            "argument";
   if (indexed != spec.getResultShape())
     return emitOpError() << "spec's out-shape " << spec.getResultShape()
                          << " does not match the shape " << indexed
@@ -814,6 +888,20 @@ LogicalResult ReshapeStrideOp::verify() {
 // map.index.transpose
 //===----------------------------------------------------------------------===//
 
+static LogicalResult verifyTransposePermutations(Operation *op,
+                                                 TransposeSpecAttr spec,
+                                                 Value permutations) {
+  bool isStatic =
+      llvm::none_of(spec.getPerm().asArrayRef(), ShapedType::isDynamic);
+  if (isStatic == static_cast<bool>(permutations))
+    return op->emitOpError("takes a permutations operand only when some "
+                           "entry of the spec's perm is dynamic");
+  if (!permutations)
+    return mlir::success();
+  return verifySliceBoundsOperandsAreRank1(
+      op, {std::pair{"permutations", permutations}});
+}
+
 LogicalResult TransposeIndexOp::verify() {
   MAP::ViewSignatureAttr signature = getSpec().getSignature();
   auto indexTy = llvm::cast<IndexType>(getIndex().getType());
@@ -828,8 +916,8 @@ LogicalResult TransposeIndexOp::verify() {
                          << " does not match spec's in-shape rank "
                          << signature.getIn().getRank();
 
-  return verifySliceBoundsOperandsAreRank1(
-      getOperation(), {std::pair{"permutations", getPermutations()}});
+  return verifyTransposePermutations(getOperation(), getSpec(),
+                                     getPermutations());
 }
 
 //===----------------------------------------------------------------------===//
@@ -855,6 +943,60 @@ LogicalResult TransposeStrideOp::verify() {
                          << " does not match input element type "
                          << inputTy.getElementType();
 
-  return verifySliceBoundsOperandsAreRank1(
-      getOperation(), {std::pair{"permutations", getPermutations()}});
+  return verifyTransposePermutations(getOperation(), getSpec(),
+                                     getPermutations());
+}
+
+//===----------------------------------------------------------------------===//
+// map.index.collapse.stride
+//===----------------------------------------------------------------------===//
+
+LogicalResult CollapseStrideOp::verify() {
+  MAP::ViewSignatureAttr signature = getSignature();
+  MOSH::ShapeAttr in = signature.getIn();
+  MOSH::ShapeAttr out = signature.getOut();
+  auto inputTy = M::MO::castFromTensorLike(getInput().getType());
+  auto resultTy = llvm::cast<M::MO::TensorType>(getResult().getType());
+  if (inputTy.getShape() != in)
+    return emitOpError() << "input shape " << inputTy.getShape()
+                         << " does not match the in-shape " << in;
+  if (resultTy.getShape() != out)
+    return emitOpError() << "result shape " << resultTy.getShape()
+                         << " does not match the out-shape " << out;
+  if (resultTy.getElementType() != inputTy.getElementType())
+    return emitOpError() << "result element type " << resultTy.getElementType()
+                         << " does not match input element type "
+                         << inputTy.getElementType();
+
+  ArrayRef<int64_t> groups = getGroups();
+  if (groups.size() != out.getRank())
+    return emitOpError() << "expected one group per out dim, got "
+                         << groups.size() << " for rank " << out.getRank();
+  SmallVector<int64_t> inDims = in.getIntDims();
+  SmallVector<int64_t> outDims = out.getIntDims();
+  size_t first = 0;
+  for (auto [g, size] : llvm::enumerate(groups)) {
+    if (size < 1)
+      return emitOpError() << "group " << g << " is empty";
+    if (first + size > inDims.size())
+      return emitOpError() << "groups cover more than the in-shape's "
+                           << inDims.size() << " dims";
+    // Symbolic extents can't be multiplied out here; static ones must match.
+    ArrayRef<int64_t> dims = ArrayRef(inDims).slice(first, size);
+    if (llvm::none_of(dims, ShapedType::isDynamic) &&
+        !ShapedType::isDynamic(outDims[g])) {
+      int64_t product = 1;
+      for (int64_t dim : dims)
+        product *= dim;
+      if (product != outDims[g])
+        return emitOpError()
+               << "out dim " << g << " is " << outDims[g]
+               << ", not the product " << product << " of its group";
+    }
+    first += size;
+  }
+  if (first != inDims.size())
+    return emitOpError() << "groups cover " << first << " of the in-shape's "
+                         << inDims.size() << " dims";
+  return success();
 }

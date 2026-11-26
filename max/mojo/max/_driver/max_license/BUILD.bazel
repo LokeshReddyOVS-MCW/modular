@@ -3,8 +3,9 @@ load("//bazel:config.bzl", "TOP_LEVEL_TAG")
 
 package(default_visibility = ["//max:consumers"])
 
-# The HAL client API (`hal`), `machine`, and the HAL DeviceContext
-# (`device_context_hal`) compile as part of `max`, as `max._driver.max_license`.
+# The HAL client API (`hal`), `machine`, and the dispatching DeviceContext
+# (`device_context_dispatch`) compile as part of `max`, as
+# `max._driver.max_license`.
 # This package boundary hides them from //max/mojo/max's glob, so `max_srcs`
 # includes them through this filegroup.
 filegroup(
@@ -26,22 +27,11 @@ overlay_layer(
     strip_prefix = "max/mojo/",
 )
 
-# Points `max.gpu.host._overlay`, and through it `max.gpu.host`, at the HAL
-# DeviceContext. Shared: both this package's `max_srcs_hal` and a downstream
-# HAL max variant stack it over their own base (+ overlay) layers.
-overlay_layer(
-    name = "dcc_overlay",
-    file_map = {
-        "device_context_hal/_dcc_overlay.mojo": "max/gpu/host/_overlay.mojo",
-    },
-    visibility = ["//visibility:public"],
-)
-
 overlay_srcs(
     name = "max_srcs_hal",
     layers = [
         ":max_base_layer",
-        ":dcc_overlay",
+        "//max/mojo/max/_driver/max_license/hal_backend:hal_backend_layer",
     ],
 )
 

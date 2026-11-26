@@ -2,17 +2,17 @@
 
 module attributes {M.target_info = #M.target<triple="", arch="", features="", data_layout="", simd_bit_width=128>} {
   // CHECK-LABEL: @external_call
-  kgen.func @external_call(%a: !kgen.simd<1, ui32>, %b: !kgen.pointer<i32>) -> !kgen.simd<4, f64> {
+  kgen.func @external_call(%a: !kgen.simd<1, ui32>, %b: !kgen.pointer<scalar<si32>>) -> !kgen.simd<4, f64> {
     // CHECK: llvm.call @foo
     %0 = pop.external_call @foo(%a) : (!kgen.simd<1, ui32>) -> !kgen.simd<4, f64> <
       funcAttrs = ["noinline", "noreturn"],
       memory = #llvm.memory_effects<other = read, argMem = read, inaccessibleMem = read, errnoMem = none, targetMem0 = none, targetMem1 = none>
     >
     // CHECK: llvm.call @bar
-    %1 = pop.external_call @bar(%b) : (!kgen.pointer<i32>) -> i32 <argAttrs = [{llvm.noalias}], resAttrs = {llvm.signext}>
+    %1 = pop.external_call @bar(%b) : (!kgen.pointer<scalar<si32>>) -> !kgen.scalar<si32> <argAttrs = [{llvm.noalias}], resAttrs = {llvm.signext}>
 
     // CHECK: llvm.call @bar
-    %2 = pop.external_call @bar(%b) : (!kgen.pointer<i32>) -> i32 <argAttrs = [{llvm.noalias}], resAttrs = {llvm.signext}>
+    %2 = pop.external_call @bar(%b) : (!kgen.pointer<scalar<si32>>) -> !kgen.scalar<si32> <argAttrs = [{llvm.noalias}], resAttrs = {llvm.signext}>
     hlcf.return %0 : !kgen.simd<4, f64>
   }
   // CHECK: llvm.func @foo(i32) -> vector<4xf64>
@@ -58,6 +58,34 @@ module attributes {M.target_info = #M.target<triple="", arch="", features="", da
   }
 
   // CHECK-LABEL: llvm.mlir.global internal @my_alloc() {addr_space = 3 : i32, alignment = 4 : i64} : !llvm.array<2 x f32>
+}
+
+// -----
+
+// The alignment is a minimum: a global is at least as aligned as its element
+// type in memory, with or without an explicit alignment.
+module attributes {M.target_info = #M.target<triple="", arch="", features="", data_layout="", simd_bit_width=128>} {
+  // CHECK-LABEL: kgen.func @global_alloc_struct_natural_alignment
+  kgen.func @global_alloc_struct_natural_alignment() -> !kgen.pointer<struct<(array<8, scalar<f32>>)>, 3> {
+    %0 = pop.global_alloc "my_struct" 1 x !kgen.struct<(array<8, scalar<f32>>)> address_space 3
+    hlcf.return %0 : !kgen.pointer<struct<(array<8, scalar<f32>>)>, 3>
+  }
+
+  // CHECK-LABEL: kgen.func @global_alloc_struct_low_alignment
+  kgen.func @global_alloc_struct_low_alignment() -> !kgen.pointer<struct<(array<8, scalar<f32>>)>, 3> {
+    %0 = pop.global_alloc "my_low" 1 x !kgen.struct<(array<8, scalar<f32>>)> address_space 3 align 1
+    hlcf.return %0 : !kgen.pointer<struct<(array<8, scalar<f32>>)>, 3>
+  }
+
+  // CHECK-LABEL: kgen.func @global_alloc_struct_high_alignment
+  kgen.func @global_alloc_struct_high_alignment() -> !kgen.pointer<struct<(array<8, scalar<f32>>)>, 3> {
+    %0 = pop.global_alloc "my_high" 1 x !kgen.struct<(array<8, scalar<f32>>)> address_space 3 align 16
+    hlcf.return %0 : !kgen.pointer<struct<(array<8, scalar<f32>>)>, 3>
+  }
+
+  // CHECK-DAG: llvm.mlir.global internal @my_struct() {addr_space = 3 : i32, alignment = 4 : i64}
+  // CHECK-DAG: llvm.mlir.global internal @my_low() {addr_space = 3 : i32, alignment = 4 : i64}
+  // CHECK-DAG: llvm.mlir.global internal @my_high() {addr_space = 3 : i32, alignment = 16 : i64}
 }
 
 // -----

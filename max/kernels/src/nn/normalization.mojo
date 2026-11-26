@@ -657,20 +657,16 @@ def rms_norm_gpu_warp_tiling[
         comptime for c in range(chunks_per_thread):
             var col = (c * bdim + tid) * simd_width
             comptime if exact_fit:
-                base[rank - 1] = col
-                vec_data[c] = input_fn[simd_width](Coord(base)).cast[
-                    accum_type
-                ]()
+                base.replace_dynamic[rank - 1](col)
+                vec_data[c] = input_fn[simd_width](base).cast[accum_type]()
                 gamma_val[c] = gamma.load[width=simd_width, alignment=align](
                     (col,)
                 )
                 thread_m2 += (vec_data[c] ** 2).reduce_add()
             else:
                 if col < _num_cols:
-                    base[rank - 1] = col
-                    vec_data[c] = input_fn[simd_width](Coord(base)).cast[
-                        accum_type
-                    ]()
+                    base.replace_dynamic[rank - 1](col)
+                    vec_data[c] = input_fn[simd_width](base).cast[accum_type]()
                     gamma_val[c] = gamma.load[
                         width=simd_width, alignment=align
                     ]((col,))
@@ -701,12 +697,12 @@ def rms_norm_gpu_warp_tiling[
                     )
 
             comptime if exact_fit:
-                base[rank - 1] = col
-                output_fn[simd_width, align](Coord(base), _normalize())
+                base.replace_dynamic[rank - 1](col)
+                output_fn[simd_width, align](base, _normalize())
             else:
                 if col < _num_cols:
-                    base[rank - 1] = col
-                    output_fn[simd_width, align](Coord(base), _normalize())
+                    base.replace_dynamic[rank - 1](col)
+                    output_fn[simd_width, align](base, _normalize())
 
 
 @inline(.always)
@@ -896,16 +892,16 @@ def rms_norm_gpu[
         var shape, var output_fn
     } -> None:
         var indices = _get_start_indices_of_nth_subvolume_static(row, shape)
-        indices[rank - 1] = col
-        output_fn[simd_width, alignment](Coord(indices), val)
+        indices.replace_dynamic[rank - 1](col)
+        output_fn[simd_width, alignment](indices, val)
 
     @inline(.always)
     def input_fn_2d[
         simd_width: Int
     ](row: Int, col: Int) {var shape, var input_fn} -> SIMD[dtype, simd_width]:
         var indices = _get_start_indices_of_nth_subvolume_static(row, shape)
-        indices[rank - 1] = col
-        return input_fn[simd_width](Coord(indices))
+        indices.replace_dynamic[rank - 1](col)
+        return input_fn[simd_width](indices)
 
     comptime simd_width = simd_width_of[dtype, target=ctx.target]()
     comptime warp_size = ctx.default_device_info.warp_size
@@ -1356,8 +1352,8 @@ def rms_norm_cpu[
             var indices = _get_start_indices_of_nth_subvolume_static(
                 row_idx + row, shape
             )
-            indices[rank - 1] = col
-            output_fn[simd_width, alignment](Coord(indices), val)
+            indices.replace_dynamic[rank - 1](col)
+            output_fn[simd_width, alignment](indices, val)
 
         @inline(.always)
         def input_fn_2d[
@@ -1367,8 +1363,8 @@ def rms_norm_cpu[
             var indices = _get_start_indices_of_nth_subvolume_static(
                 row_idx + row, shape
             )
-            indices[rank - 1] = col
-            return input_fn[simd_width](Coord(indices))
+            indices.replace_dynamic[rank - 1](col)
+            return input_fn[simd_width](indices)
 
         rms_norm_cpu[
             epsilon=epsilon,
@@ -3085,8 +3081,8 @@ def rms_norm_quantize_dynamic_scaled_fp8[
     `output` is `[rows, num_cols]` FP8 and `scales` is
     `[num_cols // group_size, rows]` (row `r`'s scale for column group `g`
     at `scales[g, r]`; a padded trailing scale column is left untouched).
-    Per-token scales (`group_size == num_cols`) stay on
-    `rms_norm_fused_quantize_dynamic_scaled_fp8`.
+    Per-token scales (`group_size == num_cols`) take the graph compiler's
+    generated kernel instead.
     """
     comptime assert output.rank == 2, "expected rank-2 output"
     comptime assert scales.rank == 2, "expected rank-2 scales"
@@ -3146,7 +3142,7 @@ def rms_norm_quantize_dynamic_scaled_fp8[
             weight_offset,
             scale_ub.cast[scales_dtype](),
         )
-        ctx.enqueue_function(
+        ctx.enqueue_closure(
             kernel,
             grid_dim=(num_rows, 1, 1),
             block_dim=num_threads,

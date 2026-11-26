@@ -23,8 +23,10 @@ across a few small column counts (even + odd), on the inner axis and -- for the
 pure arbitrary-axis reductions -- on a non-inner axis, in bfloat16, float16 and
 float32 where precision makes it meaningful, plus a CPU-only 8-byte-element
 group (see :data:`WIDE_CPU_SPECS`) for what only the widest element can reach.
-``rms_norm``, ``softmax`` and ``logsoftmax`` also run on edge-case shapes
-(:data:`RMS_NORM_SPECS`, :data:`SOFTMAX_SPECS`): no rows, odd, many and long
+``rms_norm``, ``softmax``, ``logsoftmax`` and the residual rms_norm pair
+(``rms_norm(rms_norm(x) + residual)``) also run on edge-case shapes
+(:data:`RMS_NORM_SPECS`, :data:`SOFTMAX_SPECS`,
+:data:`RESIDUAL_RMS_NORM_SPECS`): no rows, odd, many and long
 rows (the GPU split-K and CPU split-axis tiers), and ranks 1 and 5; for
 ``rms_norm``, static row widths and both ``multiply_before_cast`` orders with a
 weight offset.
@@ -59,20 +61,26 @@ from _rowwise_reduction_specs import (
     GPU_SUBWORD_SPECS,
     INNER_SPECS,
     NONINNER_SPECS,
+    RESIDUAL_RMS_NORM_EPS2,
+    RESIDUAL_RMS_NORM_SPECS,
+    RESIDUAL_RMS_NORM_WEIGHT_OFFSET2,
     RMS_NORM_SPECS,
     RMS_NORM_WEIGHT_OFFSET,
     SOFTMAX_SPECS,
     WIDE_CPU_SPECS,
+    ResidualRmsNormSpec,
     RmsNormSpec,
     RowwiseSpec,
     SoftmaxSpec,
     build_graph,
+    build_residual_rms_norm_graph,
     build_rms_norm_graph,
     build_softmax_graph,
 )
 from max.driver import CPU, Buffer
 from max.dtype import DType
 from max.engine import InferenceSession, Model
+from max.graph import DeviceRef, Graph, TensorType, ops
 from test_common.reduction_graphs import LAYER_NORM_EPS, RMS_NORM_EPS
 
 # Ops whose output is integer indices.
@@ -458,6 +466,73 @@ def test_rms_norm_edges(session: InferenceSession, spec: RmsNormSpec) -> None:
         _assert_close(got, ref, "rms_norm", spec.dtype, f"shape={shape}")
 
 
+def _rms_norm_ref(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    offset: float,
+    multiply_before_cast: bool,
+) -> torch.Tensor:
+    """rms_norm in ``x``'s dtype, rounding where the kernel does."""
+    xf = x.to(torch.float32)
+    normed = xf * torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + eps)
+    if multiply_before_cast:
+        return (normed * (w.to(torch.float32) + offset)).to(x.dtype)
+    return normed.to(x.dtype) * (w + torch.tensor(offset, dtype=x.dtype))
+
+
+@pytest.mark.parametrize("spec", RESIDUAL_RMS_NORM_SPECS, ids=lambda s: s.name)
+def test_residual_rms_norm_edges(
+    session: InferenceSession, spec: ResidualRmsNormSpec
+) -> None:
+    model = session.load(build_residual_rms_norm_graph(spec))
+    # One generated kernel computes both norms, as the hand-written one did.
+    rowwise = [s for s in model.kernel_summaries if "Rowwise(" in s]
+    assert len(rowwise) == 1, model.kernel_summaries
+    shapes = (
+        [(rows, spec.static_cols) for rows in (3, 513)]
+        if spec.static_cols
+        else _EDGE_SHAPES[2]
+    )
+    for shape in shapes:
+        torch.manual_seed(0)
+        dtype = _torch_dtype(spec.dtype)
+        x = torch.randn(shape).to(dtype)
+        residual = torch.randn(shape).to(dtype)
+        w1 = _make_weight(1, shape[-1], spec.dtype)
+        w2 = _make_weight(2, shape[-1], spec.dtype)
+        outs = [_read_f32(b) for b in _feed(model, [x, residual, w1, w2])]
+        h = (
+            _rms_norm_ref(
+                x,
+                w1,
+                RMS_NORM_EPS,
+                RMS_NORM_WEIGHT_OFFSET,
+                spec.multiply_before_cast,
+            )
+            + residual
+        )
+        y = _rms_norm_ref(
+            h,
+            w2,
+            RESIDUAL_RMS_NORM_EPS2,
+            RESIDUAL_RMS_NORM_WEIGHT_OFFSET2,
+            spec.multiply_before_cast,
+        )
+        label = f"shape={shape}"
+        _assert_close(
+            outs[0], y.to(torch.float32).numpy(), "rms_norm", spec.dtype, label
+        )
+        if spec.sum_output:
+            _assert_close(
+                outs[1],
+                h.to(torch.float32).numpy(),
+                "rms_norm",
+                spec.dtype,
+                label,
+            )
+
+
 @pytest.mark.parametrize("spec", SOFTMAX_SPECS, ids=lambda s: s.name)
 def test_softmax_edges(session: InferenceSession, spec: SoftmaxSpec) -> None:
     model = session.load(build_softmax_graph(spec))
@@ -477,3 +552,37 @@ def test_softmax_edges(session: InferenceSession, spec: SoftmaxSpec) -> None:
             else torch.log_softmax(xf, dim=-1)
         ).numpy()
         _assert_close(got, ref, spec.op, spec.dtype, f"shape={shape}")
+
+
+@pytest.mark.parametrize("device", ["cpu", "gpu"])
+def test_per_row_output_next_to_a_map_phase(
+    session: InferenceSession, device: str
+) -> None:
+    """A sum the graph outputs, also read by a per-element and a per-row
+    consumer, fuses into one rowwise kernel: the per-row outputs are written
+    once per row, next to the map phase that writes every element."""
+    dev = DeviceRef.CPU() if device == "cpu" else DeviceRef.GPU()
+    x_t = TensorType(DType.float32, ["r", "c"], device=dev)
+    with Graph(f"per_row_output_{device}", input_types=[x_t]) as graph:
+        x = graph.inputs[0].tensor
+        s = ops.sum(x, axis=-1)
+        graph.output(x / s, s, s * 2.0)
+    model = session.load(graph)
+    # Without the fusion, the division runs in a kernel of its own.
+    summaries = model.kernel_summaries
+    rowwise = [k for k in summaries if "Rowwise(" in k]
+    assert len(rowwise) == 1, summaries
+    assert "mo.div" in rowwise[0] and "mo.mul" in rowwise[0], rowwise
+    assert sum("mo.div" in k for k in summaries) == 1, summaries
+
+    for shape in ((3, 129), (64, 4096)):
+        torch.manual_seed(0)
+        x_in = torch.randn(shape) + 2.0
+        y, s_out, t = (_read_f32(b) for b in _feed(model, [x_in]))
+        s_ref = x_in.sum(-1, keepdim=True).numpy()
+        label = f"device={device} shape={shape}"
+        np.testing.assert_allclose(s_out, s_ref, rtol=1e-4, err_msg=label)
+        np.testing.assert_allclose(t, s_ref * 2.0, rtol=1e-4, err_msg=label)
+        np.testing.assert_allclose(
+            y, x_in.numpy() / s_ref, rtol=1e-4, atol=1e-6, err_msg=label
+        )

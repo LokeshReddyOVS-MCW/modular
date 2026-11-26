@@ -52,11 +52,12 @@ static inline bool hasImplicitOrigin(ArgConvention conv) {
   case ArgConvention::Mut:
   case ArgConvention::ByRefResult:
   case ArgConvention::ByRefError:
-    return true;
   case ArgConvention::PackImmMem:
   case ArgConvention::PackMut:
   case ArgConvention::PackOwnedMem:
-    llvm_unreachable("pack conventions do not occur before LowerLIT");
+    return true;
+  case ArgConvention::Unresolved:
+    llvm_unreachable("invalid argument convention");
   }
   llvm_unreachable("invalid argument convention");
 }
@@ -115,12 +116,27 @@ public:
   bool isAsync() const { return get(Impl::Async); }
   bool isCABI() const { return get(Impl::CABI); }
   bool isRefResult() const { return get(Impl::RefResult); }
+  bool isUnresolved() const { return get(Impl::Unresolved); }
 
-  FnEffects setThrows(bool throws = true) { return set(Impl::Throws, throws); }
-  FnEffects setAsync(bool async = true) { return set(Impl::Async, async); }
-  FnEffects setCABI(bool value = true) { return set(Impl::CABI, value); }
+  FnEffects setThrows(bool throws = true) {
+    assert(!isUnresolved());
+    return set(Impl::Throws, throws);
+  }
+  FnEffects setAsync(bool async = true) {
+    assert(!isUnresolved());
+    return set(Impl::Async, async);
+  }
+  FnEffects setCABI(bool value = true) {
+    assert(!isUnresolved());
+    return set(Impl::CABI, value);
+  }
   FnEffects setRefResult(bool value = true) {
+    assert(!isUnresolved());
     return set(Impl::RefResult, value);
+  }
+  FnEffects setUnresolved(bool value = true) {
+    assert(impl == Impl::None);
+    return set(Impl::Unresolved, value);
   }
 
   bool operator==(FnEffects rhs) const { return getImpl() == rhs.getImpl(); }

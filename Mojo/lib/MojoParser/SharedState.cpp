@@ -445,6 +445,7 @@ SharedState::SharedState(llvm::SourceMgr &sourceMgr, MLIRContext *context,
       impl(std::make_unique<Impl>(*this)) {
   preloadAllKGENDialects(context);
   compilerCaches = KGEN::CompilerCaches::getOrCreate(context);
+  noAssumptions = KGEN::SIMDAttr::getScalarBool(context, true);
 
   // Record any existing buffers in the source manager.
   for (int i = 0, e = sourceMgr.getNumBuffers(); i < e; ++i) {
@@ -1119,6 +1120,10 @@ ASTType SharedState::getStandardCollectionType(llvm::SMLoc loc,
 
 ASTType SharedState::getBuiltinSliceType(llvm::SMLoc loc, StringRef name) {
   return getCachedBuiltinType({"std", "builtin", "builtin_slice"}, name, loc);
+}
+
+ASTType SharedState::getBuiltinEnumType(llvm::SMLoc loc, StringRef name) {
+  return getCachedBuiltinType({"std", "builtin", "_enum"}, name, loc);
 }
 
 ASTType SharedState::getBuiltinStubsMLIRType(llvm::SMLoc loc) {

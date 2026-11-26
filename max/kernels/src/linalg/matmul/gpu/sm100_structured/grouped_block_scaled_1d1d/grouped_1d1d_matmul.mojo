@@ -92,6 +92,9 @@ def grouped_matmul_block_scaled[
     TraceBufT: TraceBuf = NullTrace,
     swiglu_use_inplace: Bool = False,
     swiglu_inplace_token_per_lane: Bool = False,
+    # Find each CTA's first tile with a warp scan of the group slots (decode
+    # calls with more groups than routed rows); False keeps lane 0's walk.
+    first_tile_scan: Bool = False,
     RowScalesT: RowScales = NullRowScales,
     grid_scale: Int = 1,
 ](
@@ -152,6 +155,9 @@ def grouped_matmul_block_scaled[
             staging for NVFP4 when `swiglu_use_inplace=True`. Each lane
             quantizes and stores one token's scale-factor block. Ignored
             for MXFP8. Defaults to `False`.
+        first_tile_scan: When `True`, every warp finds its CTA's first
+            tile with a warp scan of the group slots; `False` keeps lane
+            0's walk over them.
         RowScalesT: Per-row output scales type. Defaults to the no-op
             `NullRowScales`.
         grid_scale: CTAs launched per SM. The scheduler strides the tile list
@@ -325,6 +331,7 @@ def grouped_matmul_block_scaled[
         TraceBufT=TraceBufT,
         swiglu_use_inplace=swiglu_use_inplace,
         swiglu_inplace_token_per_lane=swiglu_inplace_token_per_lane,
+        first_tile_scan=first_tile_scan,
         c_device_engine=type_of(c_device).Engine,
         offsets_engine=type_of(a_offsets).Engine,
         a_scale_offsets_engine=type_of(a_scale_offsets).Engine,
@@ -538,15 +545,6 @@ def grouped_matmul_block_scaled[
             ctx, sfa_4d
         )  # AB_swapped: SFB uses sfa data
         ctx.enqueue_function[kernel](
-            ClusterAttributeLaunchConfig(
-                grid_dim=grid_dim,
-                block_dim=block_threads,
-                cluster_dim=Dim(
-                    cluster_shape[0], cluster_shape[1], cluster_shape[2]
-                ),
-                shared_mem_bytes=smem_size,
-                attributes=pdl_launch_attributes(pdl_level),
-            ),
             a_tma_op,
             b_tma_op,
             c_tma_op,
@@ -566,6 +564,15 @@ def grouped_matmul_block_scaled[
             swiglu_out,
             trace_buf,
             row_scales,
+            execution_config=ClusterAttributeLaunchConfig(
+                grid_dim=grid_dim,
+                block_dim=block_threads,
+                cluster_dim=Dim(
+                    cluster_shape[0], cluster_shape[1], cluster_shape[2]
+                ),
+                shared_mem_bytes=smem_size,
+                attributes=pdl_launch_attributes(pdl_level),
+            ),
         )
     else:
         var a_tma_op = create_tma_tile[
@@ -614,15 +621,6 @@ def grouped_matmul_block_scaled[
             __desc_shape=sfb_tma_tile_shape,
         ](ctx, sfb_4d)
         ctx.enqueue_function[kernel](
-            ClusterAttributeLaunchConfig(
-                grid_dim=grid_dim,
-                block_dim=block_threads,
-                cluster_dim=Dim(
-                    cluster_shape[0], cluster_shape[1], cluster_shape[2]
-                ),
-                shared_mem_bytes=smem_size,
-                attributes=pdl_launch_attributes(pdl_level),
-            ),
             a_tma_op,
             b_tma_op,
             c_tma_op,
@@ -644,4 +642,13 @@ def grouped_matmul_block_scaled[
             swiglu_out,
             trace_buf,
             row_scales,
+            execution_config=ClusterAttributeLaunchConfig(
+                grid_dim=grid_dim,
+                block_dim=block_threads,
+                cluster_dim=Dim(
+                    cluster_shape[0], cluster_shape[1], cluster_shape[2]
+                ),
+                shared_mem_bytes=smem_size,
+                attributes=pdl_launch_attributes(pdl_level),
+            ),
         )

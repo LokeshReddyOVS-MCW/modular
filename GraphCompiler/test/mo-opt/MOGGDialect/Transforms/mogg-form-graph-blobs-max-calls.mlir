@@ -6,17 +6,17 @@
 // RUN:   --mogg-form-graph-blobs="max-calls=0" | FileCheck %s --check-prefix=OFF
 
 // With `max-calls` at 0, no routines fuse.
-// OFF-NOT: mogg.graph_blob
+// OFF-NOT: mogg.graph_blob {
 
 // A blob that holds `max-calls` routines, one call each, ends before the next,
 // which starts a new blob.
 // CHECK-LABEL: mo.graph @sequence
 // CHECK:       %[[R0:.*]]:2 = mogg.routine (%{{.*}} : !mo.tensor<[2, 2], f32>) -> (!mo.tensor<[2, 2], f32>, !mo.tensor<[2, 2], f32>)
 // CHECK:         mogg.graph_blob {
-// CHECK-COUNT-2:   mogg.call.execute_device
+// CHECK-COUNT-2:   mogg.call.opaque
 // CHECK:       %[[R1:.*]]:2 = mogg.routine (%[[R0]]#1 : !mo.tensor<[2, 2], f32>) -> (!mo.tensor<[2, 2], f32>, !mo.tensor<[2, 2], f32>)
 // CHECK:         mogg.graph_blob {
-// CHECK-COUNT-2:   mogg.call.execute_device
+// CHECK-COUNT-2:   mogg.call.opaque
 // CHECK-NOT:   mogg.routine
 // CHECK:       mo.output %[[R1]]#1
 mo.graph @sequence(%a: !mo.tensor<[2, 2], f32>) -> !mo.tensor<[2, 2], f32> {
@@ -33,11 +33,11 @@ mo.graph @sequence(%a: !mo.tensor<[2, 2], f32>) -> !mo.tensor<[2, 2], f32> {
 // CHECK:       %[[R0:.*]]:2 = mogg.routine
 // CHECK:         attributes {device = #M.device_ref<"gpu", 0>
 // CHECK-NEXT:      mogg.graph_blob {
-// CHECK-COUNT-2:   mogg.call.execute_device
+// CHECK-COUNT-2:   mogg.call.opaque
 // CHECK:       %[[R1:.*]]:2 = mogg.routine
 // CHECK:         attributes {device = #M.device_ref<"gpu", 1>
 // CHECK-NEXT:      mogg.graph_blob {
-// CHECK-COUNT-2:   mogg.call.execute_device
+// CHECK-COUNT-2:   mogg.call.opaque
 // CHECK-NOT:   mogg.routine
 // CHECK:       mo.output %[[R0]]#1, %[[R1]]#1
 mo.graph @interleaved_devices(%a: !mo.tensor<[2, 2], f32>, %x: !mo.tensor<[2, 2], f32>) -> (!mo.tensor<[2, 2], f32>, !mo.tensor<[2, 2], f32>) {

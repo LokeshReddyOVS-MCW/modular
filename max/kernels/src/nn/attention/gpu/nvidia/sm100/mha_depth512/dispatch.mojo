@@ -39,7 +39,7 @@ from nn.attention.gpu.nvidia.common import (
     q_tma_fused,
     q_tma_prefill,
 )
-from nn.attention.mha_mask import MHAMask
+from nn.attention.mha_mask import CausalMask, MHAMask
 from nn.attention.mha_operand import MHAOperand
 from nn.attention.gpu.nvidia.mha_tile_scheduler import TransientScheduler
 from nn.attention.mha_utils import (
@@ -210,7 +210,7 @@ def mha_sm100_depth512_dispatch[
         UInt32(
             d512_config.num_kv_heads if fuse_gqa else d512_config.num_q_heads
         ),
-        flip_prompt_idx=MaskType.get_type_name() == "CausalMask",
+        flip_prompt_idx=MaskType == CausalMask,
         pair_cta=True,
     ]
     var scheduler: SchedulerType = SchedulerType()
@@ -286,6 +286,7 @@ def mha_sm100_depth512_dispatch[
         ](ctx, q, num_rows_q)
 
         @inline(.always)
+        @__allow_legacy_any_origin_fields
         def with_sink[
             SinkType: OptionalPointer
         ](sink_ptr: SinkType) raises {imm}:
@@ -359,15 +360,6 @@ def mha_sm100_depth512_dispatch[
                     ].kernel
 
                     ctx.enqueue_function[kernel](
-                        ClusterAttributeLaunchConfig(
-                            grid_dim=SchedulerType.grid_dim(
-                                batch_size, block_x
-                            ),
-                            block_dim=(num_threads, 1, 1),
-                            cluster_dim=Dim(2, 1, 1),
-                            shared_mem_bytes=smem_use,
-                            attributes=pdl_launch_attributes(PDLLevel.ON),
-                        ),
                         q_tma_op,
                         k_tma_op,
                         v_tma_op,
@@ -377,6 +369,15 @@ def mha_sm100_depth512_dispatch[
                         batch_size,
                         max_cache_valid_length,
                         pack,
+                        execution_config=ClusterAttributeLaunchConfig(
+                            grid_dim=SchedulerType.grid_dim(
+                                batch_size, block_x
+                            ),
+                            block_dim=(num_threads, 1, 1),
+                            cluster_dim=Dim(2, 1, 1),
+                            shared_mem_bytes=smem_use,
+                            attributes=pdl_launch_attributes(PDLLevel.ON),
+                        ),
                     )
 
                 # --- ragged dispatch ---
@@ -416,6 +417,7 @@ def mha_sm100_depth512_dispatch[
         ](ctx, q, num_rows_q)
 
         @inline(.always)
+        @__allow_legacy_any_origin_fields
         def with_sink_q[
             SinkType: OptionalPointer
         ](sink_ptr: SinkType) raises {imm}:
@@ -489,15 +491,6 @@ def mha_sm100_depth512_dispatch[
                     ].kernel
 
                     ctx.enqueue_function[kernel](
-                        ClusterAttributeLaunchConfig(
-                            grid_dim=SchedulerType.grid_dim(
-                                batch_size, block_x
-                            ),
-                            block_dim=(num_threads, 1, 1),
-                            cluster_dim=Dim(2, 1, 1),
-                            shared_mem_bytes=smem_use,
-                            attributes=pdl_launch_attributes(PDLLevel.ON),
-                        ),
                         q_tma_op,
                         k_tma_op,
                         v_tma_op,
@@ -507,6 +500,15 @@ def mha_sm100_depth512_dispatch[
                         batch_size,
                         max_cache_valid_length,
                         pack,
+                        execution_config=ClusterAttributeLaunchConfig(
+                            grid_dim=SchedulerType.grid_dim(
+                                batch_size, block_x
+                            ),
+                            block_dim=(num_threads, 1, 1),
+                            cluster_dim=Dim(2, 1, 1),
+                            shared_mem_bytes=smem_use,
+                            attributes=pdl_launch_attributes(PDLLevel.ON),
+                        ),
                     )
 
                 # --- ragged dispatch ---

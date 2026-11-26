@@ -38,6 +38,12 @@ include "mlir/Interfaces/SideEffectInterfaces.td"
 class MAP_Op<string mnemonic, list<Trait> traits = []>
     : Op<MAPDialect, mnemonic, traits>;
 
+// A rowwise phase that stores at its element, into tensors of the rowwise
+// shape. A fold only reads the row.
+def MAP_StoresElements : NativeOpTrait<"StoresElements"> {
+  let cppNamespace = "::M::MAP";
+}
+
 // Type constraint matching the `map.index<N>` type.
 def MAP_AnyIndex : Type<
     CPred<"::llvm::isa<::M::MAP::IndexType>($_self)">,
@@ -78,7 +84,7 @@ def MAP_IterOpaqueOp : MAP_Op<"iter.opaque", [
       %epi = map.iter.epilogue (%val : bf16, %idx : !map.index<2>) capturing {%cap = %out : !mo.tensor<[M, N], bf16>} {
         map.store %cap[%idx] = %val : !mo.tensor<[M, N], bf16>
       } : !mo.tensor<[M, N], bf16>
-      map.call.opaque @builtin_kernels.linalg.Matmul[transpose_b = false]
+      map.call.opaque @builtin_kernels.linalg_ops.Matmul[transpose_b = false]
         inputs (%A, %B) outputs (%epi) : (...) -> (...)
     }
     ```
@@ -209,6 +215,16 @@ def MAP_IterEpilogueOp : MAP_Op<"iter.epilogue", [
 
   let hasCustomAssemblyFormat = 1;
   let hasCanonicalizer = 1;
+
+  let extraClassDeclaration = [{
+  private:
+    /// The tile half of `lowerToMOGG`.
+    ::mlir::LogicalResult lowerTile(
+        ::M::MAP::MAPToMOGGState &state, bool isCompute,
+        ::mlir::Value outShape, ::llvm::ArrayRef<::mlir::Value> moggCaptures,
+        ::mlir::Value outputPtr,
+        ::M::MOGG::TensorArgContractAttr contractAttr);
+  }];
 }
 
 //===----------------------------------------------------------------------===//
@@ -243,6 +259,7 @@ def MAP_IterPrologueOp : MAP_Op<"iter.prologue", [
 //===----------------------------------------------------------------------===//
 
 def MAP_ConstantOp : MAP_Op<"constant", [
+  DeclareOpInterfaceMethods<MAP_FlattenableOpInterface, ["getOutputLayout"]>,
     ConstantLike,
     Pure,
     DeclareOpInterfaceMethods<LowerableToMOGGInterface>,
@@ -269,7 +286,7 @@ def MAP_CallOpaqueOp : MAP_Op<"call.opaque", [
   let summary = "Invoke an opaque Mojo kernel by symbol.";
   let description = [{
     Calls the kernel declared under `callee` (a `mogg.kernel.decl` symbol, e.g.
-    `@builtin_kernels.linalg.Matmul`) with the given `inputs` and `outputs`. The
+    `@builtin_kernels.linalg_ops.Matmul`) with the given `inputs` and `outputs`. The
     kernel parameters (e.g. `packed_b`, `transpose_b`) are carried in brackets
     immediately after the callee symbol, e.g.
     `@...Matmul[packed_b = false, transpose_b = false]`.
@@ -426,12 +443,51 @@ def MAP_IterElementwiseBodyOp : MAP_Op<"iter.elementwise.body", [
 
   let arguments = (ins MOSH_ShapeAttr:$shape,
                        Variadic<AnyTypeOf<[MO_Tensor, MO_Buffer]>>:$captures,
-                       OptionalAttr<MAP_WidthLimitAttr>:$max_simd_width);
+                       OptionalAttr<MAP_SimdWidthAttr>:$max_simd_width);
   let regions = (region SizedRegion<1>:$body);
 
   let hasCustomAssemblyFormat = 1;
   let hasCanonicalizer = 1;
   let hasVerifier = 1;
+
+  let extraClassDeclaration = [{
+  private:
+    /// The captures, lowered: each (kernel I/O or hoisted view) is defined,
+    /// and so lowered, earlier in the block.
+    ::llvm::SmallVector<::mlir::Value>
+    lowerCaptures(::M::MAP::MAPToMOGGState &state);
+
+    /// Lowers this body into `call`'s region, whose block takes one argument
+    /// per capture, then the index.
+    ::mlir::LogicalResult lowerBody(::mlir::Operation *call,
+                                    ::M::MAP::MAPToMOGGState &state,
+                                    ::llvm::ArrayRef<::mlir::Value> capturing,
+                                    ::mlir::Type indexType);
+
+    /// The callee and device of this body's `ForeachOpT` kernel.
+    template <typename ForeachOpT>
+    std::pair<::mlir::FlatSymbolRefAttr, ::mlir::StringAttr>
+    calleeFor(::M::MAP::MAPToMOGGState &state);
+
+    /// Lowers this body into a `mogg.call.foreach`, passing on its width
+    /// limit.
+    ::mlir::LogicalResult buildSimdCall(::M::MAP::MAPToMOGGState &state,
+                                        ::mlir::Value loopShape,
+                                        ::mlir::Type indexType);
+
+    /// Lowers this body into a `mogg.call.foreach.tile`.
+    ::mlir::LogicalResult buildTileCall(::M::MAP::MAPToMOGGState &state,
+                                        ::mlir::Value loopShape,
+                                        ::mlir::Type indexType);
+
+    /// The tile half of `lowerToMOGG`.
+    ::mlir::LogicalResult lowerTileBody(::M::MAP::MAPToMOGGState &state,
+                                        ::mlir::Value loopShape);
+
+    /// Checks this body against what the tile foreach driver supports.
+    ::mlir::LogicalResult verifyTileBody(::mlir::Value output,
+                                         ::llvm::ArrayRef<::mlir::Value> inputs);
+  }];
 }
 
 //===----------------------------------------------------------------------===//
@@ -452,8 +508,9 @@ def MAP_IterRowwiseOp : MAP_Op<"iter.rowwise", [
   let summary = "A kernel that runs its body once per row of a shape";
   let description = [{
     Iterates over the rows of `shape` along `axis`. The body runs once per row
-    and holds the row's phases in order: folds (`map.iter.reduce`), row-scalar
-    ops on their results, and stores.
+    and holds the row's phases in order: folds (`map.iter.reduce`), row caches
+    (`map.iter.cache`) and per-element phases (`map.iter.map`), row-scalar ops
+    on their results, and stores.
 
     The row index `%row` indexes the per-row space, `shape` with the `axis`
     coordinate pinned to 0, so it addresses a per-row (`axis` size 1) output
@@ -566,7 +623,7 @@ def MAP_IterRowwiseBodyOp : MAP_Op<"iter.rowwise.body", [
   let arguments = (ins MOSH_ShapeAttr:$shape,
                        I64Attr:$axis,
                        Variadic<AnyTypeOf<[MO_Tensor, MO_Buffer]>>:$captures,
-                       OptionalAttr<MAP_WidthLimitAttr>:$max_simd_width);
+                       OptionalAttr<MAP_SimdWidthAttr>:$max_simd_width);
   let regions = (region SizedRegion<1>:$body);
 
   let hasCustomAssemblyFormat = 1;
@@ -585,6 +642,7 @@ def MAP_IterRowwiseBodyOp : MAP_Op<"iter.rowwise.body", [
 //===----------------------------------------------------------------------===//
 
 def MAP_IterReduceOp : MAP_Op<"iter.reduce", [
+  DeclareOpInterfaceMethods<MAP_FlattenableOpInterface, ["canFlattenDims", "flatten"]>,
   // Its index is the rowwise kernel's; the ops it holds limit the width.
   MAP_MaxSimdWidthInterface,
   ParentOneOf<["IterRowwiseOp", "IterRowwiseBodyOp"]>,
@@ -632,6 +690,7 @@ def MAP_IterReduceOp : MAP_Op<"iter.reduce", [
 //===----------------------------------------------------------------------===//
 
 def MAP_IterTileOp : MAP_Op<"iter.tile", [
+  DeclareOpInterfaceMethods<MAP_FlattenableOpInterface, ["canFlattenDims", "flatten"]>,
   // Its index is the rowwise kernel's; the ops it holds limit the width.
   MAP_MaxSimdWidthInterface,
   ParentOneOf<["IterRowwiseOp", "IterRowwiseBodyOp"]>,
@@ -679,7 +738,7 @@ def MAP_IterTileOp : MAP_Op<"iter.tile", [
 }
 
 def MAP_IterTileLoadOp : MAP_Op<"iter.tile.load", [
-  ParentOneOf<["IterReduceOp", "IterMapOp"]>,
+  ParentOneOf<["IterReduceOp", "IterMapOp", "IterCacheOp"]>,
   AllTypesMatch<["tile", "result"]>,
   Pure,
   DeclareOpInterfaceMethods<LowerableToMOGGInterface>,
@@ -697,7 +756,82 @@ def MAP_IterTileLoadOp : MAP_Op<"iter.tile.load", [
   let hasVerifier = 1;
 }
 
+def MAP_IterCacheOp : MAP_Op<"iter.cache", [
+  // Its index is the rowwise kernel's; the ops it holds limit the width.
+  MAP_MaxSimdWidthInterface,
+  ParentOneOf<["IterRowwiseOp", "IterRowwiseBodyOp"]>,
+  SingleBlock,
+  RecursiveMemoryEffects,
+  MAP_RowwisePhaseOpInterface,
+  MAP_StoresElements,
+  DeclareOpInterfaceMethods<LowerableToMOGGInterface>,
+]> {
+  let summary = "A per-element value of the row that later phases read";
+  let description = [{
+    Computes, at index `%i`, a value of the row that later phases read with
+    `map.iter.cache.load` instead of computing it again: the Row's `cache`.
+    Unlike the tile, it comes after folds and may read their results, and it
+    may store at `%i` into tensors of the rowwise shape, such as a side
+    output. A phase reads either the tile or one cache, and a row with a
+    cache ends with a map phase. A `shared` cache can also be read at
+    another element of the row.
+
+    Example:
+    ```mlir
+    %acc = map.iter.reduce @builtin_kernels.monoids.ReduceSum
+        index (%i: !map.index<2>) -> f32 { ... }
+    %c = map.iter.cache index (%i: !map.index<2>) -> f32 {
+      %x = map.iter.tile.load %t[%i] : !map.index<2>, f32
+      %h = map.call.elementwise @builtin_kernels.elementwise.Mul(%i, %x, %acc)
+          : !map.index<2>, f32, f32 -> f32
+      map.store %h_out[%i] = %h : !mo.tensor<[M, N], f32>
+      map.yield %h : f32
+    }
+    map.iter.map index (%i: !map.index<2>) {
+      %h = map.iter.cache.load %c[%i] : !map.index<2>, f32
+      ...
+    }
+    ```
+  }];
+
+  let arguments = (ins DefaultValuedAttr<BoolAttr, "false">:$shared);
+  let results = (outs AnyType:$result);
+  let regions = (region SizedRegion<1>:$body);
+
+  let hasCustomAssemblyFormat = 1;
+  let hasVerifier = 1;
+}
+
+def MAP_IterCacheLoadOp : MAP_Op<"iter.cache.load", [
+  AllTypesMatch<["cache", "result"]>,
+  Pure,
+  DeclareOpInterfaceMethods<LowerableToMOGGInterface>,
+]> {
+  let summary = "Read a row cache at the current phase's element";
+  let description = [{
+    Reads the value the `map.iter.cache` `$cache` computes at `$index`, the
+    enclosing phase's index, moved `$offset` elements along the row. A
+    nonzero offset reads another element of the row, so the cache must be
+    `shared`; it may sit in a region of the phase, such as a concat
+    select's, that runs only where the moved element is in the row.
+
+    Example:
+    ```mlir
+    %p = map.iter.cache.load %c[%j] offset(64) : !map.index<2>, bf16
+    ```
+  }];
+  let arguments = (ins AnyType:$cache, MAP_AnyIndex:$index,
+                       DefaultValuedAttr<I64Attr, "0">:$offset);
+  let results = (outs AnyType:$result);
+  let assemblyFormat = [{
+    $cache `[` $index `]` (`offset` `(` $offset^ `)`)? attr-dict `:`
+    type($index) `,` type($result)
+  }];
+  let hasVerifier = 1;
+}
+
 def MAP_IterMapOp : MAP_Op<"iter.map", [
+  DeclareOpInterfaceMethods<MAP_FlattenableOpInterface, ["canFlattenDims", "flatten"]>,
   // Its index is the rowwise kernel's; the ops it holds limit the width.
   MAP_MaxSimdWidthInterface,
   ParentOneOf<["IterRowwiseOp", "IterRowwiseBodyOp"]>,
@@ -705,6 +839,7 @@ def MAP_IterMapOp : MAP_Op<"iter.map", [
   NoTerminator,
   RecursiveMemoryEffects,
   MAP_RowwisePhaseOpInterface,
+  MAP_StoresElements,
   DeclareOpInterfaceMethods<LowerableToMOGGInterface>,
 ]> {
   let summary = "A per-element phase over the current row";
@@ -875,8 +1010,10 @@ def MAP_CallElementwiseOp : MAP_Op<"call.elementwise", [
 //===----------------------------------------------------------------------===//
 
 def MAP_SliceIndexOp : MAP_Op<"index.slice", [
+  DeclareOpInterfaceMethods<MAP_FlattenableOpInterface, ["getOutputLayout"]>,
   Pure,
-  DeclareOpInterfaceMethods<MAP_IndexTransformOpInterface, ["createStridedView"]>,
+  DeclareOpInterfaceMethods<MAP_IndexTransformOpInterface, [
+    "createStridedView", "mapLoopDims"]>,
 ]> {
   let summary = "Project an output-shape index to the input-shape index for a slice view";
   let description = [{
@@ -917,11 +1054,12 @@ def MAP_SliceIndexOp : MAP_Op<"index.slice", [
 //===----------------------------------------------------------------------===//
 
 def MAP_SliceSelectOp : MAP_Op<"index.slice.select", [
+  DeclareOpInterfaceMethods<MAP_FlattenableOpInterface, ["canFlattenDims", "flatten"]>,
   SingleBlock,
   NoTerminator,
   RecursiveMemoryEffects,
   // The verifier keeps the innermost dim whole, so the body's index has the
-  // loop's innermost coordinate and its width limits hold as they are.
+  // loop's innermost coordinate and its SIMD width hold as it is.
   MAP_MaxSimdWidthInterface,
   DeclareOpInterfaceMethods<MAP_DynamicShapeIndexOpInterface>,
   DeclareOpInterfaceMethods<LowerableToMOGGInterface>,
@@ -988,6 +1126,7 @@ def MAP_SliceSelectOp : MAP_Op<"index.slice.select", [
 //===----------------------------------------------------------------------===//
 
 def MAP_ConcatSelectOp : MAP_Op<"index.concat.select", [
+  DeclareOpInterfaceMethods<MAP_FlattenableOpInterface, ["canFlattenDims", "flatten"]>,
   RecursiveMemoryEffects,
   DeclareOpInterfaceMethods<MAP_MaxSimdWidthInterface, ["getMaxSimdWidth"]>,
   DeclareOpInterfaceMethods<MAP_DynamicShapeIndexOpInterface>,
@@ -1006,10 +1145,10 @@ def MAP_ConcatSelectOp : MAP_Op<"index.concat.select", [
 
     The lowering evaluates the op once per loaded vector, which runs along
     the output's innermost dim, so `index` must be one the vector runs along:
-    a foreach's own index or an enclosing select's argument, never a
-    transformed one. Along the innermost axis a vector could cross from one
-    input into the next; the kernel launch rules that out, running only
-    widths that divide every input's extent.
+    a foreach's own index, a rowwise phase's index or an enclosing select's
+    argument, never a transformed one. Along the innermost axis a vector
+    could cross from one input into the next; the kernel launch rules that
+    out, running only widths that divide every input's extent.
 
     Example:
     ```mlir
@@ -1040,6 +1179,7 @@ def MAP_ConcatSelectOp : MAP_Op<"index.concat.select", [
 //===----------------------------------------------------------------------===//
 
 def MAP_SliceStrideOp : MAP_Op<"index.slice.stride", [
+  DeclareOpInterfaceMethods<MAP_FlattenableOpInterface, ["getOutputLayout"]>,
   ParentOneOf<["IterOpaqueOp"]>,
   Pure,
   MAP_StrideViewOpInterface,
@@ -1086,6 +1226,7 @@ def MAP_SliceStrideOp : MAP_Op<"index.slice.stride", [
 //===----------------------------------------------------------------------===//
 
 def MAP_BroadcastIndexOp : MAP_Op<"index.broadcast", [
+  DeclareOpInterfaceMethods<MAP_FlattenableOpInterface, ["getOutputLayout"]>,
   Pure,
   DeclareOpInterfaceMethods<MAP_IndexTransformOpInterface, [
     "createStridedView", "mapLoopDims"]>,
@@ -1123,6 +1264,7 @@ def MAP_BroadcastIndexOp : MAP_Op<"index.broadcast", [
 //===----------------------------------------------------------------------===//
 
 def MAP_BroadcastStrideOp : MAP_Op<"index.broadcast.stride", [
+  DeclareOpInterfaceMethods<MAP_FlattenableOpInterface, ["getOutputLayout"]>,
   ParentOneOf<["IterOpaqueOp"]>,
   Pure,
   MAP_StrideViewOpInterface,
@@ -1163,6 +1305,7 @@ def MAP_BroadcastStrideOp : MAP_Op<"index.broadcast.stride", [
 //===----------------------------------------------------------------------===//
 
 def MAP_TransposeIndexOp : MAP_Op<"index.transpose", [
+  DeclareOpInterfaceMethods<MAP_FlattenableOpInterface, ["getOutputLayout"]>,
   Pure,
   DeclareOpInterfaceMethods<MAP_IndexTransformOpInterface, [
     "createStridedView", "mapLoopDims"]>,
@@ -1173,10 +1316,10 @@ def MAP_TransposeIndexOp : MAP_Op<"index.transpose", [
     `mo.transpose`. Since `out.dim[i] == in.dim[perm[i]]`, this applies
     `perm`'s inverse.
 
-    `permutations` is the runtime permutation, read only where `spec` is
-    dynamic (the eager interpreter's one-graph-per-op transpose). It rides
-    along for the hoisted `map.index.transpose.stride`; this op is never
-    lowered to MOGG directly.
+    `permutations` is the runtime permutation, present exactly when some
+    entry of `spec`'s perm is dynamic (the eager interpreter's one-graph-per-op
+    transpose). It rides along for the hoisted `map.index.transpose.stride`;
+    this op is never lowered to MOGG directly.
 
     Example:
     ```mlir
@@ -1188,14 +1331,14 @@ def MAP_TransposeIndexOp : MAP_Op<"index.transpose", [
   let arguments = (ins
     MAP_TransposeSpecAttr:$spec,
     MAP_AnyIndex:$index,
-    MO_Tensor:$permutations
+    Optional<MO_Tensor>:$permutations
   );
   let results = (outs MAP_AnyIndex:$result);
 
   let assemblyFormat = [{
-    `<` qualified($spec) `>` `(` $index `,` $permutations `)` attr-dict
-    `:` `(` qualified(type($index)) `,` qualified(type($permutations)) `)` `->`
-    qualified(type($result))
+    `<` qualified($spec) `>` `(` $index (`,` $permutations^)? `)` attr-dict
+    `:` `(` qualified(type($index)) (`,` qualified(type($permutations))^)? `)`
+    `->` qualified(type($result))
   }];
 
   let hasVerifier = 1;
@@ -1206,6 +1349,7 @@ def MAP_TransposeIndexOp : MAP_Op<"index.transpose", [
 //===----------------------------------------------------------------------===//
 
 def MAP_TransposeStrideOp : MAP_Op<"index.transpose.stride", [
+  DeclareOpInterfaceMethods<MAP_FlattenableOpInterface, ["getOutputLayout"]>,
   ParentOneOf<["IterOpaqueOp"]>,
   Pure,
   MAP_StrideViewOpInterface,
@@ -1221,8 +1365,8 @@ def MAP_TransposeStrideOp : MAP_Op<"index.transpose.stride", [
     whose loads it feeds. `input` is a buffer when the view feeds an in-place
     kernel's fused load.
 
-    `permutations` is read only where `spec` is dynamic; emission elides the
-    read behind a `comptime if` for a static perm.
+    `permutations` is present exactly when some entry of `spec`'s perm is
+    dynamic, and is read only for those entries.
 
     Example:
     ```mlir
@@ -1234,14 +1378,14 @@ def MAP_TransposeStrideOp : MAP_Op<"index.transpose.stride", [
   let arguments = (ins
     MAP_TransposeSpecAttr:$spec,
     AnyTypeOf<[MO_Tensor, MO_Buffer]>:$input,
-    MO_Tensor:$permutations
+    Optional<MO_Tensor>:$permutations
   );
   let results = (outs MO_Tensor:$result);
 
   let assemblyFormat = [{
-    `<` qualified($spec) `>` `(` $input `,` $permutations `)` attr-dict
-    `:` `(` qualified(type($input)) `,` qualified(type($permutations)) `)` `->`
-    qualified(type($result))
+    `<` qualified($spec) `>` `(` $input (`,` $permutations^)? `)` attr-dict
+    `:` `(` qualified(type($input)) (`,` qualified(type($permutations))^)? `)`
+    `->` qualified(type($result))
   }];
 
   let hasVerifier = 1;
@@ -1252,6 +1396,7 @@ def MAP_TransposeStrideOp : MAP_Op<"index.transpose.stride", [
 //===----------------------------------------------------------------------===//
 
 def MAP_ReshapeIndexOp : MAP_Op<"index.reshape", [
+  DeclareOpInterfaceMethods<MAP_FlattenableOpInterface, ["flatten", "getOutputLayout"]>,
   Pure,
   DeclareOpInterfaceMethods<MAP_IndexTransformOpInterface, [
     "createStridedView", "mapLoopDims"]>,
@@ -1293,6 +1438,7 @@ def MAP_ReshapeIndexOp : MAP_Op<"index.reshape", [
 //===----------------------------------------------------------------------===//
 
 def MAP_ReshapeStrideOp : MAP_Op<"index.reshape.stride", [
+  DeclareOpInterfaceMethods<MAP_FlattenableOpInterface, ["getOutputLayout"]>,
   ParentOneOf<["IterOpaqueOp"]>,
   Pure,
   MAP_StrideViewOpInterface,
@@ -1323,6 +1469,52 @@ def MAP_ReshapeStrideOp : MAP_Op<"index.reshape.stride", [
   let assemblyFormat = [{
     `<` qualified($spec) `>` `(` $input `)` attr-dict
     `:` qualified(type($input)) `->` qualified(type($result))
+  }];
+
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// map.index.collapse.stride
+//===----------------------------------------------------------------------===//
+
+def MAP_CollapseStrideOp : MAP_Op<"index.collapse.stride", [
+  ParentOneOf<["IterOpaqueOp"]>,
+  Pure,
+  MAP_StrideViewOpInterface,
+  DeclareOpInterfaceMethods<LowerableToMOGGInterface>,
+]> {
+  let summary = "Merge groups of adjacent dims of a view, keeping its strides";
+  let description = [{
+    A view of `input` whose dims are `input`'s, merged in consecutive groups:
+    `groups` lists each group's size, and the view's dim `g` has the product
+    of its group's extents and the stride of the group's innermost dim.
+    Nothing is copied. It is only correct when, within each group, every dim's
+    stride is the next dim's stride times its extent (a group's rows are laid
+    out one after the other), or all are 0 (a broadcast);
+    `map-flatten-shapes` checks that before creating one, and the Mojo
+    primitive asserts it. On a contiguous input it produces the same code as
+    `map.index.reshape.stride`. It exists because it keeps the input's
+    strides, where reshape recomputes row-major ones: over a broadcast, a
+    slice or an in-order transpose, only the collapse view is correct.
+
+    Example:
+    ```mlir
+    %flat = map.index.collapse.stride<#map.view.signature<[B, S, 64] -> [BS, 64]>, groups = [2, 1]> (%x)
+        : !mo.tensor<[B, S, 64], f32> -> !mo.tensor<[BS, 64], f32>
+    ```
+  }];
+
+  let arguments = (ins
+    MAP_ViewSignatureAttr:$signature,
+    DenseI64ArrayAttr:$groups,
+    AnyTypeOf<[MO_Tensor, MO_Buffer]>:$input
+  );
+  let results = (outs MO_Tensor:$result);
+
+  let assemblyFormat = [{
+    `<` qualified($signature) `,` `groups` `=` $groups `>` `(` $input `)`
+    attr-dict `:` qualified(type($input)) `->` qualified(type($result))
   }];
 
   let hasVerifier = 1;

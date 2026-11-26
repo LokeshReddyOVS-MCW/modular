@@ -718,28 +718,77 @@ static void printOptionalDynamicMaxSimdWidth(OpAsmPrinter &p, Value operand) {
     p << "dynamic_max_simd_width(" << operand << ") ";
 }
 
-// Unlike the epilogue and prologue, the foreach body takes its captures first
-// and the index last.
+// The syntax `mogg.call.foreach` and `mogg.graph_blob.foreach` share after
+// their shape and context: an optional `dynamic_max_simd_width(%s)`, the
+// index, and the captures. Unlike the epilogue and prologue, the body takes
+// its captures first and the index last.
+struct ForeachLoopSyntax {
+  std::optional<OpAsmParser::UnresolvedOperand> dynamicMaxSimdWidth;
+  SmallVector<OpAsmParser::Argument> entryArgs;
+  SmallVector<OpAsmParser::UnresolvedOperand> captures;
+  SmallVector<Type> captureTypes;
+};
+
+static ParseResult parseForeachLoop(OpAsmParser &parser,
+                                    ForeachLoopSyntax &loop) {
+  SmallVector<OpAsmParser::Argument> leadingArgs;
+  if (parseOptionalDynamicMaxSimdWidth(parser, loop.dynamicMaxSimdWidth) ||
+      parseLeadingArgs(parser, leadingArgs) ||
+      parseBindings(parser, "capturing", loop.entryArgs, loop.captures,
+                    loop.captureTypes, /*impliedType=*/Type(),
+                    /*required=*/false))
+    return failure();
+  loop.entryArgs.append(leadingArgs.begin(), leadingArgs.end());
+  return success();
+}
+
+// Adds the captures, then the run-time width limit, to the operands.
+static ParseResult resolveForeachLoop(OpAsmParser &parser,
+                                      OperationState &result,
+                                      const ForeachLoopSyntax &loop) {
+  return failure(parser.resolveOperands(loop.captures, loop.captureTypes,
+                                        parser.getNameLoc(), result.operands) ||
+                 (loop.dynamicMaxSimdWidth &&
+                  parser.resolveOperand(*loop.dynamicMaxSimdWidth,
+                                        ShapeType::get(parser.getContext()),
+                                        result.operands)));
+}
+
+static void printForeachLoop(OpAsmPrinter &p, Value dynamicMaxSimdWidth,
+                             ValueRange capturing, Block &body) {
+  printOptionalDynamicMaxSimdWidth(p, dynamicMaxSimdWidth);
+  auto args = body.getArguments();
+  size_t numCaptures = capturing.size();
+  printLeadingArgs(p, args.drop_front(numCaptures));
+  if (numCaptures) {
+    p << " ";
+    printBindings(p, "capturing", capturing, args.take_front(numCaptures),
+                  /*impliedType=*/Type(),
+                  /*required=*/false);
+  }
+}
+
+static void nameForeachBodyArgs(Region &region, size_t numCaptures,
+                                OpAsmSetValueNameFn setNameFn) {
+  if (region.empty())
+    return;
+  auto args = region.front().getArguments();
+  nameArgs(args.take_front(numCaptures), "cap", setNameFn);
+  nameLeadingArgs(args.drop_front(numCaptures), {"idx"}, setNameFn);
+}
+
 ParseResult CallForeachOp::parse(OpAsmParser &parser, OperationState &result) {
   MLIRContext *ctx = parser.getContext();
   FlatSymbolRefAttr callee;
   OpAsmParser::UnresolvedOperand shape, context;
-  SmallVector<OpAsmParser::Argument> leadingArgs, entryArgs;
-  SmallVector<OpAsmParser::UnresolvedOperand> captures;
-  SmallVector<Type> captureTypes;
+  ForeachLoopSyntax loop;
   if (parser.parseAttribute(callee, getCalleeAttrName(result.name),
                             result.attributes) ||
       parser.parseKeyword("shape") || parser.parseLParen() ||
       parser.parseOperand(shape) || parser.parseRParen() ||
       parser.parseKeyword("context") || parser.parseLParen() ||
-      parser.parseOperand(context) || parser.parseRParen())
-    return failure();
-  std::optional<OpAsmParser::UnresolvedOperand> dynamicMaxSimdWidth;
-  if (parseOptionalDynamicMaxSimdWidth(parser, dynamicMaxSimdWidth))
-    return failure();
-  if (parseLeadingArgs(parser, leadingArgs) ||
-      parseBindings(parser, "capturing", entryArgs, captures, captureTypes,
-                    /*impliedType=*/Type(), /*required=*/false))
+      parser.parseOperand(context) || parser.parseRParen() ||
+      parseForeachLoop(parser, loop))
     return failure();
   StringAttr device;
   if (parser.parseKeyword("device") || parser.parseEqual() ||
@@ -747,37 +796,24 @@ ParseResult CallForeachOp::parse(OpAsmParser &parser, OperationState &result) {
       parser.parseOptionalAttrDictWithKeyword(result.attributes))
     return failure();
   result.addAttribute(getDeviceAttrName(result.name), device);
-  entryArgs.append(leadingArgs.begin(), leadingArgs.end());
 
   if (parser.resolveOperand(shape, ShapeType::get(ctx), result.operands) ||
       parser.resolveOperand(context, ContextType::get(ctx), result.operands) ||
-      parser.resolveOperands(captures, captureTypes, parser.getNameLoc(),
-                             result.operands) ||
-      (dynamicMaxSimdWidth &&
-       parser.resolveOperand(*dynamicMaxSimdWidth, ShapeType::get(ctx),
-                             result.operands)))
+      resolveForeachLoop(parser, result, loop))
     return failure();
   result.addAttribute(getOperandSegmentSizesAttrName(result.name),
                       parser.getBuilder().getDenseI32ArrayAttr(
-                          {1, 1, static_cast<int32_t>(captures.size()),
-                           dynamicMaxSimdWidth ? 1 : 0}));
-  return parser.parseRegion(*result.addRegion(), entryArgs);
+                          {1, 1, static_cast<int32_t>(loop.captures.size()),
+                           loop.dynamicMaxSimdWidth ? 1 : 0}));
+  return parser.parseRegion(*result.addRegion(), loop.entryArgs);
 }
 
 void CallForeachOp::print(OpAsmPrinter &p) {
   p << " ";
   p.printAttributeWithoutType(getCalleeAttr());
   p << " shape(" << getShape() << ") context(" << getDeviceContext() << ") ";
-  printOptionalDynamicMaxSimdWidth(p, getDynamicMaxSimdWidth());
-  auto args = getBody().front().getArguments();
-  size_t numCaptures = getCapturing().size();
-  printLeadingArgs(p, args.drop_front(numCaptures));
-  if (numCaptures) {
-    p << " ";
-    printBindings(p, "capturing", getCapturing(), args.take_front(numCaptures),
-                  /*impliedType=*/Type(),
-                  /*required=*/false);
-  }
+  printForeachLoop(p, getDynamicMaxSimdWidth(), getCapturing(),
+                   getBody().front());
   p << " device = ";
   p.printAttribute(getDeviceAttr());
   p.printOptionalAttrDictWithKeyword(
@@ -790,12 +826,79 @@ void CallForeachOp::print(OpAsmPrinter &p) {
 
 void CallForeachOp::getAsmBlockArgumentNames(Region &region,
                                              OpAsmSetValueNameFn setNameFn) {
-  if (region.empty())
-    return;
-  auto args = region.front().getArguments();
-  size_t numCaptures = getCapturing().size();
-  nameArgs(args.take_front(numCaptures), "cap", setNameFn);
-  nameLeadingArgs(args.drop_front(numCaptures), {"idx"}, setNameFn);
+  nameForeachBodyArgs(region, getCapturing().size(), setNameFn);
+}
+
+ParseResult GraphBlobForeachOp::parse(OpAsmParser &parser,
+                                      OperationState &result) {
+  OpAsmParser::UnresolvedOperand shape;
+  ForeachLoopSyntax loop;
+  if (parser.parseKeyword("shape") || parser.parseLParen() ||
+      parser.parseOperand(shape) || parser.parseRParen() ||
+      parseForeachLoop(parser, loop) ||
+      parser.parseOptionalAttrDictWithKeyword(result.attributes) ||
+      parser.resolveOperand(shape, ShapeType::get(parser.getContext()),
+                            result.operands) ||
+      resolveForeachLoop(parser, result, loop))
+    return failure();
+  result.addAttribute(getOperandSegmentSizesAttrName(result.name),
+                      parser.getBuilder().getDenseI32ArrayAttr(
+                          {1, static_cast<int32_t>(loop.captures.size()),
+                           loop.dynamicMaxSimdWidth ? 1 : 0}));
+  return parser.parseRegion(*result.addRegion(), loop.entryArgs);
+}
+
+void GraphBlobForeachOp::print(OpAsmPrinter &p) {
+  p << " shape(" << getShape() << ") ";
+  printForeachLoop(p, getDynamicMaxSimdWidth(), getCapturing(),
+                   getBody().front());
+  p.printOptionalAttrDictWithKeyword(
+      (*this)->getAttrs(), {getOperandSegmentSizesAttrName().getValue()});
+  p << " ";
+  p.printRegion(getBody(), /*printEntryBlockArgs=*/false);
+}
+
+void GraphBlobForeachOp::getAsmBlockArgumentNames(
+    Region &region, OpAsmSetValueNameFn setNameFn) {
+  nameForeachBodyArgs(region, getCapturing().size(), setNameFn);
+}
+
+// `context(%ctx) config(%launch) args {%a = %v : type, ...} {...}`, where
+// each launch operand is written next to the block argument that stands for
+// it in the kernel.
+ParseResult GraphBlobLaunchOp::parse(OpAsmParser &parser,
+                                     OperationState &result) {
+  MLIRContext *ctx = parser.getContext();
+  OpAsmParser::UnresolvedOperand context, config;
+  SmallVector<OpAsmParser::Argument> entryArgs;
+  SmallVector<OpAsmParser::UnresolvedOperand> args;
+  SmallVector<Type> argTypes;
+  if (parser.parseKeyword("context") || parser.parseLParen() ||
+      parser.parseOperand(context) || parser.parseRParen() ||
+      parser.parseKeyword("config") || parser.parseLParen() ||
+      parser.parseOperand(config) || parser.parseRParen() ||
+      parseBindings(parser, "args", entryArgs, args, argTypes,
+                    /*impliedType=*/Type(), /*required=*/false) ||
+      parser.parseOptionalAttrDictWithKeyword(result.attributes) ||
+      parser.resolveOperand(context, ContextType::get(ctx), result.operands) ||
+      parser.resolveOperand(config, LaunchConfigType::get(ctx),
+                            result.operands) ||
+      parser.resolveOperands(args, argTypes, parser.getNameLoc(),
+                             result.operands))
+    return failure();
+  return parser.parseRegion(*result.addRegion(), entryArgs);
+}
+
+void GraphBlobLaunchOp::print(OpAsmPrinter &p) {
+  p << " context(" << getDeviceContext() << ") config(" << getConfig() << ")";
+  if (!getArgs().empty()) {
+    p << " ";
+    printBindings(p, "args", getArgs(), getBody().front().getArguments(),
+                  /*impliedType=*/Type(), /*required=*/false);
+  }
+  p.printOptionalAttrDictWithKeyword((*this)->getAttrs());
+  p << " ";
+  p.printRegion(getBody(), /*printEntryBlockArgs=*/false);
 }
 
 // Same layout as `call.foreach`.
@@ -975,7 +1078,9 @@ void RowwiseReduceOp::getAsmBlockArgumentNames(Region &region,
   nameLeadingArgs(region.front().getArguments(), {"i"}, setNameFn);
 }
 
-ParseResult RowwiseTileOp::parse(OpAsmParser &parser, OperationState &result) {
+// `(%i : !map.index<N>) -> T { ... }`
+static ParseResult parseRowValueOp(OpAsmParser &parser,
+                                   OperationState &result) {
   SmallVector<OpAsmParser::Argument> entryArgs;
   if (parseLeadingArgs(parser, entryArgs) ||
       parser.parseArrowTypeList(result.types) ||
@@ -984,17 +1089,37 @@ ParseResult RowwiseTileOp::parse(OpAsmParser &parser, OperationState &result) {
   return parser.parseOptionalAttrDict(result.attributes);
 }
 
-void RowwiseTileOp::print(OpAsmPrinter &p) {
+static void printRowValueOp(OpAsmPrinter &p, Operation *op) {
+  Region &body = op->getRegion(0);
   p << " ";
-  printLeadingArgs(p, getBody().front().getArguments());
-  p.printArrowTypeList(getOperation()->getResultTypes());
+  printLeadingArgs(p, body.front().getArguments());
+  p.printArrowTypeList(op->getResultTypes());
   p << " ";
-  p.printRegion(getBody(), /*printEntryBlockArgs=*/false);
-  p.printOptionalAttrDict((*this)->getAttrs());
+  p.printRegion(body, /*printEntryBlockArgs=*/false);
+  p.printOptionalAttrDict(op->getAttrs());
 }
+
+ParseResult RowwiseTileOp::parse(OpAsmParser &parser, OperationState &result) {
+  return parseRowValueOp(parser, result);
+}
+
+void RowwiseTileOp::print(OpAsmPrinter &p) { printRowValueOp(p, *this); }
 
 void RowwiseTileOp::getAsmBlockArgumentNames(Region &region,
                                              OpAsmSetValueNameFn setNameFn) {
+  if (region.empty())
+    return;
+  nameLeadingArgs(region.front().getArguments(), {"i"}, setNameFn);
+}
+
+ParseResult RowwiseCacheOp::parse(OpAsmParser &parser, OperationState &result) {
+  return parseRowValueOp(parser, result);
+}
+
+void RowwiseCacheOp::print(OpAsmPrinter &p) { printRowValueOp(p, *this); }
+
+void RowwiseCacheOp::getAsmBlockArgumentNames(Region &region,
+                                              OpAsmSetValueNameFn setNameFn) {
   if (region.empty())
     return;
   nameLeadingArgs(region.front().getArguments(), {"i"}, setNameFn);

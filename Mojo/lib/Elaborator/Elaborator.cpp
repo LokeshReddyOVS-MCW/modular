@@ -36,6 +36,7 @@
 #include "Mojo/TransformUtils/EliminateDeadSymbolUtils.h"
 #include "Mojo/TransformUtils/ManglingUtils.h"
 #include "Support/Compiler/DiagnosticHandler.h"
+#include "Support/Compiler/Threading.h"
 #include "Support/DebugInfoDialect/IR/DebugInfoOps.h"
 #include "mlir/AsmParser/AsmParser.h"
 #include "mlir/Dialect/Index/IR/IndexDialect.h"
@@ -497,8 +498,10 @@ Elaborator::getConcreteFunction(ImplNode *parent, Location loc,
       auto iter = insts.find(name);
       return iter == insts.end() ? nullptr : iter->second;
     });
-    if (!implNode)
-      return FuncOp();
+    if (!implNode) {
+      return ErrorTree(loc, "no concrete function for symbol '@" +
+                                name.getValue().str() + "'");
+    }
     // A generator instance is registered under its concrete name before it
     // has elaborated (or failed), so it must go through the same
     // readiness/error protocol as a call by generator name. Only an instance
@@ -891,40 +894,54 @@ static AttrType concretizeAttr(AttrType attr, mlir::Location loc,
     inode->setToError(exprResult.takeError());
     return {};
   }
-  if (LLVM_UNLIKELY(!*exprResult)) {
-    inode->setToError(ErrorTree(
-        loc, "concretized parameter expression in attribute is null"));
+  // A debug attribute can name a generator this node never depended on, since
+  // dependencies come from ops. The fold then yields null until that value
+  // lands.
+  if (LLVM_UNLIKELY(!*exprResult))
     return {};
-  }
   return cast<AttrType>(*exprResult);
+}
+
+/// Classify a fold that yielded null. Parking is safe because every null here
+/// comes from `specializeGenerator`, which registers the continuation that
+/// resumes the node. An unresolvable symbol errors at its source instead.
+static ElaborationState pendingOrError(ImplNode *inode) {
+  return inode->recordedError() ? ElaborationState::error()
+                                : ElaborationState::skipNode();
 }
 
 /// Concretizes the location of an op or a block argument.
 template <typename ArgOrOp>
-static LogicalResult concretizeLocOf(ArgOrOp &argOrOp, ImplNode *inode) {
+static ElaborationState concretizeLocOf(ArgOrOp &argOrOp, ImplNode *inode) {
   LocationAttr loc = argOrOp.getLoc();
   if (LocationAttr newLocAttr = concretizeAttr<LocationAttr>(loc, loc, inode)) {
     argOrOp.setLoc(newLocAttr);
-    return success();
+    return ElaborationState::advance();
   }
-  return failure();
+  return pendingOrError(inode);
 }
 
-static LogicalResult
+static ElaborationState
 concretizeLocsInScope(iterator_range<Block::iterator> scope, ImplNode *inode) {
-  // Location concretization cannot yield and restart. Add a blocker to ensure
-  // no blockers are set for this node while concretizing locations. Empty
-  // concretization results will result in UnknownLoc.
-  inode->blocker = std::make_pair(inode->inst.getLoc(), nullptr);
+  ElaborationState state = ElaborationState::advance();
+  auto stop = [&](ElaborationState result) {
+    state = result;
+    return WalkResult::interrupt();
+  };
+  auto nullState = [&] { return pendingOrError(inode); };
   for (Operation &op : scope) {
-    op.walk([&](Operation *op) {
-      if (failed(concretizeLocOf(*op, inode)))
-        return WalkResult::interrupt();
+    WalkResult walked = op.walk([&](Operation *op) {
+      if (ElaborationState result = concretizeLocOf(*op, inode);
+          result.isError() || result.shouldSkipNode())
+        return stop(result);
 
       // Update the ValueInfo attr since they contain types.
       if (isa<DebugInfo::ValueOp, DebugInfo::KillOp>(op)) {
-        op->setAttrs(
-            concretizeAttr(op->getAttrDictionary(), op->getLoc(), inode));
+        DictionaryAttr attrs =
+            concretizeAttr(op->getAttrDictionary(), op->getLoc(), inode);
+        if (!attrs)
+          return stop(nullState());
+        op->setAttrs(attrs);
         return WalkResult::advance();
       }
 
@@ -932,8 +949,11 @@ concretizeLocsInScope(iterator_range<Block::iterator> scope, ImplNode *inode) {
       // what we are dealing with.
       if (auto inlined = dyn_cast<DebugInfo::InlinedSubprogramScoped>(op)) {
         if (LocationAttr callLoc = inlined.getCallLocAttr()) {
-          inlined.setCallLocAttr(
-              concretizeAttr<LocationAttr>(callLoc, op->getLoc(), inode));
+          LocationAttr concrete =
+              concretizeAttr<LocationAttr>(callLoc, op->getLoc(), inode);
+          if (!concrete)
+            return stop(nullState());
+          inlined.setCallLocAttr(concrete);
         }
       }
       // When elaboration is complete, only the first block in any region is
@@ -941,8 +961,9 @@ concretizeLocsInScope(iterator_range<Block::iterator> scope, ImplNode *inode) {
       // is handled). So we only need to go through the region arguments.
       for (Region &r : op->getRegions()) {
         for (BlockArgument arg : r.getArguments())
-          if (failed(concretizeLocOf(arg, inode)))
-            return WalkResult::interrupt();
+          if (ElaborationState result = concretizeLocOf(arg, inode);
+              result.isError() || result.shouldSkipNode())
+            return stop(result);
       }
 
       // Walk over nested scopes.
@@ -951,14 +972,17 @@ concretizeLocsInScope(iterator_range<Block::iterator> scope, ImplNode *inode) {
 
       return WalkResult::advance();
     });
+    // Stop at the first interrupt: the node suspended, or the first failure is
+    // the root cause and later ones report consequences.
+    if (walked.wasInterrupted())
+      return state;
   }
-  inode->blocker.reset();
-  return success(!inode->recordedError());
+  return ElaborationState::advance();
 }
 
 /// Concretizes the locations of all operations within scope bound by the
 /// specified block.
-static LogicalResult concretizeLocsInScope(Block &scope, ImplNode *inode) {
+static ElaborationState concretizeLocsInScope(Block &scope, ImplNode *inode) {
   return concretizeLocsInScope({scope.begin(), scope.end()}, inode);
 }
 
@@ -1043,7 +1067,7 @@ ElaborationState Elaborator::processComptimeIfOp(ImplNode *parent,
   // When the nested scope completes processing, finish processing the current
   // parameter if.
   item.onComplete = [liveRegion, debug = config.elaborateDebugInfo](
-                        ImplNode *node) -> LogicalResult {
+                        ImplNode *node) -> ElaborationState {
     assert(node->stack.size() >= 2 && "expected at least two work items");
     // Retrieve the current state.
     ImplNode::WorkItem &parentFrame = *std::next(node->stack.rbegin());
@@ -1056,8 +1080,9 @@ ElaborationState Elaborator::processComptimeIfOp(ImplNode *parent,
 
     // First update the locations if necessary
     if (debug) {
-      if (failed(concretizeLocsInScope(block, node)))
-        return failure();
+      if (ElaborationState result = concretizeLocsInScope(block, node);
+          result.isError() || result.shouldSkipNode())
+        return result;
     }
 
     Operation *terminator = block.getTerminator();
@@ -1099,7 +1124,7 @@ ElaborationState Elaborator::processComptimeIfOp(ImplNode *parent,
         return deadBlock->findAncestorOpInBlock(*o) != nullptr;
       });
     }
-    return success();
+    return ElaborationState::advance();
   };
 
   parent->stack.push_back(std::move(item));
@@ -1356,7 +1381,7 @@ ElaborationState Elaborator::processComptimeForOp(ImplNode *parent,
   // are processed and done and cleanup the result IR.
   ImplNode::WorkItem finalItem{{}, nullptr, parent->getEvaluator()};
   finalItem.onComplete = [this, op, parent, outerLoop,
-                          record](ImplNode *node) mutable -> LogicalResult {
+                          record](ImplNode *node) mutable -> ElaborationState {
     // Remove the original hlcf.comptime.for now that it has been lowered.
     recursivelyEraseFromNestedScopes(parent, op);
     op.erase();
@@ -1382,19 +1407,21 @@ ElaborationState Elaborator::processComptimeForOp(ImplNode *parent,
     // Each iteration of the hlcf.comptime.for will be turned into a nested
     // hlcf.loop and many of them will be trivial (no breaks/continues out of
     // them other than the final one).  Clean up the IR to improve compile time.
-    return success();
+    return ElaborationState::advance();
   };
   parent->stack.push_back(std::move(finalItem));
 
   // Upon completion of elaboration of each such generated loop, replace the
   // `hlcf.comptime.for` terminators with the appropriate HLCF ones.
   auto makeCompletion =
-      [debug = config.elaborateDebugInfo,
-       outerLabel](Region &region) -> std::function<LogicalResult(ImplNode *)> {
-    return [debug, &region, outerLabel](ImplNode *node) -> LogicalResult {
+      [debug = config.elaborateDebugInfo, outerLabel](
+          Region &region) -> std::function<ElaborationState(ImplNode *)> {
+    return [debug, &region, outerLabel](ImplNode *node) -> ElaborationState {
       if (debug) {
-        if (failed(concretizeLocsInScope(region.front(), node)))
-          return failure();
+        if (ElaborationState result =
+                concretizeLocsInScope(region.front(), node);
+            result.isError() || result.shouldSkipNode())
+          return result;
       }
 
       auto thisLoop = cast<HLCF::LoopOp>(region.getParentOp());
@@ -1418,7 +1445,7 @@ ElaborationState Elaborator::processComptimeForOp(ImplNode *parent,
         return WalkResult::advance();
       });
 
-      return success();
+      return ElaborationState::advance();
     };
   };
 
@@ -1625,9 +1652,15 @@ LogicalResult Elaborator::processImplNode(ImplNode *inode) {
     // Advance indicates the current work item's operation list was exhausted.
     assert(inode->stack.size() == size && "new frame with no skip");
     assert(item.ops.empty() && "advance did not exhaust worklist");
-    if (item.onComplete && failed(item.onComplete(inode))) {
-      assert(inode->recordedError() && "callback failed but no error set");
-      return success();
+    if (item.onComplete) {
+      ElaborationState result = item.onComplete(inode);
+      // Keep the frame so the resume runs the callback again.
+      if (result.shouldSkipNode())
+        return failure();
+      if (result.isError()) {
+        assert(inode->recordedError() && "callback failed but no error set");
+        return success();
+      }
     }
     inode->stack.pop_back();
   }
@@ -1936,15 +1969,16 @@ ElaborationState Elaborator::specializeGenerator(ImplNode *inode,
     }
   }
 
-  std::function<LogicalResult(ImplNode *)> onComplete;
+  std::function<ElaborationState(ImplNode *)> onComplete;
   if (config.elaborateDebugInfo) {
     // We need to recursively elaborate locations within nested regions, both on
     // ops and block arguments. We do this after the worklist is processed, to
     // ensure that all parameter computation is completed, e.g. we have
     // processed all kgen.param.decl ops.
-    onComplete = [](ImplNode *inode) -> LogicalResult {
-      if (failed(concretizeLocOf(*inode->inst, inode)))
-        return failure();
+    onComplete = [](ImplNode *inode) -> ElaborationState {
+      if (ElaborationState result = concretizeLocOf(*inode->inst, inode);
+          result.isError() || result.shouldSkipNode())
+        return result;
       return concretizeLocsInScope(inode->inst.getBodyRegion().front(), inode);
     };
   }
@@ -2652,13 +2686,15 @@ bool Elaborator::diagnoseAndBreakRecursion(unsigned generation,
 // Elaborator::run
 //===----------------------------------------------------------------------===//
 
-static WalkResult rewriteCompileOffloadOp(
+/// Replaces `op` with its offload compilation result, or returns an error if
+/// `compiledOffload` has no result for it. Several threads call this at once,
+/// so it only reads `compiledOffload`.
+static std::optional<ErrorTree> rewriteCompileOffloadOp(
     CompileOffloadOp op, Location loc,
-    DenseMap<TargetInfoAttr,
-             llvm::DenseMap<std::string,
-                            DenseMap<uint64_t, OffloadCompilationResult>>>
-        &compiledOffload,
-    bool &failed, ErrorLimit &errorLimit, bool errorIncludePrelude) {
+    const DenseMap<TargetInfoAttr,
+                   llvm::DenseMap<std::string,
+                                  DenseMap<uint64_t, OffloadCompilationResult>>>
+        &compiledOffload) {
   // Plug offload compilation results as strings back to the elaborated IR.
   auto kernelId = cast<IntegerAttr>(op.getKernelIDAttr()).getInt();
   EmitAs emissionKind = cast<EmitAsAttr>(op.getEmissionKindAttr()).getValue();
@@ -2667,56 +2703,22 @@ static WalkResult rewriteCompileOffloadOp(
   std::string groupKey = makeOffloadGroupKey(op);
 
   auto targetIter = compiledOffload.find(target);
-  if (targetIter == compiledOffload.end()) {
-    ErrorTree compileOffloadError(loc, "compile offload result missing target");
-    emitLimitedError(
-        [&] {
-          return std::move(compileOffloadError)
-              .emit([](Location loc) { return mlir::emitError(loc); },
-                    "Compile offload failed.", errorIncludePrelude);
-        },
-        errorLimit);
-    failed = true;
-    return WalkResult::interrupt();
-  }
+  if (targetIter == compiledOffload.end())
+    return ErrorTree(loc, "compile offload result missing target");
 
   auto iter0 = targetIter->second.find(groupKey);
-  if (iter0 == targetIter->second.end()) {
-    ErrorTree compileOffloadError(
-        loc,
-        "compile offload result missing emissionOptions \"" + groupKey + "\"");
-
-    emitLimitedError(
-        [&] {
-          return std::move(compileOffloadError)
-              .emit([](Location loc) { return mlir::emitError(loc); },
-                    "Compile offload failed.", errorIncludePrelude);
-        },
-        errorLimit);
-
-    failed = true;
-    return WalkResult::interrupt();
-  }
+  if (iter0 == targetIter->second.end())
+    return ErrorTree(loc, "compile offload result missing emissionOptions \"" +
+                              groupKey + "\"");
 
   auto iter = iter0->second.find(kernelId);
-  if (iter == iter0->second.end()) {
-    ErrorTree compileOffloadError(loc,
-                                  "compile offload result missing kernelId " +
-                                      std::to_string(kernelId));
-    emitLimitedError(
-        [&] {
-          return std::move(compileOffloadError)
-              .emit([](Location loc) { return mlir::emitError(loc); },
-                    "Compile offload failed.", errorIncludePrelude);
-        },
-        errorLimit);
-    failed = true;
-    return WalkResult::interrupt();
-  }
+  if (iter == iter0->second.end())
+    return ErrorTree(loc, "compile offload result missing kernelId " +
+                              std::to_string(kernelId));
 
   ImplicitLocOpBuilder b(op.getLoc(), OpBuilder(op));
-  StringAttr content = iter->second.contents[emissionKind];
-  StringAttr moduleName = iter->second.moduleNames[emissionKind];
+  StringAttr content = iter->second.contents.lookup(emissionKind);
+  StringAttr moduleName = iter->second.moduleNames.lookup(emissionKind);
   auto structType = StructType::get(op->getContext(),
                                     {content.getType(), moduleName.getType()});
 
@@ -2728,7 +2730,7 @@ static WalkResult rewriteCompileOffloadOp(
   op->replaceUsesOfWith(op.getResult(), newOp);
   op.replaceAllUsesWith(newOp.getResult());
   op.erase();
-  return WalkResult::advance();
+  return std::nullopt;
 }
 
 bool Elaborator::checkCodeGenUnreachable(ModuleOp module,
@@ -2996,24 +2998,48 @@ LogicalResult Elaborator::run(
   // Update the symbol table with the new one.
   theModule.getBodyRegion().push_back(newBlock);
 
-  renameFunctions(theModule, target.isGPU(), failed);
+  renameFunctions(theModule, sanitizesSymbolNames(target), failed);
 
-  theModule.walk([&](Operation *op) {
-    if (auto offloadOp = dyn_cast<CompileOffloadOp>(op)) {
-      // Plug offload compilation results as strings back to the elaborated
-      // IR.
-      rewriteCompileOffloadOp(offloadOp, theModule.getLoc(), compiledOffload,
-                              failed, errorLimit,
-                              options.elaborationErrorIncludePrelude);
-    } else if (auto isCompileTime =
-                   dyn_cast<IsRunInComptimeInterpreterOp>(op)) {
-      // Rewrite IsCompileTimeOp to cpuDevice value as always false.
-      OpBuilder b(op);
-      isCompileTime->replaceAllUsesWith(ParamConstantOp::create(
-          b, op->getLoc(), SIMDAttr::getScalarBool(b.getContext(), false)));
-      op->erase();
+  // Rewrite each top-level op in parallel. Emit the errors afterward, in module
+  // order, so the error limit keeps the same errors at every thread count.
+  SmallVector<Operation *, 0> topLevelOps;
+  for (Operation &op : theModule.getOps())
+    topLevelOps.push_back(&op);
+  SmallVector<SmallVector<ErrorTree>, 0> rewriteErrors = parallelMap(
+      theModule->getContext(), topLevelOps, [&](Operation *topLevelOp) {
+        SmallVector<ErrorTree> errors;
+        topLevelOp->walk([&](Operation *op) {
+          if (auto offloadOp = dyn_cast<CompileOffloadOp>(op)) {
+            // Plug offload compilation results as strings back to the
+            // elaborated IR.
+            if (std::optional<ErrorTree> error = rewriteCompileOffloadOp(
+                    offloadOp, theModule.getLoc(), compiledOffload))
+              errors.push_back(std::move(*error));
+          } else if (auto isCompileTime =
+                         dyn_cast<IsRunInComptimeInterpreterOp>(op)) {
+            // Rewrite IsCompileTimeOp to cpuDevice value as always false.
+            OpBuilder b(op);
+            isCompileTime->replaceAllUsesWith(ParamConstantOp::create(
+                b, op->getLoc(),
+                SIMDAttr::getScalarBool(b.getContext(), false)));
+            op->erase();
+          }
+        });
+        return errors;
+      });
+  for (SmallVector<ErrorTree> &errors : rewriteErrors) {
+    for (ErrorTree &error : errors) {
+      emitLimitedError(
+          [&] {
+            return std::move(error).emit(
+                [](Location loc) { return mlir::emitError(loc); },
+                "Compile offload failed.",
+                options.elaborationErrorIncludePrelude);
+          },
+          errorLimit);
+      failed = true;
     }
-  });
+  }
 
   for (Operation &op : theModule.getOps())
     if (op.hasTrait<OpTrait::SymbolTable>())
@@ -3131,6 +3157,12 @@ public:
     options.elaborationErrorIncludePrelude = errorIncludePrelude;
     options.elaborationErrorVerbose = errorVerbose;
     options.elaborationMaxDepth = maxDepth;
+
+    // The standalone pass can enable debug info without CompilationOptions.
+    // Nested compile_assembly calls must preserve that debug info too.
+    if (elaborateDebugInfo &&
+        options.debugLevel == CompilationOptions::kNoDebug)
+      options.debugLevel = CompilationOptions::kFullDebugInfo;
 
     // Now, construct and run the elaborator.
     if (useParametricInterpreter) {

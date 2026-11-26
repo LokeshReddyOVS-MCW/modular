@@ -91,17 +91,41 @@ mo.graph @epilogue(%x: !mo.tensor<[8, 128], f32>) -> !mo.tensor<[8, 128], f32> {
   mo.output %z : !mo.tensor<[8, 128], f32>
 }
 
-// The sum is also a graph output, and a per-row store can't sit next to a map
-// phase yet: the division stays its own kernel.
+// The sum is also a graph output: it stays a per-row store, before the map
+// phase the division joins.
 // CHECK-LABEL: mo.graph @perRowOutputKept
-// CHECK:       map.iter.rowwise
-// CHECK-NOT:     map.iter.map
-// CHECK:       map.iter.elementwise<[8, 128]>
+// CHECK:       %[[R:.*]]:2 = map.iter.rowwise<[8, 128], axis = 1>
+// CHECK:         map.iter.reduce
+// CHECK:         map.store %{{.*}}[%{{.*}}] = %acc : !mo.tensor<[8, 1], f32>
+// CHECK:         map.iter.map
+// CHECK-NOT:   map.iter.elementwise
+// CHECK:       mo.output %[[R]]#{{[01]}}, %[[R]]#{{[01]}}
 mo.graph @perRowOutputKept(%x: !mo.tensor<[8, 128], f32>) -> (!mo.tensor<[8, 128], f32>, !mo.tensor<[8, 1], f32>) {
   %s = mo.reduce.add(%x) : (!mo.tensor<[8, 128], f32>) -> !mo.tensor<[8, 1], f32>
   %sb = mo.static.broadcast_to(%s) : !mo.tensor<[8, 1], f32> -> !mo.tensor<[8, 128], f32>
   %y = mo.div(%x, %sb) : !mo.tensor<[8, 128], f32>
   mo.output %y, %s : !mo.tensor<[8, 128], f32>, !mo.tensor<[8, 1], f32>
+}
+
+// A per-row consumer of a reduction whose body already has a map phase joins
+// it as row-level ops before the map phase, which stays last.
+// CHECK-LABEL: mo.graph @perRowConsumerAfterMapPhase
+// CHECK:       map.iter.rowwise<[8, 128], axis = 1>
+// CHECK:         map.iter.reduce
+// CHECK:         map.call.elementwise @{{.*}}Mul
+// CHECK:         map.store %{{.*}} : !mo.tensor<[8, 1], f32>
+// CHECK:         map.iter.map
+// CHECK-NEXT:      map.load
+// CHECK:       }
+// CHECK-NOT:   map.iter.elementwise
+mo.graph @perRowConsumerAfterMapPhase(%x: !mo.tensor<[8, 128], f32>) -> (!mo.tensor<[8, 128], f32>, !mo.tensor<[8, 1], f32>) {
+  %s = mo.reduce.add(%x) : (!mo.tensor<[8, 128], f32>) -> !mo.tensor<[8, 1], f32>
+  %sb = mo.static.broadcast_to(%s) : !mo.tensor<[8, 1], f32> -> !mo.tensor<[8, 128], f32>
+  %y = mo.div(%x, %sb) : !mo.tensor<[8, 128], f32>
+  %two = mo.constant <#M.dense_array<2.0> : tensor<f32>> : !mo.tensor<[], f32>
+  %twob = mo.static.broadcast_to(%two) : !mo.tensor<[], f32> -> !mo.tensor<[8, 1], f32>
+  %t = mo.mul(%s, %twob) : !mo.tensor<[8, 1], f32>
+  mo.output %y, %t : !mo.tensor<[8, 128], f32>, !mo.tensor<[8, 1], f32>
 }
 
 // Through the transpose, element (i, j) reads row j's sum: not fused.
@@ -158,6 +182,71 @@ mo.graph @variance(%x: !mo.tensor<[8, 128], f32>) -> !mo.tensor<[8, 1], f32> {
   %d2 = mo.mul(%d, %d) : !mo.tensor<[8, 128], f32>
   %v = mo.reduce.add(%d2) : (!mo.tensor<[8, 128], f32>) -> !mo.tensor<[8, 1], f32>
   mo.output %v : !mo.tensor<[8, 1], f32>
+}
+
+// The difference is also a graph output, so it is written anyway: it becomes
+// the first reduction's map phase, and the second reduction reads it back.
+// CHECK-LABEL: mo.graph @varianceDifferenceOutput
+// CHECK:       %[[R1:.*]] = map.iter.rowwise<[8, 128], axis = 1>
+// CHECK:         map.iter.map index (%[[I7:.*]]: !map.index<2>) {
+// CHECK:           %[[D7:.*]] = map.call.elementwise @builtin_kernels.elementwise.Sub
+// CHECK-NEXT:      map.store %{{.*}}[%[[I7]]] = %[[D7]]
+// CHECK:       %[[R2:.*]] = map.iter.rowwise<[8, 128], axis = 1>
+// CHECK-NEXT:  inputs  (%[[R1]]: !mo.tensor<[8, 128], f32>)
+// CHECK:         map.iter.reduce
+// CHECK:           map.call.elementwise @builtin_kernels.elementwise.Mul
+// CHECK-NOT:   map.iter.elementwise
+// CHECK:       mo.output %[[R2]], %[[R1]]
+mo.graph @varianceDifferenceOutput(%x: !mo.tensor<[8, 128], f32>) -> (!mo.tensor<[8, 1], f32>, !mo.tensor<[8, 128], f32>) {
+  %s = mo.reduce.add(%x) : (!mo.tensor<[8, 128], f32>) -> !mo.tensor<[8, 1], f32>
+  %n = mo.constant <#M.dense_array<128.0> : tensor<f32>> : !mo.tensor<[], f32>
+  %nb = mo.static.broadcast_to(%n) : !mo.tensor<[], f32> -> !mo.tensor<[8, 1], f32>
+  %m = mo.div(%s, %nb) : !mo.tensor<[8, 1], f32>
+  %mb = mo.static.broadcast_to(%m) : !mo.tensor<[8, 1], f32> -> !mo.tensor<[8, 128], f32>
+  %d = mo.sub(%x, %mb) : !mo.tensor<[8, 128], f32>
+  %d2 = mo.mul(%d, %d) : !mo.tensor<[8, 128], f32>
+  %v = mo.reduce.add(%d2) : (!mo.tensor<[8, 128], f32>) -> !mo.tensor<[8, 1], f32>
+  mo.output %v, %d : !mo.tensor<[8, 1], f32>, !mo.tensor<[8, 128], f32>
+}
+
+// The difference also feeds a hand-written kernel: the second reduction can't
+// take it as a producer, which it would share, so it is written from the first
+// reduction's map phase.
+// CHECK-LABEL: mo.graph @varianceDifferenceOpaqueReader
+// CHECK:       %[[R3:.*]] = map.iter.rowwise<[8, 128], axis = 1>
+// CHECK:         map.iter.map
+// CHECK:       map.iter.rowwise<[8, 128], axis = 1>
+// CHECK-NEXT:  inputs  (%[[R3]]: !mo.tensor<[8, 128], f32>)
+// CHECK:       map.iter.opaque
+// CHECK-NEXT:  inputs (%{{.*}}: !mo.tensor<[8, 128], f32>, %[[R3]]: !mo.tensor<[8, 128], f32>)
+// CHECK-NOT:   map.iter.elementwise
+mo.graph @varianceDifferenceOpaqueReader(%x: !mo.tensor<[8, 128], f32>, %a: !mo.tensor<[8, 128], f32>) -> (!mo.tensor<[8, 1], f32>, !mo.tensor<[8, 128], f32>) {
+  %s = mo.reduce.add(%x) : (!mo.tensor<[8, 128], f32>) -> !mo.tensor<[8, 1], f32>
+  %sb = mo.static.broadcast_to(%s) : !mo.tensor<[8, 1], f32> -> !mo.tensor<[8, 128], f32>
+  %d = mo.sub(%x, %sb) : !mo.tensor<[8, 128], f32>
+  %d2 = mo.mul(%d, %d) : !mo.tensor<[8, 128], f32>
+  %v = mo.reduce.add(%d2) : (!mo.tensor<[8, 128], f32>) -> !mo.tensor<[8, 1], f32>
+  %k = mo.custom [symbol = "map_lower_partial_fused_inputs", device = #M.device_ref<"cpu", 0>](%a, %d) : (!mo.tensor<[8, 128], f32>, !mo.tensor<[8, 128], f32>) -> !mo.tensor<[8, 128], f32>
+  mo.output %v, %k : !mo.tensor<[8, 1], f32>, !mo.tensor<[8, 128], f32>
+}
+
+// Two different reductions read the difference, so neither can take it as a
+// producer: it becomes the first reduction's map phase, and both read it back.
+// CHECK-LABEL: mo.graph @differenceTwoReductions
+// CHECK:       %[[R4:.*]] = map.iter.rowwise<[8, 128], axis = 1>
+// CHECK:         map.iter.map
+// CHECK:       map.iter.rowwise<[8, 128], axis = 1>
+// CHECK-NEXT:  inputs  (%[[R4]]: !mo.tensor<[8, 128], f32>)
+// CHECK:       map.iter.rowwise<[8, 128], axis = 1>
+// CHECK-NEXT:  inputs  (%[[R4]]: !mo.tensor<[8, 128], f32>)
+// CHECK-NOT:   map.iter.elementwise
+mo.graph @differenceTwoReductions(%x: !mo.tensor<[8, 128], f32>) -> (!mo.tensor<[8, 1], f32>, !mo.tensor<[8, 1], f32>) {
+  %s = mo.reduce.add(%x) : (!mo.tensor<[8, 128], f32>) -> !mo.tensor<[8, 1], f32>
+  %sb = mo.static.broadcast_to(%s) : !mo.tensor<[8, 1], f32> -> !mo.tensor<[8, 128], f32>
+  %d = mo.sub(%x, %sb) : !mo.tensor<[8, 128], f32>
+  %a = mo.reduce.add(%d) : (!mo.tensor<[8, 128], f32>) -> !mo.tensor<[8, 1], f32>
+  %m = mo.reduce.max(%d) : (!mo.tensor<[8, 128], f32>) -> !mo.tensor<[8, 1], f32>
+  mo.output %a, %m : !mo.tensor<[8, 1], f32>, !mo.tensor<[8, 1], f32>
 }
 
 // Two transposes bring the sum back to its own row: it fuses.

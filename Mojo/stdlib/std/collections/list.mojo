@@ -460,6 +460,52 @@ struct List[T: AnyType, /](
         self._len = length
         _ = self._storage.storage().unsafe_init_with(fill_with)
 
+    # TODO(MOCO-4470): Merge into the non-raising overload above once a
+    # non-raising closure can be called as `raises E` with `E` bound to
+    # `Never`.
+    # TODO(https://github.com/modular/modular/issues/7637): Drop `Movable` from
+    # the `T` constraint once a raising call can construct its result in
+    # place behind a `Pointer`, and a raising closure can return a
+    # non-`Movable` type (https://github.com/modular/modular/issues/7636).
+    @inline(.always)
+    def __init__[
+        E: AnyType, //
+    ](
+        out self, *, length: Int, fill_with: Some[def(Int) raises E -> Self.T]
+    ) raises E where conforms_to(Self.T, Movable & Deinitable):
+        """Constructs a list by calling `fill_with(i)` for each index `i`,
+        where `fill_with` can raise.
+
+        If `fill_with` raises, the list destroys the elements it already
+        holds, frees its memory, and propagates the error.
+
+        Parameters:
+            E: The type of error that `fill_with` raises.
+
+        Args:
+            length: The requested length of the list.
+            fill_with: A function called with each index in `[0, length)`,
+                whose result is written to that position.
+
+        Raises:
+            E: If `fill_with` raises for any index.
+
+        Examples:
+
+        ```mojo
+        def num(i: Int) raises -> Int:
+            raise "error"
+
+        try:
+            var numbers = List(length=3, fill_with=num)
+        except e:
+            print(e)  # error
+        ```
+        """
+        self = Self(capacity=length)
+        for i in range(length):
+            self.append(fill_with(i))
+
     @inline(.always)
     def __init__(
         out self, var *values: Self.T, __list_literal__: NoneType
@@ -725,7 +771,6 @@ struct List[T: AnyType, /](
     # Without this, a call through a mutable `ref self` counts as a write to
     # the list and invalidates its existing pointers and views. This is safe
     # because creating an iterator does not change the list or its elements.
-    @__unsafe_nested_origins_read_only
     def __iter__(ref self) -> Self.IteratorType[origin_of(self)]:
         """Iterate over elements of the list, returning immutable references.
 
@@ -742,7 +787,6 @@ struct List[T: AnyType, /](
     # the list and invalidates its existing pointers and views. This is safe
     # because creating a reverse iterator does not change the list or its
     # elements.
-    @__unsafe_nested_origins_read_only
     def __reversed__(
         ref self,
     ) -> _ListIter[Self.T, origin_of(self), False] where conforms_to(
@@ -1241,7 +1285,8 @@ struct List[T: AnyType, /](
             With no new value provided, the new length must be smaller than or
             equal to the current one. Elements at the end are discarded.
 
-            Calls abort() if the new length is larger than the current length.
+            Calls abort() if the new length is larger than the current length,
+            or if the new length is negative.
 
         Examples:
 
@@ -1257,6 +1302,13 @@ struct List[T: AnyType, /](
                 " current size. If you want to make the List bigger, provide a"
                 " value to fill the new slots with. If not, make sure the new"
                 " size is smaller than the current size."
+            )
+
+        if new_length < 0:
+            abort(
+                t"You are calling List.shrink with a negative value:"
+                t" {new_length}. The new size must be in the range [0,"
+                t" {len(self)}]."
             )
 
         Span(self)._unchecked_subspan(
@@ -1293,7 +1345,6 @@ struct List[T: AnyType, /](
     # Without this, a call through a mutable `ref self` counts as a write to
     # the list and invalidates its existing pointers and views. This is safe
     # because the search only reads the list and compares its elements.
-    @__unsafe_nested_origins_read_only
     def try_index(
         ref self,
         value: Self.T,
@@ -1345,7 +1396,6 @@ struct List[T: AnyType, /](
     # Without this, a call through a mutable `ref self` counts as a write to
     # the list and invalidates its existing pointers and views. This is safe
     # because the search only reads the list and compares its elements.
-    @__unsafe_nested_origins_read_only
     def index(
         ref self,
         value: Self.T,
@@ -1482,7 +1532,6 @@ struct List[T: AnyType, /](
             ].copy(),
         )
 
-    @__unsafe_nested_origins_read_only
     @stable(since="1.0")
     @inline(.always)
     def __getitem__(
@@ -1520,7 +1569,6 @@ struct List[T: AnyType, /](
             length = end - start,
         }
 
-    @__unsafe_nested_origins_read_only
     @inline(.always)
     def __getitem__(
         ref self, idx: IntLiteral, /
@@ -1542,7 +1590,6 @@ struct List[T: AnyType, /](
         return self.unsafe_get(index(idx))
 
     @stable(since="1.0")
-    @__unsafe_nested_origins_read_only
     @inline(.always)
     def __getitem__(
         ref self, idx: Int, /
@@ -1565,7 +1612,6 @@ struct List[T: AnyType, /](
         check_bounds(idx, length=len(self))
         return self.unsafe_get(index(idx))
 
-    @__unsafe_nested_origins_read_only
     @inline(.always)
     def __getitem__(
         ref self, idx: Some[Indexer]
@@ -1588,7 +1634,6 @@ struct List[T: AnyType, /](
         check_bounds(index(idx), length=len(self))
         return self.unsafe_get(index(idx))
 
-    @__unsafe_nested_origins_read_only
     @inline(.always)
     def unsafe_get(
         ref self, idx: Int
@@ -1698,7 +1743,6 @@ struct List[T: AnyType, /](
     # Without this, a call through a mutable `ref self` counts as a write to
     # the list and invalidates its existing pointers and views. This is safe
     # because forming a pointer does not change the list or its elements.
-    @__unsafe_nested_origins_read_only
     def unsafe_ptr[
         origin: Origin,
         //,

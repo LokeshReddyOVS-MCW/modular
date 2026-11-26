@@ -509,12 +509,6 @@ bool SingletonAttr::isConstant() const {
 }
 
 //===----------------------------------------------------------------------===//
-// UnboundAttr
-//===----------------------------------------------------------------------===//
-
-bool UnboundAttr::isConstant() const { return !isParameterizedType(getType()); }
-
-//===----------------------------------------------------------------------===//
 // NoneAttr
 //===----------------------------------------------------------------------===//
 
@@ -1125,7 +1119,7 @@ ParamsBindingArrayAttr::get(MLIRContext *context, size_t numParams,
   SmallVector<TypedAttr> boundValues;
   SmallVector<bool> boundBits(numParams, false);
   for (auto [idx, value] : llvm::enumerate(paramValues)) {
-    if (!value || isa<UnboundAttr>(value))
+    if (!value)
       continue;
     boundBits[idx] = true;
     boundValues.push_back(value);
@@ -1230,8 +1224,29 @@ static DenseBoolArrayAttr mergeDischargedConstraints(
 
 BindParamsAttr BindParamsAttr::getFromBytecode(TypedAttr generator,
                                                ParamsBindingArrayAttr params,
-                                               DenseBoolArrayAttr discharged) {
-  return Base::get(generator.getContext(), generator, params, discharged);
+                                               DenseBoolArrayAttr discharged,
+                                               Type type) {
+  return Base::get(generator.getContext(), generator, params, discharged, type);
+}
+
+Attribute BindParamsAttr::parse(AsmParser &p, Type type) {
+  llvm::SMLoc loc = p.getCurrentLocation();
+  TypedAttr generator;
+  ParamsBindingArrayAttr params;
+  DenseBoolArrayAttr discharged;
+  if (p.parseLess() || parseBindParams(p, generator, params, discharged) ||
+      p.parseGreater())
+    return {};
+  if (failed(verify([&] { return p.emitError(loc); }, generator, params,
+                    discharged, type)))
+    return {};
+  return get(p.getContext(), generator, params, discharged, type);
+}
+
+void BindParamsAttr::print(AsmPrinter &p) const {
+  p << "<";
+  printBindParams(p, getGenerator(), getParams(), getDischarged());
+  p << ">";
 }
 
 static bool isEagerlyInstantiatable(GeneratorType generator) {
@@ -1333,13 +1348,6 @@ Type BindParamsAttr::inferResultType(
   return inferResultType(genType, params, /*discharged=*/{}, evaluationContext);
 }
 
-Type BindParamsAttr::getType() const {
-  return inferBindParamsResultType(
-      sugarCast<GeneratorType>(getGenerator().getType()), getParams(),
-      getDischarged(),
-      /*evaluationContext=*/nullptr);
-}
-
 /// Strips top-level sugar, including rebinds between canonically equal types,
 /// which canonicalization would remove. The result may differ from `value` in
 /// type sugar, so it is only suitable for deciding whether a fold applies.
@@ -1357,13 +1365,14 @@ static TypedAttr stripSugarAndSugarRebinds(TypedAttr value) {
 
 TypedAttr BindParamsAttr::get(MLIRContext *context, TypedAttr generator,
                               ParamsBindingArrayAttr params,
-                              DenseBoolArrayAttr discharged,
+                              DenseBoolArrayAttr discharged, Type resultType,
                               ParameterEvaluationContext *evaluationContext) {
   auto genType = sugarCast<GeneratorType>(generator.getType());
   assert(params.size() == genType.getInputParamTypes().size() &&
          "params must cover every generator input");
-  Type type =
-      inferBindParamsResultType(genType, params, discharged, evaluationContext);
+  Type type = resultType ? resultType
+                         : inferBindParamsResultType(
+                               genType, params, discharged, evaluationContext);
 
   // No bindings to apply: the generator already has the requested type.
   if (params.getBoundValues().empty() && (!discharged || discharged.empty()) &&
@@ -1395,7 +1404,7 @@ TypedAttr BindParamsAttr::get(MLIRContext *context, TypedAttr generator,
     }
     TypedAttr flattened =
         BindParamsAttr::get(bindParams.getContext(), bindParams.getGenerator(),
-                            mergedParams, mergedMask, evaluationContext);
+                            mergedParams, mergedMask, type, evaluationContext);
     if (!flattened)
       return {};
     assert(isEqualCanon(flattened.getType(), type) &&
@@ -1438,17 +1447,7 @@ TypedAttr BindParamsAttr::get(MLIRContext *context, TypedAttr generator,
   }
 
   // No simplification applies. Build the BindParamsAttr directly.
-  TypedAttr result =
-      Base::get(generator.getContext(), generator, params, discharged);
-
-  // The inferred type could be more concrete as a evaluation context is used
-  // for folding. When the trivially inferred type does not agree, simply
-  // rebind?
-  //
-  // TODO: does this means that we missed a case in `simplifyBindParams`.
-  if (result.getType() != type)
-    result = ParamOperatorAttr::getRebind(result, type);
-  return result;
+  return Base::get(generator.getContext(), generator, params, discharged, type);
 }
 
 TypedAttr BindParamsAttr::get(MLIRContext *context, TypedAttr generator,
@@ -1459,7 +1458,8 @@ TypedAttr BindParamsAttr::get(MLIRContext *context, TypedAttr generator,
       context,
       sugarCast<GeneratorType>(generator.getType()).getInputParamTypes().size(),
       paramValues);
-  return get(context, generator, params, discharged, evaluationContext);
+  return get(context, generator, params, discharged, /*resultType=*/{},
+             evaluationContext);
 }
 
 TypedAttr BindParamsAttr::get(MLIRContext *context, TypedAttr generator,
@@ -1473,11 +1473,12 @@ TypedAttr
 BindParamsAttr::getChecked(function_ref<InFlightDiagnostic()> emitError,
                            MLIRContext *context, TypedAttr generator,
                            ParamsBindingArrayAttr params,
-                           DenseBoolArrayAttr discharged,
+                           DenseBoolArrayAttr discharged, Type resultType,
                            ParameterEvaluationContext *evaluationContext) {
-  if (failed(verify(emitError, generator, params, discharged)))
+  if (failed(verify(emitError, generator, params, discharged, resultType)))
     return {};
-  return get(context, generator, params, discharged, evaluationContext);
+  return get(context, generator, params, discharged, resultType,
+             evaluationContext);
 }
 
 bool BindParamsAttr::isConstant() const { return false; }
@@ -1519,7 +1520,7 @@ verifyGeneratorAndDischarged(function_ref<InFlightDiagnostic()> emitError,
 LogicalResult
 BindParamsAttr::verify(function_ref<InFlightDiagnostic()> emitError,
                        TypedAttr generator, ParamsBindingArrayAttr params,
-                       DenseBoolArrayAttr discharged) {
+                       DenseBoolArrayAttr discharged, Type type) {
   if (failed(verifyGeneratorAndDischarged(emitError, generator, discharged)))
     return failure();
   size_t numInputs =
@@ -3214,7 +3215,7 @@ static Attribute simplifyAnd(SmallVectorImpl<TypedAttr> &operands,
   // The fold covers the flatten, dedup, sort and True/False handling below for
   // a scalar-bool AND, and also merges identity classes.
   if (isScalarOf<KGENDType::kBool>(resultType))
-    return foldBoolConjunction(operands, resultType);
+    return foldBoolConjunction(operands);
   return simplifyAssocOp(
       POC::And, operands, true,
       std::make_tuple(
@@ -4178,9 +4179,6 @@ static TypedAttr simplifyRebind(ArrayRef<TypedAttr> operands, Type resultType) {
   TypedAttr input = operands.front();
   if (input.getType() == resultType)
     return input;
-  // Fold rebinds of an unbound.
-  if (isa<UnboundAttr>(input))
-    return UnboundAttr::get(resultType);
   if (isa<UnknownAttr>(input))
     return UnknownAttr::get(resultType);
 
@@ -4445,23 +4443,37 @@ constexpr POC migratedPOCs[] = {
     POC::FloorDivS, POC::RemS, POC::RemU,      POC::Mod,      POC::EQ,
     POC::LT,        POC::LE};
 
-TypedAttr KGEN::foldBoolConjunction(ArrayRef<TypedAttr> conjuncts,
-                                    Type boolType) {
+TypedAttr KGEN::foldBoolConjunction(ArrayRef<TypedAttr> conjuncts) {
+  assert(!conjuncts.empty() && "conjunction has no conjuncts");
+  MLIRContext *ctx = conjuncts.front().getContext();
+
+  // A scalar-bool AND only exists in folded form, so conjoining onto an
+  // assumption set only costs the new clauses' inserts, not a refold of the
+  // whole set.
+  // TODO: Seed from the largest scalar-bool AND once the fold is
+  // order-independent. Today `conforms_to` slots on one type value that jointly
+  // prove a packed bound keep whichever form was inserted first.
   SmallVector<TypedAttr> clauses;
+  auto seed = dyn_cast<ParamOperatorAttr>(getCanonicalAttr(conjuncts.front()));
+  if (seed && seed.getOpcode() == POC::And &&
+      isScalarOf<KGENDType::kBool>(seed.getType())) {
+    llvm::append_range(clauses, seed.getOperands());
+    conjuncts = conjuncts.drop_front();
+  }
   for (TypedAttr conjunct : conjuncts) {
     if (insertClause(clauses, getCanonicalAttr(conjunct)) ==
         ClauseInsertResult::Contradiction)
-      return SIMDAttr::getScalarBool(boolType.getContext(), false);
+      return SIMDAttr::getScalarBool(ctx, false);
   }
   if (clauses.empty())
-    return SIMDAttr::getScalarBool(boolType.getContext(), true);
+    return SIMDAttr::getScalarBool(ctx, true);
   if (clauses.size() == 1)
     return clauses[0];
   llvm::stable_sort(clauses, ParameterAttr::compare);
   // `Base::get`, not `get`: the latter folds through `simplifyAnd`, which
   // calls back here on the same clauses.
-  return ParamOperatorAttr::Base::get(boolType.getContext(), POC::And, clauses,
-                                      boolType);
+  return ParamOperatorAttr::Base::get(ctx, POC::And, clauses,
+                                      SIMDType::getScalarBoolType(ctx));
 }
 
 /// Construct a arithmetic parameter operator attribute, folding it (in the form
@@ -4815,47 +4827,6 @@ bool ParamOperatorAttr::isLessThan(Attribute rhs) const {
   return false;
 }
 
-ErrorOrSuccess
-ParamOperatorAttr::validateForElaborator(TargetInfoAttr target) const {
-  // If this is a shift by a constant amount that does not fit in the operand's
-  // bit width, produce a clear user-facing diagnostic instead of the generic
-  // "could not simplify" note.
-  auto opcode = getOpcode();
-  if (opcode == POC::Shr || opcode == POC::Shl) {
-    ArrayRef<TypedAttr> operands = getOperands();
-    if (operands.size() == 2) {
-      auto lhsType = sugarDynCast<SIMDType>(operands[0].getType());
-      auto rhs = sugarDynCast<SIMDAttr>(operands[1]);
-      if (lhsType && rhs) {
-        std::optional<KGENDType> dtype = lhsType.getResolvedDType();
-        if (dtype) {
-          int64_t width = dtype->getWidthInBits(target);
-          if (width > 0) {
-            for (const DTypeValue &lane : rhs.getValues()) {
-              const APSInt &amount = lane.getData();
-              if (amount.isNegative() || amount.uge(width)) {
-                SmallVector<char, 16> amountStr;
-                amount.toString(amountStr);
-                std::string typeName =
-                    getTypeAsString(operands[0].getType()).str();
-                return Error(
-                    "shift amount " +
-                    StringRef(amountStr.data(), amountStr.size()).str() +
-                    " is outside the valid range 0.." +
-                    std::to_string(width - 1) + " for " + typeName);
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-
-  // If this operator didn't fold, then it's a problem.
-  // TODO: we could diagnose WHY it isn't folding more nicely now.
-  return Error("could not simplify operator " + getParamAsString(*this));
-}
-
 //===----------------------------------------------------------------------===//
 // ParamIdenticalAttr
 //===----------------------------------------------------------------------===//
@@ -5074,19 +5045,6 @@ ParamIdenticalAttr::verify(function_ref<InFlightDiagnostic()> emitError,
 }
 
 bool ParamIdenticalAttr::isConstant() const { return false; }
-
-ErrorOrSuccess
-ParamIdenticalAttr::validateForElaborator(TargetInfoAttr target) const {
-  ArrayRef<TypedAttr> operands = getOperands();
-  std::string operandList;
-  llvm::raw_string_ostream os(operandList);
-  llvm::interleave(
-      operands.drop_back(), os,
-      [&](TypedAttr operand) { os << getParamAsString(operand); }, ", ");
-  os << " and " << getParamAsString(operands.back());
-  return Error("could not prove whether " + operandList +
-               " are the same value");
-}
 
 //===----------------------------------------------------------------------===//
 // MLIROpAttr
@@ -5660,6 +5618,11 @@ bool SugarAttr::hasTopLevelSugar(Type type) {
 }
 
 static Attribute getLocalCanonical(Attribute attr) {
+  // A failed expression emission is a null attribute; there is nothing to
+  // canonicalize.
+  if (!attr)
+    return {};
+
   // SugarAttr maintains its canonical form directly so we don't need to walk.
   if (auto sugar = dyn_cast<SugarAttr>(attr))
     return sugar.getCanonical();
@@ -5673,7 +5636,7 @@ static Type getLocalCanonical(Type type) {
 
   // Otherwise, see if the LIT type knows how to elide itself.
   if (auto sugarItf = dyn_cast<KGEN::SugaredTypeInterface>(type))
-    return sugarItf.getCachedCanonicalType(type);
+    return sugarItf.getCachedCanonicalType();
 
   return {};
 }
@@ -6039,6 +6002,9 @@ SIMDAttr SIMDAttr::getZeroValue(SIMDType type) {
   } else if (dtype.isInt()) {
     APSInt aps(dtype.getIntegerWidthInBits(), /*isUnsigned=*/dtype.isUInt());
     zeroValue = DTypeValue(aps, dtype);
+  } else if (dtype.isIndex() || dtype.isUIndex() || dtype.isAddress()) {
+    // Zero doesn't depend on the target's index bit width.
+    zeroValue = DTypeValue(int64_t{0}, dtype);
   } else if (auto *sem = dtype.getFloatSemantics()) {
     zeroValue = DTypeValue(APFloat::getZero(*sem), dtype);
   }

@@ -28,6 +28,7 @@ load("//bazel/internal:mojo_binary.bzl", _mojo_binary = "mojo_binary")  # buildi
 load("//bazel/internal:mojo_filecheck_test.bzl", _mojo_filecheck_test = "mojo_filecheck_test")  # buildifier: disable=bzl-visibility
 load("//bazel/internal:mojo_library.bzl", _mojo_library = "mojo_library")  # buildifier: disable=bzl-visibility
 load("//bazel/internal:mojo_merged_precompile.bzl", _mojo_merged_precompile = "mojo_merged_precompile")  # buildifier: disable=bzl-visibility
+load("//bazel/internal:mojo_package_group.bzl", _mojo_package_group = "mojo_package_group")  # buildifier: disable=bzl-visibility
 load("//bazel/internal:mojo_shared_library.bzl", _mojo_shared_library = "mojo_shared_library")  # buildifier: disable=bzl-visibility
 load("//bazel/internal:mojo_test.bzl", _mojo_test = "mojo_test")  # buildifier: disable=bzl-visibility
 load("//bazel/internal:mojo_test_environment.bzl", _mojo_test_environment = "mojo_test_environment")  # buildifier: disable=bzl-visibility
@@ -86,11 +87,16 @@ def modular_cc_library(name, **kwargs):
     # TODO(SDLC-4549): the profiler (Tracy) is still stubbed in OSS; source-build
     # it in a follow-up (needs the tracy deps wired in OSS).
     if name == "Profiling":
-        # Headers only, with every Tracy backend compiled out (no @tracy dep).
+        # Headers only, with every Tracy backend and M_PROFILE_RANGE compiled
+        # out (no @tracy dep).
         _modular_cc_library(
             name = name,
             hdrs = kwargs.get("hdrs", []),
-            defines = ["TRACY_CUDA_ENABLE=0", "TRACY_ROCM_ENABLE=0"],
+            defines = [
+                "TRACY_CUDA_ENABLE=0",
+                "TRACY_ROCM_ENABLE=0",
+                "MODULAR_PROFILE_RANGES=0",
+            ],
             deps = ["//Support:TimeProfiler", "@llvm-project//llvm:Support"],
         )
         return
@@ -112,6 +118,7 @@ def modular_shared_library(name = None, **kwargs):
 
 mojo_binary = _mojo_binary
 mojo_library = _mojo_library
+mojo_package_group = _mojo_package_group
 mojo_shared_library = _mojo_shared_library
 modular_py_binary = _modular_py_binary
 mef = _mef

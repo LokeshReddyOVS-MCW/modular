@@ -15,6 +15,18 @@ mojo_test(
     ],
 )
 
+mojo_test(
+    name = "test_matmul_sm100_bf16_dit_band_dispatch.mojo.test",
+    size = "small",
+    srcs = ["test_matmul_sm100_bf16_dit_band_dispatch.mojo"],
+    copts = IGNORED_POINTER_DEPRECATIONS_COPTS,
+    deps = [
+        "//max:internal_utils",
+        "//max:linalg",
+        "@mojo//:std",
+    ],
+)
+
 # Grouped GEMM infrastructure tests - portable to any NVIDIA GPU
 # These tests validate scheduling logic, not block-scaled MMA operations
 _GROUPED_GEMM_INFRA_TESTS = [
@@ -98,6 +110,20 @@ _EXTRA_CONSTRAINTS = {
     # Tiled blockwise-scaled FP8 dense matmul — CDNA4 16x16x128 FP8 MFMA,
     # MI355X-specific.
     "test_blockwise_fp8_matmul_amd.mojo": ["//:mi355_gpu"],
+    # Tiled blockwise-scaled FP8 dense matmul on NVIDIA parts without tcgen05:
+    # GB10 (sm_121a) today, RTX 50-series (sm_120) by the same gate. B200 runs
+    # the SM100 kernel and this test asserts the no-tcgen05 gate is open, so it
+    # is not compatible there.
+    "test_blockwise_fp8_matmul_nvidia.mojo": select({
+        "//:gb10_gpu": ["//:gb10_gpu"],
+        "//:rtx5090_gpu": ["//:rtx5090_gpu"],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    "test_blockwise_fp8_matmul_nvidia_bench.mojo": select({
+        "//:gb10_gpu": ["//:gb10_gpu"],
+        "//:rtx5090_gpu": ["//:rtx5090_gpu"],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
     "test_batched_matmul_dynamic_scaled_fp8_amd_tiled.mojo": ["//:mi355_gpu"],
     "test_batched_matmul_dynamic_scaled_fp8_amd_tiled_mla_layout.mojo": ["//:mi355_gpu"],
     "test_blockwise_fp8_matmul_amd_bench.mojo": ["//:mi355_gpu"],
@@ -295,6 +321,13 @@ _B200_SMOKE_TESTS = [
     "test_tma_im2col_unit.mojo",
 ]
 
+# Contract guards: they pass without the epilogue wait on the current `ptxas`
+# and fail when the load warps' waits are removed, so they run after merge.
+_PDL_CONTRACT_GUARD_TESTS = [
+    "test_block_scaled_matmul_epilogue_pdl_race.mojo",
+    "test_gemm_mma_cpasync_epilogue_pdl_race.mojo",
+]
+
 _B200_TESTS = [
     "test_matmul_sm100_swiglu_pdl.mojo",
     "test_bulk_mma_pair_cta_sm100.mojo",
@@ -305,7 +338,7 @@ _B200_TESTS = [
     "test_tma_pair_mma_sm100.mojo",
     "test_matmul_sm100_fallback.mojo",
     "test_matmul_sm100_fp8_smallm_band_dispatch.mojo",
-    "test_matmul_sm100_bf16_dit_band_dispatch.mojo",
+    "test_matmul_sm100_bf16_glm53_rows_dispatch.mojo",
     "test_matmul_sm100_bf16_muse_spark_tp8.mojo",
     "test_matmul_sm100_structured_quick.mojo",
     "test_matmul_sm100_blockwise_fp8.mojo",
@@ -340,9 +373,6 @@ _B200_TESTS = [
     "test_matmul_sm100_splitk_parallel_graph.mojo",
     "test_tma_mma_sm100_mxfp8.mojo",
     "test_tma_pair_mma_sm100_mxfp8.mojo",
-    "test_matmul_sm100_block_scaled_mxfp8_1sm.mojo",
-    "test_matmul_sm100_block_scaled_mxfp8_2sm.mojo",
-    "test_matmul_sm100_batched_block_scaled_mxfp8_structured.mojo",
     "test_grouped_matmul_sm100_mxfp8.mojo",
     "test_grouped_matmul_sm100_w4a8.mojo",
     "test_grouped_matmul_sm100_block_fp4.mojo",
@@ -351,9 +381,6 @@ _B200_TESTS = [
     "test_grouped_matmul_mxfp8_decode_dispatch.mojo",
     "test_grouped_matmul_nvfp4_pdl_order.mojo",
     "test_block_scaled_matmul_with_epilogue.mojo",
-    "test_matmul_sm100_block_scaled_nvfp4_1sm.mojo",
-    "test_matmul_sm100_block_scaled_fp4_2sm.mojo",
-    "test_matmul_sm100_batched_block_scaled_nvfp4_structured.mojo",
     "test_matmul_sm100_block_scaled_mxfp8.mojo",
     "test_matmul_sm100_block_scaled_fp4.mojo",
     "test_matmul_sm100_batched_block_scaled_mxfp8.mojo",
@@ -376,7 +403,6 @@ _B200_TESTS = [
     "test_matmul_sm100_batched_1sm_bf16_ctype_fp8.mojo",
     "test_matmul_sm100_1sm_bf16_with_weight_prefetch.mojo",
     "test_matmul_sm100_2sm_bf16_with_weight_prefetch.mojo",
-    "test_matmul_sm100_block_scaled_nvfp4_with_weight_prefetch.mojo",
     "test_matmul_sm100_block_scaled_fp4_1sm_with_weight_prefetch.mojo",
     "test_matmul_sm100_block_scaled_fp4_2sm_with_weight_prefetch.mojo",
     "test_matmul_sm100_block_scaled_fp4_small_bn_with_weight_prefetch.mojo",
@@ -385,6 +411,9 @@ _B200_TESTS = [
     "test_matmul_sm100_1sm_bf16_bias.mojo",
     "test_matmul_sm100_2sm_bf16_bias.mojo",
     "test_matmul_sm100_fused_bias_residual_dispatch.mojo",
+    "test_matmul_sm100_epilogue_pdl_race.mojo",
+    "test_gemm_mma_cpasync_epilogue_pdl_race.mojo",
+    "test_block_scaled_matmul_epilogue_pdl_race.mojo",
     "test_matmul_compute_fn_sm100.mojo",
     "test_matmul_epilogue_fn_sm100.mojo",
     "test_matmul_epilogue_fn_sm100_dispatch.mojo",
@@ -403,6 +432,8 @@ _GPU_MEMORY = {
     "test_mxfp6_matmul_amd.mojo": "2",
     "test_block_scaled_mma_amd_pack_k.mojo": "1",
     "test_blockwise_fp8_1d2d_structured.mojo": "1.5",
+    "test_blockwise_fp8_matmul_nvidia.mojo": "2",
+    "test_blockwise_fp8_matmul_nvidia_bench.mojo": "2",
     "test_blockwise_fp8_grouped_matmul_amd.mojo": "2",
     "test_blockwise_fp8_grouped_matmul_amd_bench.mojo": "4",
     "test_bulk_mma_pair_cta_sm100.mojo": "1.5",
@@ -443,7 +474,6 @@ _GPU_MEMORY = {
     "test_matmul_sm100_1sm_bf16_normal_epilogue.mojo": "2",
     "test_matmul_sm100_1sm_bf16_with_weight_prefetch.mojo": "2",
     "test_matmul_sm100_2sm_bf16_with_weight_prefetch.mojo": "2",
-    "test_matmul_sm100_block_scaled_nvfp4_with_weight_prefetch.mojo": "2",
     "test_matmul_sm100_block_scaled_fp4_1sm_with_weight_prefetch.mojo": "2",
     "test_matmul_sm100_block_scaled_fp4_2sm_with_weight_prefetch.mojo": "2",
     "test_matmul_sm100_1sm_fp8.mojo": "1.5",
@@ -460,30 +490,24 @@ _GPU_MEMORY = {
     "test_matmul_sm100_batched_2sm_bf16.mojo": "2",
     "test_matmul_sm100_batched_2sm_bf16_ctype_fp8.mojo": "2",
     "test_matmul_sm100_batched_block_scaled_mxfp8.mojo": "3",
-    "test_matmul_sm100_batched_block_scaled_mxfp8_structured.mojo": "3",
     "test_matmul_sm100_batched_block_scaled_nvfp4.mojo": "2",
-    "test_matmul_sm100_batched_block_scaled_nvfp4_structured.mojo": "3",
     "test_matmul_sm100_bf16.mojo": "3",
     "test_matmul_sm100_block_scaled_fp4.mojo": "2",
-    "test_matmul_sm100_block_scaled_fp4_2sm.mojo": "1.5",
     "test_matmul_sm100_block_scaled_fp4_small_bn.mojo": "2",
     "test_matmul_sm100_block_scaled_fp4_small_bn_2sm.mojo": "2",
     "test_matmul_sm100_block_scaled_fp4_small_bn_with_weight_prefetch.mojo": "2",
     "test_matmul_sm100_block_scaled_fp4_small_bn_2sm_with_weight_prefetch.mojo": "2",
     "test_matmul_sm100_block_scaled_mxfp8.mojo": "2",
-    "test_matmul_sm100_block_scaled_mxfp8_1sm.mojo": "1.5",
-    "test_matmul_sm100_block_scaled_mxfp8_2sm.mojo": "1.5",
     "test_matmul_sm100_block_scaled_mxfp8_small_bn.mojo": "2",
     "test_matmul_sm100_block_scaled_mxfp8_small_bn_2sm.mojo": "2",
     "test_matmul_sm100_block_scaled_mxfp8_small_bn_with_weight_prefetch.mojo": "2",
-    "test_matmul_sm100_block_scaled_nvfp4_1sm.mojo": "1.5",
     "test_matmul_sm100_blockwise_fp8.mojo": "1.5",
     "test_matmul_sm100_epilogue.mojo": "3",
     "test_matmul_sm100_fallback.mojo": "2",
     "test_matmul_sm100_fp32_precision.mojo": "1.5",
     "test_matmul_sm100_fp8.mojo": "3",
     "test_matmul_sm100_fp8_smallm_band_dispatch.mojo": "2",
-    "test_matmul_sm100_bf16_dit_band_dispatch.mojo": "1",
+    "test_matmul_sm100_bf16_glm53_rows_dispatch.mojo": "1",
     "test_matmul_sm100_bf16_muse_spark_tp8.mojo": "2",
     "test_matmul_sm100_fused_bias_residual_dispatch.mojo": "2",
     "test_matmul_sm100_partial_n_tile_epilogue.mojo": "2",
@@ -562,6 +586,8 @@ _GPU_MEMORY = {
                 # TODO(KERN-3603): Flaky on B200.
                 "test_matmul_sm100_blockwise_fp8.mojo",
             ] else []
+        ) + (
+            ["postsubmit"] if src in _PDL_CONTRACT_GUARD_TESTS else []
         ),
         target_compatible_with = [
             "//:has_gpu",
@@ -856,6 +882,7 @@ mojo_test(
             ["manual"] if src in [
                 "test_ping_pong_shapes.mojo",  # TODO: KERN-2631 Flaky on AMD, re-enable
                 "test_blockwise_fp8_matmul_amd_bench.mojo",  # perf bench, local-only
+                "test_blockwise_fp8_matmul_nvidia_bench.mojo",  # perf bench, local-only
                 "test_blockwise_fp8_grouped_matmul_amd_bench.mojo",  # perf bench, local-only
             ] else []
         ),
@@ -873,6 +900,7 @@ mojo_test(
         exclude = _FILECHECK_TESTS + _B200_TESTS + _B200_SMOKE_TESTS + _GROUPED_BLOCK_SCALED_GEMM_B200_TESTS + _AMD_GENERIC_FALLBACK_TESTS + _W4A8_BLOCK_SCALED_B200_TESTS + [
             _W4A8_BLOCK_SCALED_HARNESS,
             "test_w4a8_grouped_shapes.mojo",
+            "test_matmul_sm100_bf16_dit_band_dispatch.mojo",
             "test_matmul_pdl_race.mojo",
             "test_grouped_matmul_swiglu_nvfp4_interleave.mojo",
             "test_grouped_matmul_swiglu_nvfp4_dispatch.mojo",

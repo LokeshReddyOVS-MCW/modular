@@ -308,7 +308,7 @@ kgen.generator export @main() {
 
 // -----
 // COM: MOCO-2892 unbound parameter causing interpret crash fix.
-// expected-note @below {{struct not a writeable type, got #kgen.unbound}}
+// expected-note @below {{struct not a writeable type, got #kgen.unknown}}
 kgen.generator @fn(%arg0: !kgen.pointer<struct<(index) memoryOnly>> imm_mem, %arg1: index) -> index {
   %0 = kgen.struct.gep %arg0[0]: <struct<(index) memoryOnly>>
   %1 = pop.load %0: !kgen.pointer<index>
@@ -319,7 +319,7 @@ kgen.generator @fn(%arg0: !kgen.pointer<struct<(index) memoryOnly>> imm_mem, %ar
 // expected-error @below {{function instantiation failed}}
 kgen.generator export @main() -> index {
   // expected-note @below {{failed to compile-time evaluate function call}}
-  kgen.param.apply x = [(!kgen.pointer<struct<(index) memoryOnly>>, index) -> index: @fn](store_to_mem(?), 1)
+  kgen.param.apply x = [(!kgen.pointer<struct<(index) memoryOnly>>, index) -> index: @fn](store_to_mem(*?), 1)
   %0 = kgen.param.constant = <x>
   hlcf.return %0: index
 }
@@ -559,10 +559,9 @@ kgen.generator export @nary_identical_unknown_with_target() -> !kgen.scalar<bool
 // -----
 
 // Test that a constant shift-right amount outside the operand's bit width gets
-// a clear diagnostic from validateForElaborator instead of the generic
-// "could not simplify operator" note.
+// a clear diagnostic instead of the generic "could not simplify operator" note.
 //
-// `shl` with matching types folds to zero before reaching validateForElaborator,
+// `shl` with matching types folds to zero before reaching evaluateWithContext,
 // so it cannot produce this diagnostic and is not tested here.
 
 // expected-error @below {{function instantiation failed}}
@@ -585,4 +584,19 @@ kgen.generator @shift_out_of_range_shr_index_32bit() {
   %0 = kgen.param.constant: !kgen.scalar<index> = <shr(1, 32)>
   hlcf.return
 }
+}
+
+// -----
+
+// `get_source_name` on a symbol that names no generator reports an error.
+
+kgen.func @concrete() {
+  hlcf.return
+}
+
+// expected-error @below {{function instantiation failed}}
+kgen.generator @get_source_name_of_concrete_func() {
+  // expected-note @below {{'get_source_name' function argument does not name a function generator}}
+  %0 = kgen.param.constant: string = <#kgen.get_source_name<#kgen.gen<#kgen.func.symbol<@concrete>> : !kgen.generator<() -> ()>>>
+  hlcf.return
 }

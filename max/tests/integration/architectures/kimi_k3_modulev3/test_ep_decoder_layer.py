@@ -24,11 +24,11 @@ os.environ.setdefault("MODULAR_DEBUG", "source-tracebacks")
 
 import numpy as np
 import pytest
+from _ep_test_utils import allocate_ep_buffers
 from _moe_test_utils import assign_experts
 from max.driver import Accelerator
 from max.dtype import DType
 from max.engine import InferenceSession
-from max.pipelines.architectures.kimi_k3_modulev3.layers import ep
 from max.pipelines.architectures.kimi_k3_modulev3.layers.decoder_layer import (
     KimiK3DecoderLayer,
     expert_parallel_decoder_layer,
@@ -39,9 +39,6 @@ from max.pipelines.architectures.kimi_k3_modulev3.layers.mla_attention import (
 from max.pipelines.architectures.kimi_k3_modulev3.layers.moe_latent import (
     KimiK3LatentMoE,
     expert_parallel_config,
-)
-from max.pipelines.architectures.kimi_k3_modulev3.weight_adapters import (
-    fuse_qkv_a_g_for_tp,
 )
 from max.tensor import Tensor, default_device
 from max.tensor.sharding import DeviceMesh
@@ -110,7 +107,8 @@ def test_decoder_layer_mla_moe_single_device_matches_ep2() -> None:
     norm_np = np.ones(latent, dtype=np.float32)
     experts_gate_up_np = _arr(num_experts, 2 * moe_inter, latent)
     experts_down_np = _arr(num_experts, latent, moe_inter)
-    shared_gate_up_np = _arr(2 * shared_inter, hidden)
+    shared_gate_np = _arr(shared_inter, hidden)
+    shared_up_np = _arr(shared_inter, hidden)
     shared_down_np = _arr(hidden, shared_inter)
 
     res_weights = {
@@ -135,19 +133,9 @@ def test_decoder_layer_mla_moe_single_device_matches_ep2() -> None:
             q_lora_rank=q_lora,
             kv_lora_rank=kv_lora,
         )
-        # Expert parallelism leaves attention replicated: TP degree 1.
-        attention.qkv_a_g_proj.weight = Tensor(
-            fuse_qkv_a_g_for_tp(
-                attn_weights["q_a_proj"],
-                attn_weights["kv_a_proj_with_mqa"],
-                attn_weights["g_proj"],
-                1,
-            ),
-            dtype=DType.float32,
-        ).cast(DType.bfloat16)
-        for name in ("q_b_proj", "kv_b_proj", "o_proj"):
+        for name, arr in attn_weights.items():
             getattr(attention, name).weight = Tensor(
-                attn_weights[name], dtype=DType.float32
+                arr, dtype=DType.float32
             ).cast(DType.bfloat16)
         for name, arr in norm_weights.items():
             getattr(attention, name).weight = Tensor(
@@ -189,8 +177,11 @@ def test_decoder_layer_mla_moe_single_device_matches_ep2() -> None:
             experts_down_np,
             lambda a, device: Tensor(a, device=device).cast(DType.bfloat16),
         )
-        ffn.shared_experts.gate_up_proj.weight = Tensor(
-            shared_gate_up_np, dtype=DType.float32
+        ffn.shared_experts.gate_proj.weight = Tensor(
+            shared_gate_np, dtype=DType.float32
+        ).cast(DType.bfloat16)
+        ffn.shared_experts.up_proj.weight = Tensor(
+            shared_up_np, dtype=DType.float32
         ).cast(DType.bfloat16)
         ffn.shared_experts.down_proj.weight = Tensor(
             shared_down_np, dtype=DType.float32
@@ -239,15 +230,15 @@ def test_decoder_layer_mla_moe_single_device_matches_ep2() -> None:
         config = expert_parallel_config(
             layer2.ffn, mesh, max_tokens_per_rank=64
         )
-        buffers = ep.allocate_ep_buffers(config, mesh, session)
+        layer2.ffn.ep_config = config
+        buffers = allocate_ep_buffers(config, mesh, session)
         out2, _ = layer2(
             Tensor(x_np, dtype=DType.float32).cast(DType.bfloat16),
             [
                 Tensor(c, dtype=DType.float32).cast(DType.bfloat16)
                 for c in block_residual_np
             ],
-            ep_config=config,
-            ep_buffers=buffers,
+            ep=buffers,
         )
         assert isinstance(out2, Tensor)
         out2_np = out2.cast(DType.float32).to_numpy()

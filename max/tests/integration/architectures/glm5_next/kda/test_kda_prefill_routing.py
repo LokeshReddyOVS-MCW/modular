@@ -43,7 +43,9 @@ from max.nn._graph_ops.state_space import kda_ring_record_elements, kimi_delta
 from max.nn._graph_ops.state_space.kimi_delta import (
     KdaGateMode,
     amd_kda_chunk_workspace_bytes,
+    kda_chunk_max_segments,
     kda_chunk_predicate,
+    kda_chunk_scratch_rows,
     kda_chunk_workspace_bytes,
 )
 from max.pipelines.architectures.glm5_next.layers import kda
@@ -64,6 +66,7 @@ def _patch_accelerator(
     monkeypatch: pytest.MonkeyPatch, api: str, architecture: str
 ) -> None:
     monkeypatch.setattr(kimi_delta, "accelerator_api", lambda: api)
+    monkeypatch.setattr(kimi_delta, "accelerator_count", lambda: 1)
     monkeypatch.setattr(
         kimi_delta, "accelerator_architecture_name", lambda: architecture
     )
@@ -85,8 +88,10 @@ def _core_mlir(
     gate_mode: KdaGateMode = "safe",
     pool_dtype: DType = DType.float32,
     verify: bool = False,
+    qkv_dtype: DType = DType.float32,
 ) -> str:
     act = TensorType(DType.float32, ["total_tokens", QKV_DIM], device=GPU)
+    qkv_part = TensorType(qkv_dtype, ["total_tokens", QKV_DIM], device=GPU)
     conv = TensorType(DType.float32, [QKV_DIM, KERNEL], device=GPU)
     rows = TensorType(DType.int32, [1, "batch"], device=GPU)
     ring = BufferType(
@@ -98,9 +103,9 @@ def _core_mlir(
         Graph(
             "glm_kda_routing",
             input_types=[
-                act,
-                act,
-                act,
+                qkv_part,
+                qkv_part,
+                qkv_part,
                 conv,
                 conv,
                 conv,
@@ -164,16 +169,31 @@ def _core_mlir(
     return str(graph)
 
 
+def _op_lines(mlir: str, symbol: str) -> list[str]:
+    return [line for line in mlir.splitlines() if f'"{symbol}"' in line]
+
+
 def _chunk_lines(mlir: str) -> list[str]:
-    return [line for line in mlir.splitlines() if '"kda_chunk"' in line]
+    return _op_lines(mlir, "kda_chunk")
 
 
 _VALUE_DTYPE = re.compile(r"!mo\.(?:tensor|buffer)<\[[^\]]*\], (\w+)")
 
 
+def _signature(line: str) -> tuple[str, str]:
+    """An op line's operand types and result types."""
+    operands, results = line.split(") : (", 1)[1].split(" -> ", 1)
+    return operands, results
+
+
+def _operand_dtypes(line: str) -> list[str]:
+    """Dtypes of an op's operands, in order."""
+    return _VALUE_DTYPE.findall(_signature(line)[0])
+
+
 def _chunk_io_dtypes(line: str) -> list[str]:
     """Dtypes of a ``kda_chunk`` op's q, k, v and output, in that order."""
-    operands, results = line.split(") : (", 1)[1].split(" -> ", 1)
+    operands, results = _signature(line)
     return (
         _VALUE_DTYPE.findall(operands)[:3] + _VALUE_DTYPE.findall(results)[:1]
     )
@@ -235,7 +255,13 @@ def test_gfx950_chunk_is_not_computebound(
 
 @pytest.mark.parametrize(
     ("api", "architecture"),
-    [("hip", "gfx942"), ("cuda", "sm_90a"), ("cuda", "sm_86")],
+    [
+        ("hip", "gfx942"),
+        ("cuda", "sm_90a"),
+        ("cuda", "sm_86"),
+        # Above SM100 numerically and without tcgen05.
+        ("cuda", "sm_121a"),
+    ],
 )
 def test_unsupported_accelerator_stays_sequential(
     monkeypatch: pytest.MonkeyPatch, api: str, architecture: str
@@ -272,9 +298,28 @@ def test_gfx950_bf16_pool_stays_sequential(
     _assert_sequential(_core_mlir(pool_dtype=DType.bfloat16))
 
 
+def test_gfx950_decode_pins_its_fmas(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Plain decode spells its multiply-adds as the verify ring does.
+
+    The ring reproduces ``kda_decode`` bit for bit only under ``pin_fma``, so
+    without it the model's MTP tokens drift from its own greedy tokens. NVIDIA
+    pins inside the kernel; AMD takes the parameter.
+    """
+    _patch_accelerator(monkeypatch, "hip", "gfx950")
+    (line,) = _op_lines(_core_mlir(), "kda_decode")
+    assert re.search(r"pin_fma\s*=\s*true", line), line
+
+
+def _ops(mlir: str, symbol: str) -> int:
+    return len(re.findall(rf'symbol\s*=\s*"{re.escape(symbol)}"', mlir))
+
+
 @pytest.mark.parametrize(
-    ("api", "architecture", "output_dtype", "computebound"),
-    [("hip", "gfx950", "bf16", False), ("cuda", "sm_100a", "f32", True)],
+    ("api", "architecture", "output_dtype", "computebound", "ring"),
+    [
+        ("hip", "gfx950", "bf16", False, "kda_verify_ring"),
+        ("cuda", "sm_100a", "f32", True, "kda_verify_ring_kgroup_conv"),
+    ],
 )
 def test_verify_keeps_drafts_on_the_ring(
     monkeypatch: pytest.MonkeyPatch,
@@ -282,41 +327,98 @@ def test_verify_keeps_drafts_on_the_ring(
     architecture: str,
     output_dtype: str,
     computebound: bool,
+    ring: str,
 ) -> None:
     """A batch with drafts records into the ring the rollback folds.
 
     Only a draft-free prefill, which has nothing to roll back, takes
     ``kda_chunk``, behind the same conditional as the forward's, with the
-    forward's chunk launch on either vendor. The ring asks for the K-group
-    kernel, which the op runs only on NVIDIA.
+    forward's chunk launch on either vendor. On NVIDIA the ring is the
+    K-group kernel with the short conv in it.
     """
     _patch_accelerator(monkeypatch, api, architecture)
     mlir = _core_mlir(verify=True)
-    _assert_routed(mlir, "bf16", output_dtype, fallback="kda_verify_ring")
+    _assert_routed(mlir, "bf16", output_dtype, fallback=f'"{ring}"')
+    assert _ops(mlir, ring) == 1
     assert ("use_computebound = true" in mlir) == computebound
-    assert "kgroup = true" in mlir
     assert "kda_decode" not in mlir
 
 
-def _legacy_predicate(
-    tokens: TensorValue, seqs: TensorValue, num_heads: int
-) -> TensorValue:
-    return kda_chunk_predicate(tokens, seqs, num_heads, HEAD_DIM)
+def test_gfx950_verify_asks_for_the_kgroup_ring(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The flag the op ignores off NVIDIA, so both vendors trace one call."""
+    _patch_accelerator(monkeypatch, "hip", "gfx950")
+    mlir = _core_mlir(verify=True)
+    assert "kgroup = true" in mlir
+    assert _ops(mlir, "kda_verify_ring_kgroup_conv") == 0
 
 
-def _layer_predicate(
-    tokens: TensorValue, seqs: TensorValue, num_heads: int
-) -> TensorValue:
+@pytest.mark.parametrize("architecture", ["sm_100a", "sm_90a"])
+def test_nvidia_verify_runs_the_conv_in_the_ring(
+    monkeypatch: pytest.MonkeyPatch, architecture: str
+) -> None:
+    """With drafts, the conv runs in the ring op, so the ring branch has
+    neither a conv op nor the conv output's bf16 cast; the draft-free
+    prefill's conv is ``kda_chunk_conv``, which writes the bf16 q, k and v
+    itself, inside the chunk branch where ``kda_chunk`` is built."""
+    _patch_accelerator(monkeypatch, "cuda", architecture)
+    mlir = _core_mlir(verify=True)
+    chunked = architecture == "sm_100a"
+    assert _ops(mlir, "kda_verify_ring_kgroup_conv") == 1
+    assert _ops(mlir, "kda_verify_ring") == 0
+    assert _ops(mlir, "kda_chunk_conv") == int(chunked)
+    assert _ops(mlir, "gated_delta_conv1d_verify_fwd") == 0
+    assert ("mo.if" in mlir) == chunked
+
+
+@pytest.mark.parametrize(
+    ("qkv_dtype", "mlir_dtype"),
+    [(DType.bfloat16, "bf16"), (DType.float32, "f32")],
+)
+def test_nvidia_verify_reads_qkv_in_the_model_dtype(
+    monkeypatch: pytest.MonkeyPatch, qkv_dtype: DType, mlir_dtype: str
+) -> None:
+    """Both K-group conv ops widen ``qkv`` as they load it, so the layer
+    hands them the projection's own dtype and makes no float32 copy."""
+    _patch_accelerator(monkeypatch, "cuda", "sm_100a")
+    mlir = _core_mlir(verify=True, qkv_dtype=qkv_dtype)
+    for symbol in ("kda_verify_ring_kgroup_conv", "kda_chunk_conv"):
+        (line,) = _op_lines(mlir, symbol)
+        assert _operand_dtypes(line)[0] == mlir_dtype, line
+
+
+def test_nvidia_verify_without_the_conv_op_keeps_the_conv_launch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A build without the K-group conv op keeps the conv and the ring
+    apart."""
+    _patch_accelerator(monkeypatch, "cuda", "sm_100a")
+    monkeypatch.setattr(
+        kda,
+        "kda_verify_ring_kgroup_conv_servable",
+        lambda head_dim, gate_mode, pool_dtype: False,
+    )
+    mlir = _core_mlir(verify=True)
+    assert _ops(mlir, "kda_verify_ring_kgroup_conv") == 0
+    assert _ops(mlir, "kda_chunk_conv") == 0
+    assert _ops(mlir, "kda_verify_ring") == 1
+    assert _ops(mlir, "gated_delta_conv1d_verify_fwd") == 1
+    assert "kgroup = true" in mlir
+
+
+def _legacy_predicate(tokens: TensorValue, seqs: TensorValue) -> TensorValue:
+    return kda_chunk_predicate(tokens, seqs)
+
+
+def _layer_predicate(tokens: TensorValue, seqs: TensorValue) -> TensorValue:
     taken = kda._chunk_predicate(
-        Tensor.from_graph_value(tokens),
-        Tensor.from_graph_value(seqs),
-        num_heads,
-        HEAD_DIM,
+        Tensor.from_graph_value(tokens), Tensor.from_graph_value(seqs)
     )
     return TensorValue(taken)
 
 
-_Predicate = Callable[[TensorValue, TensorValue, int], TensorValue]
+_Predicate = Callable[[TensorValue, TensorValue], TensorValue]
 
 PREDICATES = pytest.mark.parametrize(
     "predicate", [_legacy_predicate, _layer_predicate], ids=["op", "layer"]
@@ -331,7 +433,6 @@ def _takes_chunk(
     api: str,
     total_tokens: int,
     batch_size: int,
-    num_heads: int = HEADS,
 ) -> bool:
     """Evaluates a chunk predicate on concrete counts."""
     monkeypatch.setattr(kimi_delta, "accelerator_api", lambda: api)
@@ -341,7 +442,7 @@ def _takes_chunk(
         ensure_context(),
     ):
         tokens, seqs = graph.inputs
-        graph.output(predicate(tokens.tensor, seqs.tensor, num_heads))
+        graph.output(predicate(tokens.tensor, seqs.tensor))
     model = InferenceSession(devices=[CPU()]).load(graph)
     (taken,) = model.execute(
         Buffer.from_numpy(np.array(total_tokens, dtype=np.int64)),
@@ -358,21 +459,6 @@ def test_decode_batch_skips_chunk(
 ) -> None:
     assert not _takes_chunk(monkeypatch, predicate, api, 8, 8)
     assert _takes_chunk(monkeypatch, predicate, api, 9, 8)
-
-
-@PREDICATES
-def test_amd_chunk_past_32_bit_indexing_falls_back(
-    monkeypatch: pytest.MonkeyPatch, predicate: _Predicate
-) -> None:
-    """The AMD launch raises once ``kg_t`` passes 2^31 elements.
-
-    It holds ``(T // 64 + N) * 64`` rows of ``H * 128``; at 32 heads one
-    sequence fits up to ``T = 2^19 - 64`` under the predicate's bound.
-    """
-    limit = (1 << 31) // (HEADS * HEAD_DIM) - 64
-    assert _takes_chunk(monkeypatch, predicate, "hip", limit, 1)
-    assert not _takes_chunk(monkeypatch, predicate, "hip", limit + 1, 1)
-    assert _takes_chunk(monkeypatch, predicate, "cuda", limit + 1, 1)
 
 
 def _reserved(
@@ -415,61 +501,71 @@ def test_planner_without_chunked_prefill_reserves_a_whole_prompt(
     )
 
 
-def _launch_groups(
-    chunks_per_seq: int, num_seqs: int, num_heads: int, num_cus: int
-) -> int:
-    """``kda_amd_chunk_groups`` in ``Kernels/lib/kda/amd_chunk_launch.mojo``."""
-    planes = max(num_seqs * num_heads, 1)
-    fill1, fill2 = num_cus // (2 * planes), num_cus // planes
-    groups = fill1
-    if fill2 > 0 and chunks_per_seq // fill2 >= 12:
-        groups = fill2
-    groups = min(groups, chunks_per_seq // 4, 32)
-    return groups if groups >= 4 else 1
+def _launch_bytes(tokens: int, num_seqs: int, num_heads: int) -> int:
+    """What one gfx950 ``kda_chunk`` launch on one device allocates."""
+    rows = kda_chunk_scratch_rows(tokens, num_seqs, num_heads)
+    return rows * num_heads * HEAD_DIM * 2
 
 
-def _launch_bytes(
-    tokens: int, num_seqs: int, num_heads: int, num_cus: int = 256
-) -> int:
-    """What one ``kda_amd_chunk_launch`` on one device allocates."""
-    chunk_len, plane_elems = 64, HEAD_DIM * HEAD_DIM
-    max_chunks = tokens // chunk_len + num_seqs
-    groups = _launch_groups(
-        -(-tokens // chunk_len) // max(num_seqs, 1),
-        num_seqs,
-        num_heads,
-        num_cus,
-    )
-    bf16 = (
-        3 * tokens * num_heads * HEAD_DIM
-        + tokens * num_heads * chunk_len
-        + max_chunks * num_heads * HEAD_DIM * chunk_len
-    )
-    f32 = max_chunks * num_heads * HEAD_DIM
-    if groups > 1:
-        group_planes = groups * num_seqs * num_heads
-        f32 += (
-            group_planes * (2 * plane_elems + HEAD_DIM)
-            + (group_planes * plane_elems + 1) // 2
-        )
-    return 2 * bf16 + 4 * f32 + 4 * num_seqs
+# (tokens, sequences, heads, segments, rows). `check_workspace_mirror` in
+# `Kernels/test/kda/test_kda_amd_prefill.mojo` checks the launcher against the
+# same table; change both together with the launcher's segment rule.
+_LAUNCHER_PINNED_SHAPES = [
+    (2048, 1, 8, 8, 15114),
+    (2049, 1, 8, 6, 13716),
+    (8192, 1, 8, 22, 52362),
+    (8193, 1, 8, 9, 42516),
+    (32768, 1, 12, 32, 166026),
+    (81920, 1, 2, 80, 414858),
+    (4992, 4, 8, 1, 22080),
+    (5120, 4, 8, 8, 47208),
+    (8192, 6, 8, 8, 73020),
+    (8192, 8, 8, 1, 36432),
+    (81920, 8, 12, 12, 428112),
+    (16384, 64, 64, 1, 79488),
+]
+
+
+@pytest.mark.parametrize(
+    ("tokens", "seqs", "heads", "segments", "rows"), _LAUNCHER_PINNED_SHAPES
+)
+def test_chunk_sizing_matches_the_launcher_table(
+    tokens: int, seqs: int, heads: int, segments: int, rows: int
+) -> None:
+    """The Python sizing equals the table the launcher's test pins."""
+    assert kda_chunk_max_segments(tokens, seqs, heads) == segments
+    assert kda_chunk_scratch_rows(tokens, seqs, heads) == rows
 
 
 @pytest.mark.parametrize("tensor_parallel", [1, 2, 4])
 @pytest.mark.parametrize("num_seqs", [1, 8, 64])
 @pytest.mark.parametrize("tokens", [64, 1000, 8192, 32768, 81920])
-def test_chunk_workspace_bound_covers_the_launch(
+def test_chunk_workspace_bound_covers_every_batch(
     tensor_parallel: int, num_seqs: int, tokens: int
 ) -> None:
-    """The planner's bound stays above, and near, every device's allocation."""
+    """The bound covers every batch within the budget and stays near the largest.
+
+    The full batch is not the largest: at 8192 tokens, six sequences split
+    into eight segments each where eight sequences do not split at all.
+    """
     if num_seqs > tokens:
         pytest.skip("a sequence holds at least one token")
     total_heads = 64
-    allocated = tensor_parallel * _launch_bytes(
-        tokens, num_seqs, total_heads // tensor_parallel
-    )
     bound = kda_chunk_workspace_bytes(total_heads, HEAD_DIM, tokens, num_seqs)
-    assert allocated <= bound <= 2 * allocated
+    # Both residues mod 32 so the sweep lands on every chunk-count edge and
+    # on the single-sequence rule's steps at 2048 and 8192 tokens.
+    token_counts = {*range(1, tokens + 1, 32), *range(32, tokens + 1, 32)}
+    largest = 0
+    for batch_tokens in sorted(token_counts | {tokens}):
+        for seqs in range(1, min(num_seqs, batch_tokens) + 1):
+            allocated = tensor_parallel * _launch_bytes(
+                batch_tokens, seqs, total_heads // tensor_parallel
+            )
+            assert allocated <= bound, (batch_tokens, seqs)
+            largest = max(largest, allocated)
+    # The bound mirrors the launcher's mid-length segment fill without its
+    # narrow-walk exception, so a few shapes carry up to ~26% slack.
+    assert bound <= 1.3 * largest
 
 
 @pytest.mark.parametrize(
@@ -495,17 +591,18 @@ def test_gfx950_planner_reserves_nothing_where_prefill_stays_sequential(
 
 @pytest.mark.parametrize("tensor_parallel", [1, 2, 4])
 @pytest.mark.parametrize("tokens", [32768, 81920])
-def test_chunk_workspace_bound_caps_groups_per_sequence(
+def test_chunk_workspace_bound_is_tight_for_one_long_sequence(
     tensor_parallel: int, tokens: int
 ) -> None:
-    """One long sequence splits into at most 32 groups, not one per 4 chunks.
+    """One long sequence's bound stays near what its devices allocate.
 
-    Without that cap the split workspace alone puts the bound about 1.5x over
-    the allocation here.
+    The bound takes the segment count of a one-head device, which a device
+    holding more heads clamps lower; the per-chunk rows dominate, so the
+    slack stays small.
     """
     total_heads = 64
     allocated = tensor_parallel * _launch_bytes(
         tokens, 1, total_heads // tensor_parallel
     )
     bound = kda_chunk_workspace_bytes(total_heads, HEAD_DIM, tokens, 1)
-    assert allocated <= bound <= 1.15 * allocated
+    assert allocated <= bound <= 1.2 * allocated

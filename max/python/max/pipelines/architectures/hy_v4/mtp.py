@@ -26,6 +26,7 @@ from max.nn.norm import RMSNorm
 from max.tensor import Tensor
 
 from .layers.decoder import HYV4DecoderLayer
+from .layers.moe import HYV4MoE
 from .model_config import HYV4Config
 
 __all__ = ["HYV4MultiTokenPredictor", "draft_config"]
@@ -81,10 +82,26 @@ class HYV4MultiTokenPredictor(HYV4DecoderLayer):
     def __init__(self, config: HYV4Config) -> None:
         super().__init__(config, 0, ihc=False)
         hidden = config.hidden_size
-        self.enorm = RMSNorm(hidden, config.rms_norm_eps)
-        self.hnorm = RMSNorm(hidden, config.rms_norm_eps)
+        self.enorm = RMSNorm(
+            hidden, config.rms_norm_eps, multiply_before_cast=True
+        )
+        self.hnorm = RMSNorm(
+            hidden, config.rms_norm_eps, multiply_before_cast=True
+        )
         self.eh_proj = Linear(2 * hidden, hidden, bias=False)
-        self.final_layernorm = RMSNorm(hidden, config.rms_norm_eps)
+        self.final_layernorm = RMSNorm(
+            hidden, config.rms_norm_eps, multiply_before_cast=True
+        )
+
+    def shard(self) -> None:
+        """Splits attention by heads and the routed experts by expert.
+
+        The shared expert stays replicated, so its gate and up rows stack
+        whole.
+        """
+        self.self_attn.shard_heads()
+        assert isinstance(self.mlp, HYV4MoE)
+        self.mlp.shard_experts()
 
     def predict(
         self,

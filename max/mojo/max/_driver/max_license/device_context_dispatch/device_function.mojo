@@ -47,7 +47,6 @@ from max.gpu.host import (
     _launch_args,
 )
 from max.gpu.host._driver_common import _check_dim_in_range
-from max.gpu.host._driver_handles import _DeviceFunctionPtr
 from max.gpu.host.compile import _compile_code
 from max.gpu.host.nvidia import LaunchAttributeHolderExecutionConfig
 from max._driver.max_license.hal import (
@@ -178,9 +177,6 @@ struct _HALDeviceFunction[
 
     var _ctx: DeviceContext.Unknown
     var _inner: ArcPointer[_DeviceFunctionInner]
-    # Null until the C++ runtime shim provides it; read by the CUDA/HIP
-    # interop accessors (`_nvidia_cuda` / `_amdgpu_hip`).
-    var _handle: _DeviceFunctionPtr[mut=True]
     # The compilation result for `Self._wrapped_func`: its assembly and
     # linkage name.
     var _func_info: CompiledFunctionInfo[
@@ -274,39 +270,34 @@ struct DeviceFunction[
 
         Args:
             ctx: The device context to compile for.
-            func_attribute: An attribute to use when compiling the function. The
-                HAL backend accepts only `MAX_DYNAMIC_SHARED_SIZE_BYTES`, and it
-                has no effect.
+            func_attribute: An attribute to use when compiling the function.
+                Only `MAX_DYNAMIC_SHARED_SIZE_BYTES` is accepted, and it has no
+                effect.
             name: The symbol name to give the function. The HAL backend
                 ignores it.
 
         Raises:
-            If the compilation or function loading fails, or if the HAL backend
-            is given an unsupported function attribute.
+            If the compilation or function loading fails, or if given an
+            unsupported function attribute.
         """
-        comptime __guard case False = use_legacy_backend() else:
-            comptime assert use_legacy_backend()  # TODO(MOCO-5393)
+        comptime __guard not use_legacy_backend() else:
             self._impl = Self._Legacy(
                 ctx._impl,
                 func_attribute=func_attribute,
                 name=name,
             )
             return
-        comptime assert not use_legacy_backend()  # TODO(MOCO-5393)
 
-        if case .Some(func_attribute) = func_attribute:
-            # The CUDA plugin lifts the dynamic shared memory cap to the
-            # device's opt-in limit when it loads a function, and Metal and
-            # HIP have no cap, so a requested cap needs nothing more.
-            if (
-                func_attribute.attribute
-                != Attribute.MAX_DYNAMIC_SHARED_SIZE_BYTES
-            ):
-                raise Error(
-                    "the function attribute '",
-                    func_attribute.attribute,
-                    "' is not currently supported",
-                )
+        # The CUDA plugin lifts the dynamic shared memory cap to the
+        # device's opt-in limit when it loads a function, and Metal and
+        # HIP have no cap, so a requested cap needs nothing more.
+        if case .Some(func_attribute) = func_attribute;
+          func_attribute.attribute != Attribute.MAX_DYNAMIC_SHARED_SIZE_BYTES:
+            raise Error(
+                "the function attribute '",
+                func_attribute.attribute,
+                "' is not currently supported",
+            )
         var info = ctx._impl._context[]._compile_inner[
             type_of(Self._HAL._wrapped_func),
             Self._HAL._wrapped_func,
@@ -321,7 +312,6 @@ struct DeviceFunction[
         self._impl = Self._HAL(
             ctx.into_unknown_target(),
             ArcPointer(_DeviceFunctionInner(func_handle, ctx._impl._context)),
-            None,
             info,
         )
 
@@ -332,6 +322,17 @@ struct DeviceFunction[
             _impl: The backend function to take ownership of.
         """
         self._impl = _impl^
+
+    @doc_hidden
+    def __init__(out self, *, _legacy: Self._Legacy) where use_legacy_backend():
+        """Wraps a legacy function.
+
+        Only available in a build whose backend is the legacy one.
+
+        Args:
+            _legacy: The legacy function to wrap.
+        """
+        self._impl = _legacy
 
     @doc_hidden
     def _call_with_pack_checked[
@@ -845,12 +846,10 @@ struct DeviceFunction[
         Raises:
             If the occupancy calculation fails.
         """
-        comptime __guard case False = use_legacy_backend() else:
-            comptime assert use_legacy_backend()  # TODO(MOCO-5393)
+        comptime __guard not use_legacy_backend() else:
             return self._impl.occupancy_max_active_blocks_per_multiprocessor(
                 block_size, dynamic_shared_mem_size
             )
-        comptime assert not use_legacy_backend()  # TODO(MOCO-5393)
 
         return Int(
             self._impl._inner[]
@@ -933,8 +932,7 @@ struct DeviceExternalFunction[
         Raises:
             If the load fails.
         """
-        comptime __guard case False = use_legacy_backend() else:
-            comptime assert use_legacy_backend()  # TODO(MOCO-5393)
+        comptime __guard not use_legacy_backend() else:
             self._impl = Self._Legacy(
                 ctx._impl,
                 function_name=function_name^,
@@ -942,7 +940,6 @@ struct DeviceExternalFunction[
                 func_attribute=func_attribute,
             )
             return
-        comptime assert not use_legacy_backend()  # TODO(MOCO-5393)
 
         var func_handle = ctx._impl._context[].get_or_load_function_dynamic(
             asm, function_name
@@ -1083,6 +1080,7 @@ struct DeviceExternalFunction[
                 .as_unsafe_any_origin()
             )
 
+        @__allow_legacy_any_origin_fields
         def _populate_arg_sizes[i: Int]() {mut dense_args}:
             dense_args.sizes.unsafe_get(i) = UInt64(size_of[Ts[i]]())
 
@@ -1141,6 +1139,7 @@ struct DeviceExternalFunction[
                 .as_unsafe_any_origin()
             )
 
+        @__allow_legacy_any_origin_fields
         def _populate_arg_sizes[i: Int]() {mut dense_args}:
             dense_args.sizes.unsafe_get(i) = UInt64(size_of[Ts[i]]())
 

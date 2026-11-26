@@ -18,9 +18,9 @@ from std.sys.info import simd_width_of
 from max.algorithm import stencil, stencil_gpu
 from max.gpu.host import DeviceContext
 from max.gpu.host.info import is_cpu, is_gpu
-from layout import Coord, TileTensor, coord_to_index_list
+from layout import Coord, TileTensor
+from std.utils.coord import DynamicCoord
 
-from std.utils.index import IndexList
 from std.utils.numerics import min_or_neg_inf
 
 from .shapes import get_sliding_window_out_dim
@@ -57,7 +57,7 @@ def pool_shape_ceil[
     strides_buf: TileTensor[mut=False, strides_type, ...],
     dilations_buf: TileTensor[mut=False, dilations_type, ...],
     paddings_buf: TileTensor[mut=False, paddings_type, ...],
-) raises -> IndexList[input_buf.rank]:
+) raises -> DynamicCoord[.int, input_buf.rank]:
     """Computes the output shape of a pooling operation using ceil rounding for the spatial dimensions.
 
     Parameters:
@@ -100,7 +100,7 @@ def pool_shape[
     strides_buf: TileTensor[mut=False, strides_type, ...],
     dilations_buf: TileTensor[mut=False, dilations_type, ...],
     paddings_buf: TileTensor[mut=False, paddings_type, ...],
-) raises -> IndexList[input_buf.rank]:
+) raises -> DynamicCoord[.int, input_buf.rank]:
     """Computes the output shape of a pooling operation using floor rounding for the spatial dimensions.
 
     Parameters:
@@ -144,7 +144,7 @@ def pool_shape_impl[
     strides_buf: TileTensor[mut=False, strides_type, ...],
     dilations_buf: TileTensor[mut=False, dilations_type, ...],
     paddings_buf: TileTensor[mut=False, paddings_type, ...],
-) raises -> IndexList[input_buf.rank]:
+) raises -> DynamicCoord[.int, input_buf.rank]:
     """
     Compute the output shape of a pooling operation, and assert the inputs are
     compatible. Works for 2D pool operations only in the NHWC format.
@@ -196,9 +196,9 @@ def pool_shape_impl[
     # Assume input has layout NHWC
     var batch_size = Int(input_buf.dim(0))
     var input_channels = Int(input_buf.dim(3))
-    var output_shape = IndexList[input_buf.rank]()
-    output_shape[0] = batch_size
-    output_shape[input_buf.rank - 1] = input_channels
+    var output_shape = DynamicCoord[.int, input_buf.rank]()
+    output_shape.replace_dynamic[0](batch_size)
+    output_shape.replace_dynamic[input_buf.rank - 1](input_channels)
 
     comptime for i in range(0, input_buf.rank - 2):
         var input_spatial_dim = Int(input_buf.dim(i + 1))
@@ -211,7 +211,7 @@ def pool_shape_impl[
         )
         if output_spatial_dim <= 0:
             raise Error("[pooling] output spatial dim must be positive")
-        output_shape[i + 1] = output_spatial_dim
+        output_shape.replace_dynamic[i + 1](output_spatial_dim)
 
     return output_shape
 
@@ -274,11 +274,11 @@ def max_pool_cpu[
     var dilation_w = Int(dilations[1])
 
     comptime stencil_rank = 2
-    comptime stencil_axis = IndexList[stencil_rank](1, 2)
+    comptime StencilPoint = DynamicCoord[DType.int, stencil_rank]
 
     @inline(.always)
     def map_fn(
-        point: IndexList[stencil_rank, ...],
+        point: StencilPoint,
     ) {
         var stride_h,
         var padding_h_low,
@@ -288,16 +288,16 @@ def max_pool_cpu[
         var dilation_w,
         var pool_window_h,
         var pool_window_w,
-    } -> Tuple[IndexList[stencil_rank], IndexList[stencil_rank]]:
-        var lower_bound = IndexList[stencil_rank](
-            point[0] * stride_h - padding_h_low,
-            point[1] * stride_w - padding_w_low,
+    } -> Tuple[StencilPoint, StencilPoint]:
+        var lower_h = point[0] * stride_h - padding_h_low
+        var lower_w = point[1] * stride_w - padding_w_low
+        return (
+            Coord(lower_h, lower_w),
+            Coord(
+                lower_h + pool_window_h * dilation_h,
+                lower_w + pool_window_w * dilation_w,
+            ),
         )
-        var upper_bound = IndexList[stencil_rank](
-            lower_bound[0] + pool_window_h * dilation_h,
-            lower_bound[1] + pool_window_w * dilation_w,
-        )
-        return lower_bound, upper_bound
 
     @inline(.always)
     def load_fn[
@@ -334,7 +334,6 @@ def max_pool_cpu[
     comptime stencil_with_padding = stencil[
         output.rank,
         stencil_rank,
-        stencil_axis,
         simd_width,
         dtype,
         type_of(map_fn),
@@ -348,7 +347,6 @@ def max_pool_cpu[
     comptime stencil_empty_padding = stencil[
         output.rank,
         stencil_rank,
-        stencil_axis,
         simd_width,
         dtype,
         type_of(map_fn),
@@ -362,12 +360,8 @@ def max_pool_cpu[
     # value, so in that case we use stencil_with_padding
     if empty_padding and not ceil_mode:
         return stencil_empty_padding(
-            rebind[IndexList[output.rank]](
-                coord_to_index_list(output.layout.shape_coord())
-            ),
-            rebind[IndexList[output.rank]](
-                coord_to_index_list(input.layout.shape_coord())
-            ),
+            output.layout.shape_coord(),
+            input.layout.shape_coord(),
             map_fn,
             dilation_fn,
             load_fn,
@@ -377,12 +371,8 @@ def max_pool_cpu[
         )
     else:
         return stencil_with_padding(
-            rebind[IndexList[output.rank]](
-                coord_to_index_list(output.layout.shape_coord()),
-            ),
-            rebind[IndexList[output.rank]](
-                coord_to_index_list(input.layout.shape_coord()),
-            ),
+            output.layout.shape_coord(),
+            input.layout.shape_coord(),
             map_fn,
             dilation_fn,
             load_fn,
@@ -520,11 +510,11 @@ def max_pool_gpu_impl[
         raise Error("Dilation not supported for size > 2")
 
     comptime stencil_rank = 2
-    comptime stencil_axis = IndexList[stencil_rank](1, 2)
+    comptime StencilPoint = DynamicCoord[DType.int, stencil_rank]
 
     @inline(.always)
     def map_fn(
-        point: IndexList[stencil_rank, ...],
+        point: StencilPoint,
     ) {
         var stride_h,
         var padding_h_low,
@@ -534,16 +524,16 @@ def max_pool_gpu_impl[
         var dilation_w,
         var pool_window_h,
         var pool_window_w,
-    } -> Tuple[IndexList[stencil_rank], IndexList[stencil_rank]]:
-        var lower_bound = IndexList[stencil_rank](
-            point[0] * stride_h - padding_h_low,
-            point[1] * stride_w - padding_w_low,
+    } -> Tuple[StencilPoint, StencilPoint]:
+        var lower_h = point[0] * stride_h - padding_h_low
+        var lower_w = point[1] * stride_w - padding_w_low
+        return (
+            Coord(lower_h, lower_w),
+            Coord(
+                lower_h + pool_window_h * dilation_h,
+                lower_w + pool_window_w * dilation_w,
+            ),
         )
-        var upper_bound = IndexList[stencil_rank](
-            lower_bound[0] + pool_window_h * dilation_h,
-            lower_bound[1] + pool_window_w * dilation_w,
-        )
-        return lower_bound, upper_bound
 
     @inline(.always)
     def load_fn[
@@ -587,7 +577,6 @@ def max_pool_gpu_impl[
     comptime stencil_gpu_fn = stencil_gpu[
         output.rank,
         stencil_rank,
-        stencil_axis,
         simd_width,
         dtype,
         type_of(map_fn),
@@ -599,12 +588,8 @@ def max_pool_gpu_impl[
     ]
     return stencil_gpu_fn(
         ctx,
-        rebind[IndexList[output.rank]](
-            coord_to_index_list(output.layout.shape_coord())
-        ),
-        rebind[IndexList[output.rank]](
-            coord_to_index_list(input.layout.shape_coord())
-        ),
+        output.layout.shape_coord(),
+        input.layout.shape_coord(),
         map_fn,
         dilation_fn,
         load_fn,
@@ -702,11 +687,11 @@ def avg_pool_cpu[
     var dilation_w = Int(dilations[1])
 
     comptime stencil_rank = 2
-    comptime stencil_axis = IndexList[stencil_rank](1, 2)
+    comptime StencilPoint = DynamicCoord[DType.int, stencil_rank]
 
     @inline(.always)
     def map_fn(
-        point: IndexList[stencil_rank, ...],
+        point: StencilPoint,
     ) {
         var stride_h,
         var stride_w,
@@ -716,16 +701,16 @@ def avg_pool_cpu[
         var dilation_w,
         var pool_window_h,
         var pool_window_w,
-    } -> Tuple[IndexList[stencil_rank], IndexList[stencil_rank]]:
-        var lower_bound = IndexList[stencil_rank](
-            point[0] * stride_h - padding_h_low,
-            point[1] * stride_w - padding_w_low,
+    } -> Tuple[StencilPoint, StencilPoint]:
+        var lower_h = point[0] * stride_h - padding_h_low
+        var lower_w = point[1] * stride_w - padding_w_low
+        return (
+            Coord(lower_h, lower_w),
+            Coord(
+                lower_h + pool_window_h * dilation_h,
+                lower_w + pool_window_w * dilation_w,
+            ),
         )
-        var upper_bound = IndexList[stencil_rank](
-            lower_bound[0] + pool_window_h * dilation_h,
-            lower_bound[1] + pool_window_w * dilation_w,
-        )
-        return lower_bound, upper_bound
 
     @inline(.always)
     def load_fn[
@@ -817,7 +802,6 @@ def avg_pool_cpu[
     comptime stencil_with_padding = stencil[
         output.rank,
         stencil_rank,
-        stencil_axis,
         simd_width,
         dtype,
         type_of(map_fn),
@@ -831,7 +815,6 @@ def avg_pool_cpu[
     comptime stencil_with_padding_count_exclude_boundary = stencil[
         output.rank,
         stencil_rank,
-        stencil_axis,
         simd_width,
         dtype,
         type_of(map_fn),
@@ -845,7 +828,6 @@ def avg_pool_cpu[
     comptime stencil_empty_padding = stencil[
         output.rank,
         stencil_rank,
-        stencil_axis,
         simd_width,
         dtype,
         type_of(map_fn),
@@ -858,12 +840,8 @@ def avg_pool_cpu[
 
     if empty_padding and not ceil_mode:
         return stencil_empty_padding(
-            rebind[IndexList[output.rank]](
-                coord_to_index_list(output.layout.shape_coord())
-            ),
-            rebind[IndexList[output.rank]](
-                coord_to_index_list(input.layout.shape_coord())
-            ),
+            output.layout.shape_coord(),
+            input.layout.shape_coord(),
             map_fn,
             dilation_fn,
             load_fn,
@@ -874,12 +852,8 @@ def avg_pool_cpu[
     else:
         comptime if count_boundary:
             return stencil_with_padding(
-                rebind[IndexList[output.rank]](
-                    coord_to_index_list(output.layout.shape_coord())
-                ),
-                rebind[IndexList[output.rank]](
-                    coord_to_index_list(input.layout.shape_coord())
-                ),
+                output.layout.shape_coord(),
+                input.layout.shape_coord(),
                 map_fn,
                 dilation_fn,
                 load_fn,
@@ -889,12 +863,8 @@ def avg_pool_cpu[
             )
         else:
             return stencil_with_padding_count_exclude_boundary(
-                rebind[IndexList[output.rank]](
-                    coord_to_index_list(output.layout.shape_coord())
-                ),
-                rebind[IndexList[output.rank]](
-                    coord_to_index_list(input.layout.shape_coord())
-                ),
+                output.layout.shape_coord(),
+                input.layout.shape_coord(),
                 map_fn,
                 dilation_fn,
                 load_fn,
@@ -1061,11 +1031,11 @@ def avg_pool_gpu_impl[
         raise Error("Dilation not supported for size > 2")
 
     comptime stencil_rank = 2
-    comptime stencil_axis = IndexList[stencil_rank](1, 2)
+    comptime StencilPoint = DynamicCoord[DType.int, stencil_rank]
 
     @inline(.always)
     def map_fn(
-        point: IndexList[stencil_rank, ...],
+        point: StencilPoint,
     ) {
         var stride_h,
         var stride_w,
@@ -1075,16 +1045,16 @@ def avg_pool_gpu_impl[
         var dilation_w,
         var pool_window_h,
         var pool_window_w,
-    } -> Tuple[IndexList[stencil_rank], IndexList[stencil_rank]]:
-        var lower_bound = IndexList[stencil_rank](
-            point[0] * stride_h - padding_h_low,
-            point[1] * stride_w - padding_w_low,
+    } -> Tuple[StencilPoint, StencilPoint]:
+        var lower_h = point[0] * stride_h - padding_h_low
+        var lower_w = point[1] * stride_w - padding_w_low
+        return (
+            Coord(lower_h, lower_w),
+            Coord(
+                lower_h + pool_window_h * dilation_h,
+                lower_w + pool_window_w * dilation_w,
+            ),
         )
-        var upper_bound = IndexList[stencil_rank](
-            lower_bound[0] + pool_window_h * dilation_h,
-            lower_bound[1] + pool_window_w * dilation_w,
-        )
-        return lower_bound, upper_bound
 
     @inline(.always)
     def load_fn[
@@ -1183,7 +1153,6 @@ def avg_pool_gpu_impl[
     comptime stencil_gpu_fn = stencil_gpu[
         output.rank,
         stencil_rank,
-        stencil_axis,
         simd_width,
         dtype,
         type_of(map_fn),
@@ -1197,7 +1166,6 @@ def avg_pool_gpu_impl[
     comptime stencil_gpu_count_exclude_boundary = stencil_gpu[
         output.rank,
         stencil_rank,
-        stencil_axis,
         simd_width,
         dtype,
         type_of(map_fn),
@@ -1211,12 +1179,8 @@ def avg_pool_gpu_impl[
     if empty_padding and not ceil_mode:
         return stencil_gpu_fn(
             ctx,
-            rebind[IndexList[output.rank]](
-                coord_to_index_list(output.layout.shape_coord())
-            ),
-            rebind[IndexList[output.rank]](
-                coord_to_index_list(input.layout.shape_coord())
-            ),
+            output.layout.shape_coord(),
+            input.layout.shape_coord(),
             map_fn,
             dilation_fn,
             load_fn,
@@ -1228,12 +1192,8 @@ def avg_pool_gpu_impl[
         comptime if count_boundary:
             return stencil_gpu_fn(
                 ctx,
-                rebind[IndexList[output.rank]](
-                    coord_to_index_list(output.layout.shape_coord())
-                ),
-                rebind[IndexList[output.rank]](
-                    coord_to_index_list(input.layout.shape_coord())
-                ),
+                output.layout.shape_coord(),
+                input.layout.shape_coord(),
                 map_fn,
                 dilation_fn,
                 load_fn,
@@ -1244,12 +1204,8 @@ def avg_pool_gpu_impl[
         else:
             return stencil_gpu_count_exclude_boundary(
                 ctx,
-                rebind[IndexList[output.rank]](
-                    coord_to_index_list(output.layout.shape_coord())
-                ),
-                rebind[IndexList[output.rank]](
-                    coord_to_index_list(input.layout.shape_coord())
-                ),
+                output.layout.shape_coord(),
+                input.layout.shape_coord(),
                 map_fn,
                 dilation_fn,
                 load_fn,

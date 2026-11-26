@@ -413,9 +413,10 @@ struct ExampleCMTuple(ImplicitlyCopyable):
 
 # CHECK-LABEL: lit.fn @"testExampleCMTuple
 def testExampleCMTuple(cm: ExampleCMTuple):
+    # CHECK: [[TARGET:%.*]] = lit.call {{.*}}__enter__
     # CHECK: %a = lit.var.decl "a"
     # CHECK: %b = lit.var.decl "b"
-    # CHECK: [[TARGET:%.*]] = lit.call {{.*}}__enter__
+    # CHECK: lit.ref.store [[TARGET]],
     with cm as (a, b):
         # Captures the refs from the tuple.
         # CHECK: [[A:%.*]] = lit.ref.load %a
@@ -457,7 +458,7 @@ def with_infer_int() raises Int:
         raise_int()
 
 
-__enum ContextualWithError(ImplicitlyCopyable):
+__union ContextualWithError(ImplicitlyCopyable):
     case custom(String)
 
 

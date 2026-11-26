@@ -62,7 +62,7 @@ accumulators.
 """
 
 from max.gpu import WARP_SIZE, block_idx, warp_id
-from max.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext, GridBlockLaunchConfig
 from std.math import ceildiv
 from std.sys import align_of
 
@@ -277,6 +277,7 @@ struct Matmul2dFp8[
         # does), which the TileTensor-idioms-only rule forbids here. `_write4`
         # reaches the same 2-vector-store result.
         @inline(.always)
+        @__allow_legacy_any_origin_fields
         def _apply_epilogue[bounded: Bool]() {imm}:
             var c_sub = c.tile[SG_M, SG_N](Int(sg_row_idx), Int(sg_col_idx))
             # 4 contiguous out cols = one SIMD unit; element alignment only (the
@@ -421,6 +422,7 @@ struct Matmul2dFp8[
         var c_ptr = c.ptr
 
         @inline(.always)
+        @__allow_legacy_any_origin_fields
         def group_epilogue_fn[
             dtype: DType, width: SIMDLength, *, alignment: Int
         ](idx: Coord, val: SIMD[dtype, width]) {
@@ -553,9 +555,11 @@ def enqueue_matmul2d_fp8[
             weight.as_imm(),
             log2_m,
             log2_n,
+            execution_config=GridBlockLaunchConfig(
+                grid_dim=(side_m * side_n),
+                block_dim=(MM.THREADS_PER_BLOCK),
+            ),
             host_args=(epilogue_fn,),
-            grid_dim=(side_m * side_n),
-            block_dim=(MM.THREADS_PER_BLOCK),
         )
     else:
         comptime kernel = MM.run[
@@ -572,8 +576,10 @@ def enqueue_matmul2d_fp8[
             weight.as_imm(),
             log2_m,
             log2_n,
-            grid_dim=(side_m * side_n),
-            block_dim=(MM.THREADS_PER_BLOCK),
+            execution_config=GridBlockLaunchConfig(
+                grid_dim=(side_m * side_n),
+                block_dim=(MM.THREADS_PER_BLOCK),
+            ),
         )
 
 
@@ -672,7 +678,9 @@ def enqueue_grouped_matmul2d_fp8[
         expert_ids,
         Int32(n),
         Int32(k),
+        execution_config=GridBlockLaunchConfig(
+            grid_dim=(grid_n, grid_m, num_active_experts),
+            block_dim=(MM.THREADS_PER_BLOCK),
+        ),
         host_args=(epilogue_fn, compute_fn),
-        grid_dim=(grid_n, grid_m, num_active_experts),
-        block_dim=(MM.THREADS_PER_BLOCK),
     )

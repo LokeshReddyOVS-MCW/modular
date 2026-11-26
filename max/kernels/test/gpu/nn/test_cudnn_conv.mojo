@@ -12,7 +12,7 @@
 # ===----------------------------------------------------------------------=== #
 
 from max.gpu.host import DeviceContext
-from layout import Idx, TileTensor, row_major
+from layout import Coord, Idx, TileTensor, row_major
 from layout._fillers import random
 from nn.conv.conv import conv_cudnn, conv_gpu
 from std.testing import assert_almost_equal
@@ -167,9 +167,9 @@ def test_conv_cudnn[
         input_dev_tt,
         filter_dev_tt,
         output_ref_dev_tt,
-        stride_dim,
-        dilation_dim,
-        pad_dim,
+        Coord(stride_dim),
+        Coord(dilation_dim),
+        Coord(pad_dim),
         num_groups,
         ctx,
     )
@@ -180,13 +180,13 @@ def test_conv_cudnn[
     # [pad_h_before, pad_h_after, pad_w_before, pad_w_after] -> [pad_h, pad_w].
     # Note: This test only uses symmetric padding, so
     # pad_h_before == pad_h_after and pad_w_before == pad_w_after.
-    var pad_for_cudnn = IndexList[2](pad_dim[0], pad_dim[2])
+    var pad_for_cudnn = (pad_dim[0], pad_dim[2])
     conv_cudnn[input_type, filter_type, output_type](
         input_dev_tt,
         filter_nchw_dev_tt,
         output_dev_tt,
-        stride_dim,
-        dilation_dim,
+        (stride_dim[0], stride_dim[1]),
+        (dilation_dim[0], dilation_dim[1]),
         pad_for_cudnn,
         num_groups,
         ctx,
@@ -241,6 +241,44 @@ def main() raises:
                 3,
                 3,
             ),  # pad: [pad_h_before, pad_h_after, pad_w_before, pad_w_after] (symmetric: pad_h=0, pad_w=3)
+        ](ctx)
+
+        # Filter rows too long for the shared-memory layout change (64 KB):
+        # the direct kernel, with 8-wide and with scalar accesses.
+        test_conv_cudnn[
+            (1, 2, 2, 16384),
+            (1, 1, 16384, 8),
+            (1, 2, 2, 8),
+            .float32,
+            .float32,
+            .float32,
+            (1, 1),
+            (1, 1),
+            (0, 0, 0, 0),
+        ](ctx)
+        test_conv_cudnn[
+            (1, 2, 2, 16388),
+            (1, 1, 16388, 8),
+            (1, 2, 2, 8),
+            .float32,
+            .float32,
+            .float32,
+            (1, 1),
+            (1, 1),
+            (0, 0, 0, 0),
+        ](ctx)
+
+        # Odd channel counts and a 1 x 5 filter through the row kernel.
+        test_conv_cudnn[
+            (1, 1, 40, 3),
+            (1, 5, 3, 16),
+            (1, 1, 36, 16),
+            .float16,
+            .float16,
+            .float16,
+            (1, 1),
+            (1, 1),
+            (0, 0, 0, 0),
         ](ctx)
 
         # Test different data types.

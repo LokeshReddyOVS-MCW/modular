@@ -365,6 +365,7 @@ def _fa4_splitk_combine_kernel[
         )
 
         @inline(.always)
+        @__allow_legacy_any_origin_fields
         def fold(p: Int, scale: Scalar[_ACC]) {mut datas, mut result, imm}:
             var is_valid = SIMD[.bool, vec_size](fill=scale != Scalar[_ACC](0))
             comptime for i in range(elems_per_thread):
@@ -496,21 +497,22 @@ def fa4_splitk_combine[
     comptime sm_count = ctx.default_device_info.sm_count
 
     @inline(.always)
+    @__allow_legacy_any_origin_fields
     def enqueue[P_STATIC: Int]() raises {imm}:
         comptime kernel = _fa4_splitk_combine_kernel[
             output_type, ov_depth, intermediate_type, P_STATIC=P_STATIC
         ]
         ctx.enqueue_function[kernel](
-            GridBlockAttributeLaunchConfig(
-                grid_dim=(Int(rows_heads), 1, 1),
-                block_dim=(nthreads, 1, 1),
-                attributes=pdl_launch_attributes(MHA_PDL_LEVEL),
-            ),
             output_ptr,
             o_partial_ptr,
             lse_partial_ptr,
             num_partitions,
             rows_heads,
+            execution_config=GridBlockAttributeLaunchConfig(
+                grid_dim=(Int(rows_heads), 1, 1),
+                block_dim=(nthreads, 1, 1),
+                attributes=pdl_launch_attributes(MHA_PDL_LEVEL),
+            ),
         )
 
     comptime _COMBINE_P_LADDER = splitk_p_ladder[sm_count]()

@@ -21,7 +21,7 @@
 #include "Support/ErrorOr.h"
 #include "Support/Preprocessor.h"
 #include "Support/SymbolExport.h"
-#include "Support/max_license/Tracy/Tracy.h"
+#include "Support/max_license/Profiling/ProfileRange.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -129,7 +129,7 @@ using hipMemcpyAttributes = struct hipMemcpyAttributes_st {
 
 // Virtual Memory Management types (mirroring CUDA's CUmem* VMM types). Used by
 // the defragmenting allocator; see
-// MLRT/lib/Driver/DeviceContext/MemoryManager.h. Layouts must match
+// MLRT/lib/Driver/MemoryManager/MemoryManager.h. Layouts must match
 // hip_runtime_api.h exactly since the driver is loaded via dlsym.
 using hipMemGenericAllocationHandle_t = struct ihipMemGenericAllocationHandle *;
 
@@ -825,7 +825,7 @@ public:
 
 #define HIP_FUNC(name, ret, ...)                                               \
   ret name(EXPAND_PARAMS(__VA_ARGS__)) const {                                 \
-    TRACY_ZONE_SCOPED_NC(#name, TRACY_COLOR_RED);                              \
+    M_PROFILE_TRACY_ZONE(#name, M_PROFILE_COLOR_RED);                          \
     return name##_(EXPAND_ARGS(__VA_ARGS__));                                  \
   }
 #include "HIPDriver.inc"

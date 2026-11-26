@@ -83,7 +83,8 @@ ASTType LIT::specializeStruct(const ParamBindings &bindings,
   TypeSignatureType sig = structOp.getSignature();
   ParamInf inference(bindings, sig.getParamTypes(), sig.getParamListAttrs(),
                      /*allowImplicitConversions=*/true, declIfKnown,
-                     /*discardError=*/false);
+                     /*discardError=*/false,
+                     bindings.declScope.getShared().noAssumptions);
   VerifiedParamBindings verified = inference.inferForStruct();
   if (!verified)
     return {};
@@ -135,6 +136,15 @@ CValue LIT::materializeAsyncCallAsCoroutine(IREmitter &emitter,
                                   std::move(dest), {{SRValue(call), expr}}));
 }
 
+CValue LIT::getFunctionArgumentValue(Value bbArg, ArgConvention convention) {
+  if (convention == ArgConvention::ByRefResult)
+    return MLValue(bbArg);
+  if (convention == ArgConvention::ImmReg)
+    return SRValue(bbArg);
+  // Everything else is passed in memory.
+  return CValue::getMValueForRef(bbArg);
+}
+
 void LIT::markRegionUnreachable(Region *deadRegion, Location unreachableLoc) {
   // Erase bottom up to avoid deleting an op while something uses its results.
   for (Operation &op :
@@ -149,11 +159,30 @@ void LIT::markRegionUnreachable(Region *deadRegion, Location unreachableLoc) {
   UnreachableOp::create(builder, unreachableLoc);
 }
 
+bool LIT::typeHasAnyOrigin(SharedState &shared, Type type) {
+  return llvm::any_of(
+      shared.cachedOriginFinder.findOriginsIn(getCanonicalType(type)),
+      [](TypedAttr origin) {
+        return sugarIsa<AnyOriginAttr>(
+            OriginType::stripMutCastAndRebind(origin));
+      });
+}
+
 //===----------------------------------------------------------------------===//
 // Diagnostic utilities
 //===----------------------------------------------------------------------===//
 
 bool LIT::isInternalName(StringRef name) { return name.starts_with('_'); }
+
+StringRef LIT::getEnumOrUnionNoun(StructDeclOp structOp) {
+  return structOp.isEnum() ? "enum" : "union";
+}
+
+StringRef LIT::getMalformedCaseMessage(StructDeclOp structOp) {
+  if (structOp.isEnum())
+    return "enum case must have the form 'case name'";
+  return "union case must have the form 'case name()' or 'case name(T, ...)'";
+}
 
 namespace {
 class IndexRefToNamedRefReplacer

@@ -544,12 +544,14 @@ mergeConformsToConstraints(ArrayRef<ConstraintAttr> constraints,
 
 static StringRef getConventionString(ArgConvention convention) {
   switch (convention) {
+  case ArgConvention::Unresolved:
+    llvm_unreachable("unresolved convention in a resolved signature");
   case ArgConvention::ByRefError:
     llvm_unreachable("error arguments are not rendered");
   case ArgConvention::PackImmMem:
   case ArgConvention::PackMut:
   case ArgConvention::PackOwnedMem:
-    llvm_unreachable("pack conventions do not occur before LowerLIT");
+    llvm_unreachable("pack arguments render their element convention");
   case ArgConvention::ByRefResult:
     return "out";
   case ArgConvention::ImmReg:

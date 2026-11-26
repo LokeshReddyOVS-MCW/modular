@@ -33,7 +33,7 @@ from std.memory import bitcast
 
 comptime _DEFAULT_ARITHMETIC_ORDERING = CurrentPlugin.default_atomic_ordering
 comptime _DEFAULT_COMPARISON_ORDERING = _DEFAULT_ARITHMETIC_ORDERING
-comptime _DEFAULT_MEMORY_ORDERING = Ordering.SEQUENTIAL
+comptime _DEFAULT_MEMORY_ORDERING = Ordering.sequential
 
 
 struct Ordering(
@@ -48,13 +48,13 @@ struct Ordering(
     orderings for atomic operations.
 
     Attributes:
-        NOT_ATOMIC: Not atomic.
-        UNORDERED: Unordered.
-        RELAXED: Relaxed.
-        ACQUIRE: Acquire.
-        RELEASE: Release.
-        ACQUIRE_RELEASE: Acquire-release.
-        SEQUENTIAL: Sequentially consistent.
+        not_atomic: Not atomic.
+        unordered: Unordered.
+        relaxed: Relaxed.
+        acquire: Acquire.
+        release: Release.
+        acquire_release: Acquire-release.
+        sequential: Sequentially consistent.
     """
 
     var _value: UInt8
@@ -62,20 +62,48 @@ struct Ordering(
     This is the underlying value of the memory ordering.
     """
 
-    comptime NOT_ATOMIC = Self(0)
+    comptime not_atomic = Self(0)
     """Not atomic."""
-    comptime UNORDERED = Self(1)
+    comptime unordered = Self(1)
     """Unordered."""
-    comptime RELAXED = Self(2)
+    comptime relaxed = Self(2)
     """Relaxed."""
-    comptime ACQUIRE = Self(3)
+    comptime acquire = Self(3)
     """Acquire."""
-    comptime RELEASE = Self(4)
+    comptime release = Self(4)
     """Release."""
-    comptime ACQUIRE_RELEASE = Self(5)
+    comptime acquire_release = Self(5)
     """Acquire-release."""
-    comptime SEQUENTIAL = Self(6)
+    comptime sequential = Self(6)
     """Sequentially consistent."""
+
+    @deprecated(use=not_atomic)
+    comptime NOT_ATOMIC = Self.not_atomic
+    """Deprecated: The former name of `not_atomic`."""
+
+    @deprecated(use=unordered)
+    comptime UNORDERED = Self.unordered
+    """Deprecated: The former name of `unordered`."""
+
+    @deprecated(use=relaxed)
+    comptime RELAXED = Self.relaxed
+    """Deprecated: The former name of `relaxed`."""
+
+    @deprecated(use=acquire)
+    comptime ACQUIRE = Self.acquire
+    """Deprecated: The former name of `acquire`."""
+
+    @deprecated(use=release)
+    comptime RELEASE = Self.release
+    """Deprecated: The former name of `release`."""
+
+    @deprecated(use=acquire_release)
+    comptime ACQUIRE_RELEASE = Self.acquire_release
+    """Deprecated: The former name of `acquire_release`."""
+
+    @deprecated(use=sequential)
+    comptime SEQUENTIAL = Self.sequential
+    """Deprecated: The former name of `sequential`."""
 
     @inline(.always)
     def __init__(out self, value: UInt8):
@@ -117,22 +145,22 @@ struct Ordering(
             A string slice representation of this ordering.
         """
 
-        if self == Self.NOT_ATOMIC:
-            return "Ordering.NOT_ATOMIC"
-        if self == Self.UNORDERED:
-            return "Ordering.UNORDERED"
-        if self == Self.RELAXED:
-            return "Ordering.RELAXED"
-        if self == Self.ACQUIRE:
-            return "Ordering.ACQUIRE"
-        if self == Self.RELEASE:
-            return "Ordering.RELEASE"
-        if self == Self.ACQUIRE_RELEASE:
-            return "Ordering.ACQUIRE_RELEASE"
-        if self == Self.SEQUENTIAL:
-            return "Ordering.SEQUENTIAL"
+        if self == Self.not_atomic:
+            return "Ordering.not_atomic"
+        if self == Self.unordered:
+            return "Ordering.unordered"
+        if self == Self.relaxed:
+            return "Ordering.relaxed"
+        if self == Self.acquire:
+            return "Ordering.acquire"
+        if self == Self.release:
+            return "Ordering.release"
+        if self == Self.acquire_release:
+            return "Ordering.acquire_release"
+        if self == Self.sequential:
+            return "Ordering.sequential"
 
-        return "Ordering.UNKNOWN"
+        return "Ordering.unknown"
 
     def write_to(self, mut writer: Some[Writer]):
         """Write the string representation of this `Ordering` to a writer.
@@ -158,19 +186,19 @@ struct Ordering(
         Returns:
             The MLIR attribute representation of the Ordering object.
         """
-        if self == Self.NOT_ATOMIC:
+        if self == Self.not_atomic:
             return __mlir_attr.`#pop.atomic_ordering<not_atomic>`
-        if self == Self.UNORDERED:
+        if self == Self.unordered:
             return __mlir_attr.`#pop.atomic_ordering<unordered>`
-        if self == Self.RELAXED:
+        if self == Self.relaxed:
             return __mlir_attr.`#pop.atomic_ordering<monotonic>`
-        if self == Self.ACQUIRE:
+        if self == Self.acquire:
             return __mlir_attr.`#pop.atomic_ordering<acquire>`
-        if self == Self.RELEASE:
+        if self == Self.release:
             return __mlir_attr.`#pop.atomic_ordering<release>`
-        if self == Self.ACQUIRE_RELEASE:
+        if self == Self.acquire_release:
             return __mlir_attr.`#pop.atomic_ordering<acq_rel>`
-        if self == Self.SEQUENTIAL:
+        if self == Self.sequential:
             return __mlir_attr.`#pop.atomic_ordering<seq_cst>`
 
         abort()

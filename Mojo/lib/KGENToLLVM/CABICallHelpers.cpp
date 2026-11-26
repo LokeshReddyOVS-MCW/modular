@@ -89,8 +89,8 @@ std::unique_ptr<CABIInfo> CABICallHelper::createABIHandler() const {
 }
 
 Value CABICallHelper::createEntryBlockAlloca(DirectRewriter &rewriter,
-                                             Location loc,
-                                             Type elemType) const {
+                                             Location loc, Type elemType,
+                                             int64_t alignment) const {
   auto ptrType = LLVMPointerType::get(ctx);
 
   // Save current insertion point and emit alloca at the start of the
@@ -101,8 +101,7 @@ Value CABICallHelper::createEntryBlockAlloca(DirectRewriter &rewriter,
 
   Value count =
       ConstantOp::create(rewriter, loc, rewriter.getI32IntegerAttr(1));
-  return AllocaOp::create(rewriter, loc, ptrType, elemType, count,
-                          /*alignment=*/0);
+  return AllocaOp::create(rewriter, loc, ptrType, elemType, count, alignment);
 }
 
 LLVMFuncOp CABICallHelper::getParentFunc() const {
@@ -116,6 +115,9 @@ SmallVector<Value> CABICallHelper::prepareArg(const CoercionInfo &coercion,
                                               DirectRewriter &rewriter) const {
   SmallVector<Value> result;
 
+  if (coercion.isIgnore())
+    return result;
+
   if (coercion.isIdentity()) {
     // No coercion - pass directly
     result.push_back(squashPointlessCasts(originalArg));
@@ -124,7 +126,8 @@ SmallVector<Value> CABICallHelper::prepareArg(const CoercionInfo &coercion,
 
   if (coercion.useIndirect) {
     // Allocate stack space, store struct, pass pointer
-    Value alloca = createEntryBlockAlloca(rewriter, loc, originalArg.getType());
+    Value alloca = createEntryBlockAlloca(rewriter, loc, originalArg.getType(),
+                                          coercion.indirectAlign);
     StoreOp::create(rewriter, loc, originalArg, alloca);
     result.push_back(alloca);
     return result;
@@ -153,7 +156,8 @@ CABICallHelper::buildCallArgs(ArrayRef<CoercionInfo> argClass,
 
   // Prepare sret pointer if needed
   if (retClass.useSRet) {
-    sretPointer = createEntryBlockAlloca(rewriter, loc, origRetTy);
+    sretPointer = createEntryBlockAlloca(rewriter, loc, origRetTy,
+                                         retClass.indirectAlign);
     callArgs.push_back(sretPointer);
   }
 
@@ -175,6 +179,9 @@ Value CABICallHelper::extractReturn(const CoercionInfo &retClass,
     // Load from sret pointer
     return LoadOp::create(rewriter, loc, origRetTy, sretPointer);
   }
+
+  if (retClass.isIgnore())
+    return UndefOp::create(rewriter, loc, origRetTy);
 
   if (retClass.isIdentity()) {
     // No coercion - use directly
@@ -261,7 +268,9 @@ Value CABICallHelper::finishCall(CallOp call, const CABICallPrep &prep,
 
   if (!prep.retType)
     return {};
-  Value callResult = sigClass.ret.useSRet ? Value() : call.getResult();
+  Value callResult = sigClass.ret.useSRet || sigClass.ret.isIgnore()
+                         ? Value()
+                         : call.getResult();
   return extractReturn(sigClass.ret, callResult, prep.sretPtr, prep.retType,
                        loc, rewriter);
 }

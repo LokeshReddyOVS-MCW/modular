@@ -18,7 +18,7 @@ from std.math import ceildiv
 from std.sys import size_of
 
 from max.gpu.globals import WARPGROUP_SIZE
-from max.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext, GridBlockLaunchConfig
 from max.gpu.host.nvidia.tma import TensorMapSwizzle
 from max.gpu.host.info import H100
 from layout import (
@@ -35,7 +35,6 @@ from std.logger import Logger
 from std.bit import log2_floor
 
 from std.utils.coord import Coord, DynamicCoord
-from std.utils.index import Index, IndexList
 from std.utils.static_tuple import StaticTuple
 
 from ....utils import (
@@ -55,7 +54,7 @@ comptime logger = Logger()
 
 def _is_valid_cluster_shape[
     cluster_shape: Tuple[Int, Int, Int]
-](grid_shape: IndexList[2], num_tiles_n: Int) -> Bool:
+](grid_shape: Tuple[Int, Int], num_tiles_n: Int) -> Bool:
     if num_tiles_n % cluster_shape[0] != 0:
         return False
 
@@ -71,27 +70,24 @@ def _is_valid_cluster_shape[
 
 def _get_grid_shape[
     cluster_shape: Tuple[Int, Int, Int] = (1, 1, 1)
-](num_tiles_n: Int) -> IndexList[2]:
+](num_tiles_n: Int) -> Tuple[Int, Int]:
     # Hardcode values on purpose until we move this inside tile scheduler
     # in a more robust way.
     comptime h100_num_SMs = H100.sm_count
     var num_blocks_n = min(num_tiles_n, h100_num_SMs)
-    var adjusted_grid_shape = Index(
-        num_blocks_n,
-        h100_num_SMs // num_blocks_n,
-    )
+    var adjusted_grid_shape = (num_blocks_n, h100_num_SMs // num_blocks_n)
 
     # A Naive heuristic to select grid shape based on number of tile in N.
     if num_tiles_n % 8 == 0 or not _is_valid_cluster_shape[cluster_shape](
         adjusted_grid_shape, num_tiles_n
     ):
-        return Index(8, 16)
+        return (8, 16)
 
     return adjusted_grid_shape
 
 
 def _is_valid_grid_shape[
-    grid_shape: IndexList[2], cluster_shape: Tuple[Int, Int, Int]
+    grid_shape: Tuple[Int, Int], cluster_shape: Tuple[Int, Int, Int]
 ](num_tiles_n: Int) -> Bool:
     comptime assert (
         grid_shape[0] * grid_shape[1] <= H100.sm_count
@@ -485,10 +481,8 @@ def _warp_specialize_gemm_with_multicasting_impl[
             sep=" ",
         )
 
-    comptime grid_shape_adjusted = IndexList[2](
-        grid_shape.value()
-    ) if grid_shape else _get_grid_shape[config.cluster_shape](
-        ceildiv(N_static, BN)
+    comptime grid_shape_adjusted = grid_shape.or_else(
+        _get_grid_shape[config.cluster_shape](ceildiv(N_static, BN))
     )
 
     comptime cluster_shape = config.cluster_shape
@@ -694,11 +688,16 @@ def _warp_specialize_gemm_with_multicasting_impl[
                     b_tma_op,
                     c_tma_op,
                     c_device.as_unsafe_any_origin(),
-                    Index(M, N, K),
+                    Coord(M, N, K),
+                    execution_config=GridBlockLaunchConfig(
+                        grid_dim=(
+                            grid_shape_adjusted[0],
+                            grid_shape_adjusted[1],
+                        ),
+                        block_dim=(num_threads),
+                        shared_mem_bytes=smem_size,
+                    ),
                     host_args=(epilogue_fn, compute_fn),
-                    grid_dim=(grid_shape_adjusted[0], grid_shape_adjusted[1]),
-                    block_dim=(num_threads),
-                    shared_mem_bytes=smem_size,
                 )
             else:
                 comptime kernel = matmul_kernel_regular[
@@ -727,10 +726,12 @@ def _warp_specialize_gemm_with_multicasting_impl[
                     b_device.as_imm().as_unsafe_any_origin(),
                     c_device.as_unsafe_any_origin(),
                     lut_ptr,
+                    execution_config=GridBlockLaunchConfig(
+                        grid_dim=(ceildiv(N, BN), ceildiv(M, BM)),
+                        block_dim=(num_threads),
+                        shared_mem_bytes=smem_size,
+                    ),
                     host_args=(epilogue_fn, compute_fn),
-                    grid_dim=(ceildiv(N, BN), ceildiv(M, BM)),
-                    block_dim=(num_threads),
-                    shared_mem_bytes=smem_size,
                 )
         else:
             var a_tma_op = create_tensor_tile[
@@ -774,10 +775,12 @@ def _warp_specialize_gemm_with_multicasting_impl[
                     a_device.as_imm().as_unsafe_any_origin(),
                     c_device.as_unsafe_any_origin(),
                     lut_ptr,
+                    execution_config=GridBlockLaunchConfig(
+                        grid_dim=(ceildiv(N, BN), ceildiv(M, BM)),
+                        block_dim=(num_threads),
+                        shared_mem_bytes=smem_size,
+                    ),
                     host_args=(epilogue_fn, compute_fn),
-                    grid_dim=(ceildiv(N, BN), ceildiv(M, BM)),
-                    block_dim=(num_threads),
-                    shared_mem_bytes=smem_size,
                 )
 
     # Dispatch kernel using cp.async.ca when the stride is not multiple of 4B or 8B..
@@ -800,10 +803,12 @@ def _warp_specialize_gemm_with_multicasting_impl[
             a_device.as_imm().as_unsafe_any_origin(),
             b_device.as_imm().as_unsafe_any_origin(),
             c_device.as_unsafe_any_origin(),
+            execution_config=GridBlockLaunchConfig(
+                grid_dim=(ceildiv(N, BN), ceildiv(M, BM)),
+                block_dim=(num_threads),
+                shared_mem_bytes=smem_size,
+            ),
             host_args=(epilogue_fn, compute_fn),
-            grid_dim=(ceildiv(N, BN), ceildiv(M, BM)),
-            block_dim=(num_threads),
-            shared_mem_bytes=smem_size,
         )
 
 
@@ -1021,7 +1026,7 @@ def warp_specialize_gemm_with_multicasting_splitk[
 
     comptime scheduler = SplitKTileScheduler[
         locks_origin=MutAnyOrigin,
-        Index(N, K),
+        (N, K),
         config.block_tile_shape,
         UInt32(splits),
         UInt32(config.num_consumer),
@@ -1037,8 +1042,9 @@ def warp_specialize_gemm_with_multicasting_splitk[
 
     comptime accum_type = DType.float32  # fix this
 
+    var problem_shape = Coord(Int(M), N, K)
     var NUM_TILES = scheduler.get_num_tiles(
-        Index(M, N, K),
+        problem_shape,
         config.block_tile_shape,
         (Int(config.cluster_shape[1]), Int(config.cluster_shape[0])),
     )
@@ -1052,7 +1058,7 @@ def warp_specialize_gemm_with_multicasting_splitk[
         scheduler.get_required_locks_buffer_size_bytes[
             accum_type, UInt32(config.num_consumer)
         ](
-            Index(M, N, K),
+            problem_shape,
             config.block_tile_shape,
             (Int(CLUSTER_M), Int(CLUSTER_N)),
         )
@@ -1119,15 +1125,17 @@ def warp_specialize_gemm_with_multicasting_splitk[
         c_device.as_unsafe_any_origin(),
         workspace_ptr,
         locks_ptr,
-        Index(M, N, K),
-        host_args=(epilogue_fn, compute_fn),
-        grid_dim=(
-            launch_grid_shape[0],
-            launch_grid_shape[1],
-            launch_grid_shape[2],
+        problem_shape,
+        execution_config=GridBlockLaunchConfig(
+            grid_dim=(
+                launch_grid_shape[0],
+                launch_grid_shape[1],
+                launch_grid_shape[2],
+            ),
+            block_dim=(num_threads),
+            shared_mem_bytes=smem_size,
         ),
-        block_dim=(num_threads),
-        shared_mem_bytes=smem_size,
+        host_args=(epilogue_fn, compute_fn),
     )
 
     _ = workspace_data^

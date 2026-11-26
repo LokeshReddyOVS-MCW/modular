@@ -21,6 +21,7 @@
 #include "Mojo/POPDialect/POPAttrs.h"
 #include "Mojo/POPDialect/POPDialect.h"
 #include "Mojo/POPDialect/POPOps.h"
+#include "Mojo/Support/PrecompiledMLIR.h"
 #include "Support/Compiler/MLIRDType.h"
 #include "Support/DebugInfoDialect/IR/DebugInfoDialect.h"
 #include "Support/DebugInfoDialect/Transforms/Conversion.h"
@@ -34,6 +35,7 @@
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/IR/Dominance.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/IR/Attributes.h"
@@ -52,6 +54,25 @@ namespace M::KGEN {
 } // namespace M::KGEN
 
 namespace {
+
+/// Only a SIMD cast leaves lanes behind for SLP to widen back up.
+static PrecompiledMLIRRegistry::FloatConversionForm
+conversionForm(POP::CastOp op) {
+  using Form = PrecompiledMLIRRegistry::FloatConversionForm;
+  auto simd = dyn_cast<SIMDType>(op.getOutput().getType());
+  return simd && simd.isScalar() ? Form::Branching : Form::Flat;
+}
+
+/// Owns the snippet parse cache. A registry is process-lifetime and so cannot
+/// hold parsed IR; an analysis can, because it dies with the module's context.
+struct PrecompiledSnippetCache {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(PrecompiledSnippetCache)
+
+  explicit PrecompiledSnippetCache(mlir::Operation *op)
+      : cache(op->getContext()) {}
+
+  PrecompiledMLIRCache cache;
+};
 
 /// POP dialect fastmath flags match the LLVM ones.
 static LLVM::FastmathFlagsAttr convertFastmathFlags(FastmathFlags fmf,
@@ -551,41 +572,18 @@ static LLVM::AtomicOrdering getAtomicOrdering(AtomicOrdering ordering) {
   llvm_unreachable("unknown atomic ordering");
 }
 
-/// Expand one level of structs so kgen.pack elements are passed as individual
-/// values instead of as a kgen.struct.
-///
-/// Takes both the converted LLVM values and the original KGEN types to
-/// correctly map logical field indices to LLVM field indices (which may
-/// differ due to alignment padding fields).
-static SmallVector<Value> expandOperands(OpBuilder &rewriter, Location loc,
-                                         ValueRange args, TypeRange origTypes,
-                                         const POPToLLVMTypeConverter &tc) {
+/// Returns the lowered operands of a call-like op, without the conversion
+/// casts that would prevent folds. The pack operand must be expanded already.
+static FailureOr<SmallVector<Value>>
+getCallLikeOperands(Operation *op, ValueRange args, IntegerAttr packIdx) {
+  if (packIdx) {
+    return op->emitOpError(
+        "pack operand must be expanded by lower-arg-conventions");
+  }
   SmallVector<Value> operands;
   operands.reserve(args.size());
-  for (auto [value, origType] : llvm::zip(args, origTypes)) {
-    // Squash pointless conversion casts that will get in the way of folds.
-    value = squashPointlessCasts(value);
-
-    // Check if the original type is a KGEN struct type.
-    if (auto kgenStructTy = dyn_cast<StructType>(origType)) {
-      // Get the element types - should be resolved at this point.
-      if (auto elemTypes = kgenStructTy.getElementTypes()) {
-        // Iterate over KGEN logical field indices and extract using remapped
-        // LLVM indices to account for any padding fields.
-        for (size_t i = 0, e = elemTypes->size(); i != e; ++i) {
-          int64_t llvmIdx = tc.getRemappedFieldIndex(kgenStructTy, i);
-          auto elt =
-              rewriter.createOrFold<LLVM::ExtractValueOp>(loc, value, llvmIdx);
-          operands.push_back(elt);
-        }
-      } else {
-        // Parametric struct - just push the value as-is.
-        operands.push_back(value);
-      }
-    } else {
-      operands.push_back(value);
-    }
-  }
+  for (Value value : args)
+    operands.push_back(squashPointlessCasts(value));
   return operands;
 }
 
@@ -687,6 +685,8 @@ private:
   LogicalResult lowerPOPFMA(FMAOp op);
   LogicalResult lowerPOPCmp(CmpOp op);
   LogicalResult lowerPOPCast(CastOp op);
+  LogicalResult lowerCastWithSnippet(CastOp op, KGENDType inDType,
+                                     KGENDType outDType, Value input);
   LogicalResult lowerPOPSIMDSelect(SIMDSelectOp op);
   LogicalResult lowerPOPSIMDSplat(SIMDSplatOp op);
   LogicalResult lowerPOPSIMDInsertElement(SIMDInsertElementOp op);
@@ -756,6 +756,23 @@ FailureOr<mlir::FunctionOpInterface> LowerPOPToLLVMPass::validateOperation() {
   if (!func)
     return getOperation()->emitError(
         "lower-pop-to-llvm must be nested on a FunctionOpInterface");
+
+  // Skip functions with nothing for this pass to lower, e.g. a precompiled
+  // conversion snippet inserted already fully lowered to LLVM. The CFG check
+  // below only matters when there are POP/index ops (stack allocations)
+  // present.
+  bool hasWork = false;
+  func->walk([&](Operation *op) {
+    StringRef ns = op->getName().getDialectNamespace();
+    if (ns == POPDialect::getDialectNamespace() ||
+        ns == mlir::index::IndexDialect::getDialectNamespace()) {
+      hasWork = true;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  if (!hasWork)
+    return func;
 
   // Stack allocations cannot be lowered in the presence of CFGs.
   Operation *cfgOp = nullptr;
@@ -1512,6 +1529,14 @@ LogicalResult LowerPOPToLLVMPass::lowerPOPCast(CastOp op) {
   CastOpAdaptor adaptor(operands, op);
   KGENDType inDType = *op.getInput().getType().getResolvedDType();
   KGENDType outDType = *op.getOutput().getType().getResolvedDType();
+
+  // fp8 <-> f32 conversions go to a precompiled snippet, whose definition
+  // `LowerGlobalPOPToLLVM` has already inserted at module scope.
+  if (!PrecompiledMLIRRegistry::getFloatConversionSymbolName(inDType, outDType,
+                                                             conversionForm(op))
+           .empty())
+    return lowerCastWithSnippet(op, inDType, outDType, adaptor.getInput());
+
   if ((inDType.isFloat() && inDType.getWidthInBits() <= 8) ||
       (outDType.isFloat() && outDType.getWidthInBits() <= 8))
     return op.emitError() << "illegal conversion";
@@ -1562,6 +1587,50 @@ LogicalResult LowerPOPToLLVMPass::lowerPOPCast(CastOp op) {
   state.addOperands(adaptor.getInput());
   state.addTypes(typeConverter->convertType(op.getOutput().getType()));
   builder->replaceOp(op, builder->create(state));
+  return success();
+}
+
+/// The snippets are scalar, so a SIMD cast becomes one conversion per lane.
+LogicalResult LowerPOPToLLVMPass::lowerCastWithSnippet(CastOp op,
+                                                       KGENDType inDType,
+                                                       KGENDType outDType,
+                                                       Value input) {
+  llvm::StringRef symbolName =
+      PrecompiledMLIRRegistry::getFloatConversionSymbolName(inDType, outDType,
+                                                            conversionForm(op));
+  Type resultType = typeConverter->convertType(op.getOutput().getType());
+  auto vecType = dyn_cast<VectorType>(resultType);
+  if (vecType && vecType.isScalable())
+    return op.emitError() << "scalable snippet cast";
+  Type laneType = vecType ? vecType.getElementType() : resultType;
+
+  auto convertLane = [&](Value lane) -> Value {
+    return LLVM::CallOp::create(*builder, op.getLoc(), TypeRange{laneType},
+                                symbolName, ValueRange{lane})
+        .getResult();
+  };
+
+  if (!vecType) {
+    builder->replaceOp(op, convertLane(input));
+    return success();
+  }
+
+  SmallVector<Value> lanes;
+  for (int64_t i = 0, e = vecType.getNumElements(); i < e; ++i) {
+    Value index = LLVM::ConstantOp::create(*builder, op.getLoc(),
+                                           builder->getI32IntegerAttr(i));
+    lanes.push_back(convertLane(
+        LLVM::ExtractElementOp::create(*builder, op.getLoc(), input, index)));
+  }
+
+  Value result = LLVM::UndefOp::create(*builder, op.getLoc(), vecType);
+  for (auto [i, lane] : llvm::enumerate(lanes)) {
+    Value index = LLVM::ConstantOp::create(*builder, op.getLoc(),
+                                           builder->getI32IntegerAttr(i));
+    result = LLVM::InsertElementOp::create(*builder, op.getLoc(), result, lane,
+                                           index);
+  }
+  builder->replaceOp(op, result);
   return success();
 }
 
@@ -1619,10 +1688,12 @@ LogicalResult LowerPOPToLLVMPass::lowerPOPInlineAsm(InlineAsmOp op) {
     if (!types.back())
       return failure();
   }
+  FailureOr<SmallVector<Value>> operands = getCallLikeOperands(
+      op, adaptor.getOperands(), op.getExpandPackOperandIdxAttr());
+  if (failed(operands))
+    return failure();
   auto asmOp = LLVM::InlineAsmOp::create(
-      *builder, op.getLoc(), types.empty() ? Type() : types.front(),
-      expandOperands(*builder, op.getLoc(), adaptor.getOperands(),
-                     op.getOperands().getTypes(), *typeConverter),
+      *builder, op.getLoc(), types.empty() ? Type() : types.front(), *operands,
       cast<StringAttr>(adaptor.getAssembly()),
       cast<StringAttr>(adaptor.getConstraints()),
       cast<BoolAttr>(adaptor.getHasSideEffects()).getValue(),
@@ -1843,8 +1914,11 @@ LowerPOPToLLVMPass::lowerPOPCallLLVMIntrinsic(CallLLVMIntrinsicOp op) {
   if (failed(typeConverter->convertTypes(op.getResultTypes(), types)))
     return failure();
   StringRef intrinsicName = cast<StringAttr>(op.getIntrin());
-  auto operands = expandOperands(*builder, op.getLoc(), adaptor.getOperands(),
-                                 op.getOperands().getTypes(), *typeConverter);
+  FailureOr<SmallVector<Value>> loweredOperands = getCallLikeOperands(
+      op, adaptor.getOperands(), op.getExpandPackOperandIdxAttr());
+  if (failed(loweredOperands))
+    return failure();
+  SmallVector<Value> &operands = *loweredOperands;
 
   auto getAlignment = [&](Value alignment,
                           StringRef name) -> FailureOr<IntegerAttr> {
@@ -2211,12 +2285,21 @@ struct ConvertPOPGlobalAlloc : public ConvertSymbolOpToLLVM<GlobalAllocOp> {
 
   LogicalResult matchAndRewrite(GlobalAllocOp op, GlobalAllocOpAdaptor adaptor,
                                 DirectRewriter &b) const override {
-    // Set the alignment if specified. Otherwise use the natural alignment.
+    // The alignment attribute is a minimum, as it is for a stack slot: the
+    // global is at least as aligned as its element type in memory.
     auto kgenPtrType = cast<PointerType>(op.getType());
     auto elementType =
         getTypeConverter()->convertMemoryType(kgenPtrType.getElementType());
-    unsigned alignment =
-        getAlignment(getTypeConverter(), kgenPtrType, op.getAlignmentAttr());
+    std::optional<int64_t> naturalAlignment =
+        DataLayoutInterface::getTypeABIAlign(getTypeConverter()->getTarget(),
+                                             kgenPtrType.getElementType());
+    if (!naturalAlignment)
+      return op.emitError("could not get alignment of element type");
+    unsigned alignment = *naturalAlignment;
+    if (TypedAttr alignmentAttr = op.getAlignmentAttr()) {
+      alignment = std::max<int64_t>(alignment,
+                                    cast<IntegerAttr>(alignmentAttr).getInt());
+    }
 
     // Set the address space if specified.
     unsigned addrSpace = op.getType().getAddrSpaceOrZero();
@@ -2482,6 +2565,39 @@ void LowerGlobalPOPToLLVMPass::runOnOperation() {
   POPToLLVMTypeConverter typeConverter(targetInfo);
   InterpreterMemoryConverter imc(symtab, typeConverter);
 
+  // Snippet insertion mutates the symbol table, so it happens at module scope
+  // rather than in the lowering itself.
+  {
+    using Form = PrecompiledMLIRRegistry::FloatConversionForm;
+    llvm::SmallSetVector<std::tuple<KGENDType, KGENDType, Form>, 4> needed;
+    theModule.walk([&](POP::CastOp cast) {
+      std::optional<KGENDType> in =
+          cast.getInput().getType().getResolvedDType();
+      std::optional<KGENDType> out =
+          cast.getOutput().getType().getResolvedDType();
+      if (!in || !out)
+        return;
+      Form form = conversionForm(cast);
+      if (!PrecompiledMLIRRegistry::getFloatConversionSymbolName(*in, *out,
+                                                                 form)
+               .empty())
+        needed.insert({*in, *out, form});
+    });
+    for (auto [from, to, form] : needed) {
+      if (failed(PrecompiledMLIRRegistry::insertFloatConversion(from, to, form,
+                                                                theModule)))
+        return signalPassFailure();
+      // The cast lowers to a call either way; `always_inline` is what gets
+      // the body in, and LLVM honors it at every level, -O0 included.
+      if (!inlinePrecompiledMLIR)
+        continue;
+      llvm::StringRef name =
+          PrecompiledMLIRRegistry::getFloatConversionSymbolName(from, to, form);
+      if (auto fn = theModule.lookupSymbol<LLVM::LLVMFuncOp>(name))
+        fn.setAlwaysInlineAttr(mlir::UnitAttr::get(&getContext()));
+    }
+  }
+
   // Populate patterns and run the conversion.
   mlir::RewritePatternSet patterns(&getContext());
 
@@ -2516,4 +2632,9 @@ void LowerGlobalPOPToLLVMPass::runOnOperation() {
   if (failed(M::applyDirectConversion(
           theModule, &typeConverter, std::move(patterns), skipOp, mustConvert)))
     return signalPassFailure();
+
+  if (inlinePrecompiledMLIR) {
+    getAnalysis<PrecompiledSnippetCache>();
+    markAnalysesPreserved<PrecompiledSnippetCache>();
+  }
 }

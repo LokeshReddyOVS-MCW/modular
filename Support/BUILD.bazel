@@ -506,6 +506,7 @@ modular_cc_library(
         "include/Support/Profiling/CaptureLabels.h",
         "include/Support/Profiling/ExternalProfilerAnnotation.h",
         "include/Support/Profiling/Ranges.h",
+        "include/Support/Profiling/TraceActivity.h",
     ],
     deps = [
         # Holds the process-global gates + cached sink, so every statically
@@ -524,11 +525,15 @@ modular_cc_library(
 # archive order.
 modular_cc_library(
     name = "ProfilingRangesHeaders",
-    hdrs = ["include/Support/Profiling/Ranges.h"],
+    hdrs = [
+        "include/Support/Profiling/Ranges.h",
+        "include/Support/Profiling/TraceActivity.h",
+    ],
     visibility = ["//max/internal/profiler:__pkg__"],
     deps = [
         ":Base",
         ":SymbolExport",
+        "@llvm-project//llvm:Support",
     ],
 )
 
@@ -673,6 +678,7 @@ modular_cc_library(
         "internal/Tracy/TracyRocm.cpp",
     ],
     hdrs = [
+        "max_license/Profiling/ProfileRange.h",
         "max_license/Tracy/Tracy.h",
         "max_license/Tracy/TracyCuda.h",
         "max_license/Tracy/TracyRocm.h",
@@ -681,8 +687,13 @@ modular_cc_library(
     # TracyRocm.cpp uses a constructor to promote Tracy symbols to RTLD_GLOBAL
     # so that the rocprofiler-sdk plugin can resolve them via dlsym.
     copts = ["-Wno-global-constructors"],
-    defines = PROFILING_DEFINES,
-    deps = PROFILING_DEPS,
+    # Passed as defines so every M_PROFILE_RANGE call site sees the same
+    # expansion.
+    defines = PROFILING_DEFINES + select({
+        "//:profile_ranges_disabled": ["MODULAR_PROFILE_RANGES=0"],
+        "//conditions:default": ["MODULAR_PROFILE_RANGES=1"],
+    }),
+    deps = PROFILING_DEPS + [":ProfilingRanges"],
 )
 
 modular_cc_library(

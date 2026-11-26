@@ -82,7 +82,7 @@ lit.fn @decorated_fn()
 // CHECK: hlcf.return
 kgen.generator @bind_params_discharged_mask_cleared() {
   kgen.param.declare bound: index =
-    <#kgen.bind_params<:!lit.generator<<index, {<true, loc("lower-lit":1:1)>}>index> ?, 1 | "1">>
+    <#kgen.bind_params<:!lit.generator<<index, {<true, loc("lower-lit":1:1)>}>index> *?, 1 | "1">>
   hlcf.return
 }
 
@@ -616,6 +616,15 @@ lit.fn @call_using_empty_struct<es: !lit.struct<@EmptyStruct>, alwaysFn: !lit.ge
   kgen.param.declare alwaysFn2: !lit.generator<() -> ()> = <bind_params(:!lit.generator<<index, @EmptyStruct>() -> ()> alwaysFn, :index 1, :!lit.struct<@EmptyStruct> es)>
   // CHECK-NEXT: <bind_params(:<type, *(0,0)>() -> () paramFn, {{.*}}, :struct<() memoryOnly> {  })>
   kgen.param.declare paramFn2: !lit.generator<() -> ()> = <bind_params(:!lit.generator<<type, !kgen.param<*(0,0)>>() -> ()> paramFn, #kgen.type<!lit.struct<@EmptyStruct>>, :!lit.struct<@EmptyStruct> es)>
+  hlcf.return
+}
+
+// COM: A non-func generator whose params are all singletons lowers to its
+// COM: body, so binding it leaves nothing to bind.
+// CHECK-LABEL: kgen.generator @bind_singleton_only_type_generator<typeGen: type>()
+lit.fn @bind_singleton_only_type_generator<es: !lit.struct<@EmptyStruct>, typeGen: !lit.generator<<@EmptyStruct>type>>() {
+  // CHECK-NEXT: kgen.param.declare t: type = <typeGen>
+  kgen.param.declare t: type = <bind_params(:!lit.generator<<@EmptyStruct>type> typeGen, :!lit.struct<@EmptyStruct> es)>
   hlcf.return
 }
 

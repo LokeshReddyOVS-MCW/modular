@@ -43,6 +43,13 @@
 
 namespace M::Profiling {
 
+struct TraceActivity;
+struct TraceMetadataField;
+
+// Receives a stopped trace's activities and metadata; see disableCollecting.
+using TraceVisitor = function_ref<void(ArrayRef<TraceActivity> activities,
+                                       ArrayRef<TraceMetadataField> metadata)>;
+
 namespace Detail {
 // Implementation-detail master enable flag. Read via the inline
 // ``isEnabled()`` accessor below — direct callers must not store() to it;
@@ -117,6 +124,11 @@ struct RangeSink {
   bool (*requestBurst)(StringRef reason);
   // Null when the attached profiler predates it.
   void (*setTraceMetadata)(StringRef key, StringRef value);
+  // Returns whether the caller must pair it with rangeEnd; false when the
+  // attached profiler predates span-only ranges.
+  bool (*rangeBeginSpanOnly)(StringRef name, uint32_t color);
+  // Returns false without disabling when the attached profiler predates it.
+  bool (*disableCollecting)(TraceVisitor visitor, bool save);
 };
 
 // Why a sink is being requested; the integration decides per request kind
@@ -187,6 +199,13 @@ MODULAR_CXX_EXPORT void rangeEnd();
 MODULAR_CXX_EXPORT void rangeBeginWithId(uint64_t correlationId, StringRef name,
                                          uint32_t color);
 
+// As rangeBegin, but the span claims no device work: GPU kernels and copies
+// launched inside it stay correlated to the enclosing range. Runtime layers
+// below the op (driver bindings, device contexts) use it so that their spans
+// show in the trace without taking the op's attribution. Returns whether the
+// caller must pair it with rangeEnd(). Prefer SpanScope.
+MODULAR_CXX_EXPORT bool rangeBeginSpanOnly(StringRef name, uint32_t color);
+
 // Attach a top-level metadata field to the live trace, if any. The first value
 // set for a key in a trace wins and later calls for it are cheap, so callers
 // may set it on every occurrence of the event it describes. `value` is
@@ -208,6 +227,15 @@ MODULAR_CXX_EXPORT void step();
 // independently.
 MODULAR_CXX_EXPORT void enable();
 MODULAR_CXX_EXPORT void disable();
+
+// As disable(), but hands the stopped trace to `visitor` (records in
+// TraceActivity.h) before returning, and writes the trace file only when
+// `save` is set, so a caller can read a capture in process. The visitor is
+// not called when no trace was live, nor when the trace could not be read,
+// which lastTraceError() then reports. A repeating step window's earlier bursts
+// are still written to their files. Returns false, leaving the profiler
+// enabled, when the attached profiler predates this call.
+MODULAR_CXX_EXPORT bool disableCollecting(TraceVisitor visitor, bool save);
 
 // Activate a deferred trace subscription: enable() only records intent,
 // because the profiler backend has a vendor-specific readiness ordering that
@@ -291,6 +319,21 @@ struct MODULAR_CXX_EXPORT RangeScope {
 
 private:
   // True iff the ctor called rangeBegin. The dtor pairs the call.
+  bool enabled_;
+};
+
+// RAII helper for rangeBeginSpanOnly, with RangeScope's cost and contract.
+struct MODULAR_CXX_EXPORT SpanScope {
+  explicit SpanScope(StringRef name, uint32_t color = 0);
+  ~SpanScope();
+
+  SpanScope(const SpanScope &) = delete;
+  SpanScope &operator=(const SpanScope &) = delete;
+  SpanScope(SpanScope &&) = delete;
+  SpanScope &operator=(SpanScope &&) = delete;
+
+private:
+  // True iff the ctor's begin needs a rangeEnd. The dtor pairs it.
   bool enabled_;
 };
 

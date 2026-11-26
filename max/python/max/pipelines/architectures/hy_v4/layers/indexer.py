@@ -17,8 +17,10 @@ The DeepSeek V3.2 indexer without the Hadamard rotation, plus a ``k_norm``
 bias and Hy4's IndexCache: a ``shared`` layer has no indexer of its own and
 reuses the top-k of the most recent ``full`` layer.
 
-The weight adapter moves the 64 rope dims of every ``wq_b`` head, ``wk`` and
-``k_norm`` to the front of the head, so the rotation covers the leading dims.
+The checkpoint stores each head's 64 rope dims last, and the rotation
+covers the trailing dims. As in vLLM, one BF16 matmul gives the key and the
+scoring weights: the graph dequantizes ``wk`` and stacks ``weights_proj``'s
+rows after it.
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ from max.nn import Linear, Module
 from max.nn.attention_mask import MHAMaskVariant
 from max.nn.common_layers.kv_cache import PagedCacheValues
 from max.nn.common_layers.quant_linear import QuantizedLinear
+from max.nn.common_layers.quant_tensor import MXFP8Tensor
 from max.nn.kernels import quantize_dynamic_scaled_float8
 from max.nn.norm import LayerNorm
 from max.nn.quant_config import (
@@ -43,7 +46,7 @@ from ..model_config import HYV4Config
 from . import mxfp8
 from .functional_kernels import (
     mla_fp8_index_top_k_physical,
-    rope_ragged,
+    rope_rows,
     store_k_cache_ragged,
     store_k_scale_cache_ragged,
 )
@@ -92,8 +95,8 @@ class HYV4Indexer(Module[..., Tensor]):
     ``prev_topk_indices`` it is given.
 
     Args:
-        config: The model config; ``config.quant_config`` decides whether
-            ``wq_b`` and ``wk`` are quantized.
+        config: The model config; ``config.projection_quant_config`` decides
+            whether ``wq_b`` is quantized.
         layer_idx: The decoder layer this indexer belongs to.
     """
 
@@ -111,18 +114,18 @@ class HYV4Indexer(Module[..., Tensor]):
             config.q_lora_rank,
             q_dim,
             bias=False,
-            quant_config=config.quant_config,
+            quant_config=config.projection_quant_config,
         )
         self.wk = QuantizedLinear(
             config.hidden_size,
             self.head_dim,
             bias=False,
-            quant_config=config.quant_config,
+            quant_config=config.projection_quant_config,
         )
+        self.weights_proj = Linear(config.hidden_size, self.n_heads, bias=False)
         self.k_norm = LayerNorm(
             self.head_dim, eps=config.rms_norm_eps, keep_dtype=False
         )
-        self.weights_proj = Linear(config.hidden_size, self.n_heads, bias=False)
 
     def forward(
         self,
@@ -134,6 +137,7 @@ class HYV4Indexer(Module[..., Tensor]):
         cache_layer: Tensor,
         mla_cache: PagedCacheValues,
         prev_topk_indices: Tensor | None = None,
+        token_rope: Tensor | None = None,
     ) -> Tensor:
         """Returns ``[tokens, index_topk]`` int32 physical MLA cache rows.
 
@@ -153,6 +157,8 @@ class HYV4Indexer(Module[..., Tensor]):
             mla_cache: The MLA latent cache the returned rows index.
             prev_topk_indices: The previous ``full`` layer's result; read
                 only by a ``shared`` layer.
+            token_rope: ``[tokens, qk_rope_head_dim]`` rows of each token
+                (M-RoPE), read in place of ``freqs_cis`` at cache positions.
         """
         if self.skip_topk:
             if prev_topk_indices is None:
@@ -162,23 +168,29 @@ class HYV4Indexer(Module[..., Tensor]):
                 )
             return prev_topk_indices
 
-        # The kernels run per device; under tensor parallelism every device
-        # computes the same replicated result.
+        # Under tensor parallelism every device computes the same replicated
+        # result. A per-token table holds one row per token of the batch.
+        if token_rope is None:
+            table, start_pos = freqs_cis, k_cache.cache_lengths
+        else:
+            table, start_pos = token_rope, input_row_offsets[:-1]
+
         def rope(t: Tensor) -> Tensor:
-            return rope_ragged(
-                t,
-                input_row_offsets,
-                k_cache.cache_lengths,
-                freqs_cis,
-                interleaved=True,
-                rope_first=True,
-            ).rebind_mapping(t.mapping)
+            return rope_rows(t, input_row_offsets, start_pos, table)
 
         q = mxfp8.matmul(qr, self.wq_b.weight).reshape(
             [-1, self.n_heads, self.head_dim]
         )
         q_fp8, q_scale = _quantize_rows(rope(q))
-        k = rope(self.k_norm(mxfp8.matmul(x, self.wk.weight)).unsqueeze(1))
+        wk = self.wk.weight
+        if isinstance(wk, MXFP8Tensor):
+            wk = mxfp8.dequantize(wk)
+        assert isinstance(wk, Tensor)
+        wk_weights_proj = F.concat([wk, self.weights_proj.weight])
+        k, scoring = F.split(
+            x @ wk_weights_proj.T, [self.head_dim, self.n_heads], axis=-1
+        )
+        k = rope(self.k_norm(k).unsqueeze(1))
         k_fp8, k_scale = _quantize_rows(k)
 
         store_k_cache_ragged(k_cache, k_fp8, input_row_offsets, cache_layer)
@@ -190,10 +202,8 @@ class HYV4Indexer(Module[..., Tensor]):
             quantization_granularity=self.head_dim,
         )
 
-        # The scoring weights are projected in float32.
-        proj = F.cast(self.weights_proj.weight, DType.float32)
         weights = (
-            (F.cast(x, DType.float32) @ proj.T)
+            F.cast(scoring, DType.float32)
             * self.n_heads**-0.5
             * q_scale
             * self.head_dim**-0.5

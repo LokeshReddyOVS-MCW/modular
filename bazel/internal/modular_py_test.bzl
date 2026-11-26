@@ -322,6 +322,7 @@ def modular_py_test(
     toolchains.append(env_name)
     extra_data += [env_name]  # buildifier: disable=list-append
     extra_env |= {
+        "MODULAR_DRIVER_PLUGINS": "$(MODULAR_DRIVER_PLUGINS)",
         "MODULAR_MOJO_MAX_COMPILERRT_PATH": "$(COMPILER_RT_PATH)",
         "MODULAR_MOJO_MAX_DRIVER_PATH": "$(MOJO_BINARY_PATH)",
         "MODULAR_MOJO_MAX_IMPORT_PATH": "$(COMPUTED_IMPORT_PATH)",
@@ -337,7 +338,7 @@ def modular_py_test(
     )
 
     default_exec_properties = get_default_exec_properties(tags, gpu_constraints)
-    extra_env |= get_default_test_env(exec_properties)
+    extra_env |= get_default_test_env(default_exec_properties | exec_properties)
 
     # Assume networking is used for huggingface and add the cache
     hf_env = {"HF_ESCAPES_SANDBOX": "1"} if "requires-network" in tags else {}

@@ -408,15 +408,6 @@ struct NoScoreHook(IndexerScoreHook):
     ):
         encoder.encode_fields[Self](self, target)
 
-    @staticmethod
-    def get_type_name() -> String:
-        """Returns the type name for runtime diagnostics.
-
-        Returns:
-            Always `"NoScoreHook"`.
-        """
-        return "NoScoreHook"
-
 
 # Bytes of one row one `KIND_MXF4` MMA contracts: 64 E2M1 values.
 comptime _MXF4_K_BYTES = 32
@@ -1723,6 +1714,7 @@ def _fp8_index_score_prefill_kernel_sm100[
     var b = block_idx.x
 
     @inline(.always)
+    @__allow_legacy_any_origin_fields
     def decode(bb: Int, token_block: Int32, key_part: UInt32) {imm} -> _Item:
         # ctaids are consumed in launch order, so map them onto token blocks
         # last-first: a causal block's key range grows with its index, and the
@@ -1925,6 +1917,7 @@ def _fp8_index_score_prefill_kernel_sm100[
             # q-scales re-hoisted, then the slot freed for the load warp. Every ring
             # cursor carries over.
             @inline(.always)
+            @__allow_legacy_any_origin_fields
             def consume_item() {mut c_state, mut k_state, mut qs_reg, imm}:
                 # `n_tiles_local` is `Int32`, so `range` yields an `Int32` induction
                 # variable directly (`range.mojo:495`) -- the whole key-index chain
@@ -3152,16 +3145,6 @@ def fp8_index_score_sm100_prefill[
             ),
         )
     ctx.enqueue_function[kernel](
-        GridBlockAttributeLaunchConfig(
-            grid_dim=(
-                batch_size,
-                token_blocks,
-                num_key_parts,
-            ),
-            block_dim=CFG.nthreads,
-            shared_mem_bytes=smem_bytes,
-            attributes=pdl_launch_attributes(PDLLevel.ON),
-        ),
         q_tma,
         k_tma,
         ks_tma,
@@ -3180,4 +3163,14 @@ def fp8_index_score_sm100_prefill[
         Int32(evict_k),
         score_hook,
         cp_rank,
+        execution_config=GridBlockAttributeLaunchConfig(
+            grid_dim=(
+                batch_size,
+                token_blocks,
+                num_key_parts,
+            ),
+            block_dim=CFG.nthreads,
+            shared_mem_bytes=smem_bytes,
+            attributes=pdl_launch_attributes(PDLLevel.ON),
+        ),
     )

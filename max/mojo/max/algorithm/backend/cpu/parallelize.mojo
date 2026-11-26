@@ -14,7 +14,7 @@
 
 from std.math import ceildiv
 from std.os import abort
-from std.utils.index import IndexList
+from std.utils.coord import Coord
 
 from max.runtime.asyncrt import parallelism_level
 from max.runtime import tracing
@@ -205,7 +205,7 @@ def parallelize_over_rows[
     FuncType: def(Int, Int) -> None,
 ](
     func: FuncType,
-    shape: IndexList,
+    shape: Coord,
     axis: Int,
     grain_size: Int,
     ctx: Optional[DeviceContext.CPU] = None,
@@ -222,12 +222,21 @@ def parallelize_over_rows[
         grain_size: The minimum number of elements to warrant using an additional thread.
         ctx: Optional CPU DeviceContext to execute the work on.
     """
+    comptime assert type_of(shape).is_flat, "shape must be flat"
+    debug_assert(
+        0 <= axis < type_of(shape).rank, "axis ", axis, " is out of range"
+    )
+    var axis_size = 0
+    comptime for i in range(type_of(shape).rank):
+        if i == axis:
+            axis_size = Int(shape[i])
+
     # If we know we will have no work, return early
-    if shape[axis] == 0:
+    if axis_size == 0:
         return
 
-    var total_size = shape.flattened_length()
-    var num_rows = total_size // shape[axis]
+    var total_size = Int(shape.product())
+    var num_rows = total_size // axis_size
 
     var num_workers = min(
         num_rows,

@@ -40,6 +40,10 @@ class ExecutionSession;
 } // namespace orc
 } // namespace llvm
 
+namespace mlir::LLVM {
+class GlobalOp;
+} // namespace mlir::LLVM
+
 namespace M::KGEN {
 struct SymbolAndMCInfo;
 class TargetBackend;
@@ -143,6 +147,17 @@ private:
       llvm::TargetMachine &targetMachine,
       llvm::StringMap<llvm::GlobalValue::LinkageTypes> &symbolLinkageTypes);
 
+  /// Whether `emitArchive` splits `module` per exported function in the LLVM
+  /// dialect and translates each slice to LLVM IR in its own task. Otherwise
+  /// it translates the whole module and splits the LLVM IR.
+  bool splitsInLLVMDialect(ModuleOp module);
+
+  /// Like `emitArchiveParallelCompilation`, for a module in the LLVM dialect.
+  ErrorOr<SmallVector<AsyncRT::AnyAsyncValueRef>> emitArchiveSlices(
+      OwningOpRef<ModuleOp> module, Location opLoc,
+      llvm::TargetMachine &targetMachine,
+      llvm::StringMap<llvm::GlobalValue::LinkageTypes> &symbolLinkageTypes);
+
   /// Link parallel compilation results and call AsmPrint to generate one object
   /// file.
   ErrorOr<WriteableBufferRef> emitArchiveMCLinking(
@@ -201,6 +216,13 @@ private:
 /// Setup the machine properties from the provided target.
 ErrorOr<std::unique_ptr<llvm::TargetMachine>>
 createTargetMachine(const CompilationOptions &options, bool isJIT);
+
+/// Answers `TargetBackend::isSharedMemoryGlobal` for a global that is still in
+/// the LLVM dialect. The backend takes an LLVM IR global and reads its name,
+/// address space and linkage, which a probe in `probeCtx` carries.
+bool isSharedMemoryGlobal(const TargetBackend &backend,
+                          mlir::LLVM::GlobalOp global,
+                          llvm::LLVMContext &probeCtx);
 
 namespace LLVM {
 /// Write the specified module to the specified raw output stream using

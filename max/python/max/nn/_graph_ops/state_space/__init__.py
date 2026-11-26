@@ -30,7 +30,9 @@ from .gated_delta import (
 )
 from .gated_group_rmsnorm import gated_group_rmsnorm
 from .kimi_delta import (
+    has_blackwell_tcgen05,
     kda_chunk,
+    kda_chunk_conv,
     kda_chunk_is_registered,
     kda_chunk_rows,
     kda_chunk_rows_servable,
@@ -42,6 +44,8 @@ from .kimi_delta import (
     kda_verify_ring_conv,
     kda_verify_ring_conv_packed,
     kda_verify_ring_conv_packed_gate_up,
+    kda_verify_ring_kgroup_conv,
+    kda_verify_ring_kgroup_conv_servable,
 )
 from .mamba2_replay_fold import mamba2_replay_fold
 from .mamba2_ssd_scan import (
@@ -65,7 +69,9 @@ __all__ = [
     "gated_delta_recurrence_verify_ring_fwd",
     "gated_delta_state_fold",
     "gated_group_rmsnorm",
+    "has_blackwell_tcgen05",
     "kda_chunk",
+    "kda_chunk_conv",
     "kda_chunk_is_registered",
     "kda_chunk_rows",
     "kda_chunk_rows_servable",
@@ -77,6 +83,8 @@ __all__ = [
     "kda_verify_ring_conv",
     "kda_verify_ring_conv_packed",
     "kda_verify_ring_conv_packed_gate_up",
+    "kda_verify_ring_kgroup_conv",
+    "kda_verify_ring_kgroup_conv_servable",
     "mamba2_replay_fold",
     "mamba2_ssd_chunk_scan_varlen_fwd_inplace",
     "mamba2_ssd_chunk_scan_varlen_fwd_inplace_rows",

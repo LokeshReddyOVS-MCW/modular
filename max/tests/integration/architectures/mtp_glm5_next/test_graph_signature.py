@@ -29,7 +29,7 @@ from unittest.mock import Mock
 
 import pytest
 from max import functional as F
-from max.driver import Accelerator, Buffer
+from max.driver import Accelerator, Buffer, accelerator_api
 from max.dtype import DType
 from max.graph import DeviceRef
 from max.nn.kv_cache import MultiKVCacheParams
@@ -171,6 +171,7 @@ def _config(kv_params: MultiKVCacheParams, mesh: DeviceMesh) -> Glm5NextConfig:
             mlp_layers=all_layers,
             attn_layers=attn_layers,
             compute_dtype=DType.bfloat16,
+            moe_layers=frozenset(range(1, num_layers + 1)),
         ),
         mesh=mesh,
     )
@@ -250,8 +251,23 @@ def test_the_fused_graph_keeps_the_graph_api_name() -> None:
     assert _graph_name_for_test() == "glm5_next_with_mtp_graph"
 
 
+def _ring() -> str:
+    """The verify's ring op: on NVIDIA it also runs the short conv."""
+    if accelerator_api() == "cuda":
+        return "kda_verify_ring_kgroup_conv"
+    return "kda_verify_ring"
+
+
+def _prefill_conv() -> str:
+    """The draft-free prefill's conv op: on NVIDIA it also writes the bf16 q,
+    k and v ``kda_chunk`` takes."""
+    if accelerator_api() == "cuda":
+        return "kda_chunk_conv"
+    return "gated_delta_conv1d_verify_fwd"
+
+
 def test_the_verify_records_every_kda_layer_into_the_ring(fused: str) -> None:
-    assert _symbol_count(fused, "kda_verify_ring") == NUM_KDA
+    assert _symbol_count(fused, _ring()) == NUM_KDA
     assert _symbol_count(fused, "kda_decode") == 0
     # One launch per device folds every layer.
     assert _symbol_count(fused, "kda_state_fold") == 1
@@ -269,14 +285,15 @@ def test_only_a_draft_free_verify_takes_kda_chunk(
     )
     graph = _trace()
     assert _symbol_count(graph, "kda_chunk") == (NUM_KDA if servable else 0)
-    assert _symbol_count(graph, "kda_verify_ring") == NUM_KDA
+    assert _symbol_count(graph, _ring()) == NUM_KDA
     assert _symbol_count(graph, "kda_decode") == 0
 
 
 def test_the_conv_window_is_left_for_the_rollback(fused: str) -> None:
     # Only the verify's forward launch, one per KDA layer: the rollback places
-    # the windows inside the fold's launch instead.
-    assert _symbol_count(fused, "gated_delta_conv1d_verify_fwd") == NUM_KDA
+    # the windows inside the fold's launch instead. On NVIDIA the ring op runs
+    # a verify's conv, and the conv op is the draft-free prefill's.
+    assert _symbol_count(fused, _prefill_conv()) == NUM_KDA
     assert _symbol_count(fused, "gated_delta_conv1d_fwd") == 0
 
 
@@ -285,9 +302,11 @@ def test_the_rollback_folds_the_conv_windows_in_the_folds_launch(
 ) -> None:
     """Checks the rollback holds one fold op and no per-layer conv replay."""
     assert _symbol_count(fused, "kda_state_fold") == 1
-    # One forward conv-verify per layer is all the conv-verify ops the graph
-    # holds; a per-layer replay in the roll-forward would double it.
-    assert _symbol_count(fused, "gated_delta_conv1d_verify_fwd") == NUM_KDA
+    # The forward's conv ops are all the graph holds; a per-layer replay in
+    # the roll-forward would add a conv-verify op for every layer. On NVIDIA
+    # the forward holds none.
+    forward = 0 if accelerator_api() == "cuda" else NUM_KDA
+    assert _symbol_count(fused, "gated_delta_conv1d_verify_fwd") == forward
 
 
 def test_every_indexer_seeds_its_tail_twice(fused: str) -> None:

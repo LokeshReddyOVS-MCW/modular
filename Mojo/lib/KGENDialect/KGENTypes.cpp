@@ -44,6 +44,8 @@ constexpr llvm::StringLiteral kStructElemLayoutError =
 /// Return a string like "imm" or "mut".
 const char *KGEN::getUserSyntax(ArgConvention convention) {
   switch (convention) {
+  case ArgConvention::Unresolved:
+    llvm_unreachable("unresolved convention in a resolved signature");
   case ArgConvention::ImmReg:
   case ArgConvention::ImmMem:
   case ArgConvention::PackImmMem:
@@ -244,12 +246,40 @@ LogicalResult ParamType::printValue(AsmPrinter &p, TypedAttr value,
 // TypeValueType
 //===----------------------------------------------------------------------===//
 
+/// Returns true if `type` is `__MLIRType[T]`, the stub struct that provides the
+/// witness tables of a non-struct type `T`.
+static bool isMLIRTypeStub(Type type) {
+  auto ref = dyn_cast<TypeValueType>(type);
+  if (!ref)
+    return false;
+  SymbolRefAttr symbol;
+  if (auto genRef = dyn_cast<TypeGeneratorRefAttr>(ref.getTypeValue()))
+    symbol = genRef.getSymbol();
+  else if (auto instRef = dyn_cast<TypeInstanceRefAttr>(ref.getTypeValue()))
+    symbol = instRef.getSymbol();
+  else
+    return false;
+
+  // TODO: We don't have a good way to see whether we are handling __MLIRType at
+  // this stage, hard code it here :(
+  constexpr StringLiteral stubName = "std::builtin::_stubs::__MLIRType";
+  return symbol.getRootReference().getValue().starts_with(stubName);
+}
+
 Type TypeValueType::get(TypedAttr typeValue) {
   // Strip extension to reveal the actual underlying type.
   typeValue = ExtensionAttr::strip(typeValue);
   // Simply forward the value domain type from a TypeParamAttr.
-  if (auto constant = dyn_cast<TypeParamAttr>(typeValue))
+  if (auto constant = dyn_cast<TypeParamAttr>(typeValue)) {
+    // Look through MLIRStubs, this mirrors what we do in parser when creating
+    // `ParamType` from a `__MLIRType` type value. This make evaluation result
+    // consistent between parser and elaborator.
+    //
+    // FIXME: Fix `__MLIRType`!
+    if (isMLIRTypeStub(constant.getTypeValue()))
+      return constant.getMlirType();
     return constant.getTypeValue();
+  }
 
   // Otherwise, form the TypeValueType like normal.
   return Base::get(typeValue.getContext(), typeValue);
@@ -715,12 +745,14 @@ bool FuncType::isPosVarArg(size_t index) {
   return getArgListAttrs().isPosVarArg(index);
 }
 
-/// For a PosVarArg, return the declared ArgConvention of the elements. For
-/// example: def x(mut *args: Int) is declared 'mut'.
+/// For a PosVarArg/PackVarArg, return the declared ArgConvention of the
+/// elements. For example: def x(mut *args: Int) is declared 'mut'.
 ArgConvention FuncType::getVariadicConvention(size_t index) {
+  if (std::optional<ArgConvention> eltConvention =
+          getPackEltConvention(getArgConvention(index)))
+    return *eltConvention;
   PogListAttr pogs = getArgListAttrs();
-  if (pogs.getVariadicKind(index) == VariadicKind::PosVarArg ||
-      pogs.getVariadicKind(index) == VariadicKind::PackVarArg)
+  if (pogs.getVariadicKind(index) == VariadicKind::PosVarArg)
     return pogs.getOrigVariadicConvention();
   return ArgConvention::ByRefError;
 }
@@ -729,18 +761,18 @@ bool FuncType::isKwVarArg(size_t index) {
   return getArgListAttrs().isKwVarArg(index);
 }
 
-bool FuncType::isPack(size_t index) { return getArgListAttrs().isPack(index); }
+bool FuncType::isPack(size_t index) {
+  return getPackEltConvention(getArgConvention(index)).has_value();
+}
 
 std::optional<size_t> FuncType::findPackVarArgIndex() {
-  PogListAttr argList = getArgListAttrs();
-  if (!argList)
+  ArrayRef<ArgConvention> conventions = getArgConventions();
+  const auto *it = llvm::find_if(conventions, [](ArgConvention conv) {
+    return getPackEltConvention(conv).has_value();
+  });
+  if (it == conventions.end())
     return std::nullopt;
-  ArrayRef<PogMetadataAttr> pogs = argList.getPogs();
-  const auto *it =
-      llvm::find_if(pogs, [](PogMetadataAttr pog) { return pog.isPack(); });
-  if (it == pogs.end())
-    return std::nullopt;
-  return it - pogs.begin();
+  return it - conventions.begin();
 }
 
 bool FuncType::hasKwVarArgs() { return getArgListAttrs().hasKwVarArg(); }
@@ -840,7 +872,7 @@ verifyPackArgument(function_ref<InFlightDiagnostic()> emitError, size_t argIdx,
     return success();
   // Before elaboration, the pack can be a `VariadicPack` that is not resolved.
   auto pack = dyn_cast<StructType>(ptr.getElementType());
-  if (!pack || !pack.getIsParamPack())
+  if (!pack)
     return success();
   auto elts = dyn_cast_or_null<ParamListAttr>(pack.getElementTypesVariadic());
   if (!elts)
@@ -879,6 +911,31 @@ LogicalResult FuncType::verify(function_ref<InFlightDiagnostic()> emitError,
     return emitError()
            << "number of arguments does not match number of argument names: "
            << values.getNumInputs() << " != " << numPogs;
+  }
+
+  // The convention of a pack argument holds its element convention, so the
+  // argument list does not.
+  std::optional<size_t> packIdx;
+  for (auto [i, conv] : llvm::enumerate(argConventions)) {
+    if (!getPackEltConvention(conv))
+      continue;
+    if (packIdx)
+      return emitError() << "func type cannot have more than one pack argument";
+    packIdx = i;
+  }
+  if (!argListAttrs.getPogs().empty()) {
+    for (auto [i, pog] : llvm::enumerate(argListAttrs.getPogs())) {
+      if (pog.isPack() != (packIdx == i)) {
+        return emitError() << "argument #" << i
+                           << " must have a pack convention if and only if it "
+                              "is a pack vararg";
+      }
+    }
+    if (packIdx &&
+        argListAttrs.getOrigVariadicConvention() != ArgConvention::ByRefError) {
+      return emitError() << "argument list with a pack vararg cannot have a "
+                            "variadic convention";
+    }
   }
 
   // If the FuncType has metadata, defer to it for further verification.
@@ -1619,7 +1676,6 @@ Type StructType::parse(AsmParser &p) {
   if (failed(KGEN::parseIsMemoryOnly(p, isMemoryOnly)))
     return {};
 
-  bool isParamPack = succeeded(p.parseOptionalKeyword("isParamPack"));
   if (succeeded(p.parseOptionalKeyword("layout")))
     domain = StructDomain::Layout;
   else if (succeeded(p.parseOptionalKeyword("value")))
@@ -1637,7 +1693,7 @@ Type StructType::parse(AsmParser &p) {
     return {};
 
   return StructType::get(p.getContext(), variadic, isMemoryOnly, minAlignment,
-                         isParamPack, domain);
+                         domain);
 }
 
 /// Print the StructType.
@@ -1651,8 +1707,7 @@ void StructType::print(AsmPrinter &p) const {
 /// expression.
 LogicalResult StructType::verify(function_ref<InFlightDiagnostic()> emitError,
                                  TypedAttr variadic, TypedAttr isMemoryOnly,
-                                 TypedAttr minAlignment, bool isParamPack,
-                                 StructDomain domain) {
+                                 TypedAttr minAlignment, StructDomain domain) {
   // isMemoryOnly must be an i1-typed attribute (BoolAttr or constraint
   // proposition).
   if (auto intTy = dyn_cast<IntegerType>(isMemoryOnly.getType());
@@ -1663,11 +1718,6 @@ LogicalResult StructType::verify(function_ref<InFlightDiagnostic()> emitError,
   if (!sugarIsa<IndexType>(minAlignment.getType()))
     return emitError() << "alignment must have index type, but got "
                        << minAlignment.getType();
-  if (isParamPack) {
-    if (!isa<IntegerAttr>(isMemoryOnly) ||
-        cast<IntegerAttr>(isMemoryOnly).getInt() != 0)
-      return emitError() << "packs must not be memory-only";
-  }
 
   // Accept any ParamListType (for concrete cases).
   if (llvm::isa<ParamListType>(variadic.getType()))
@@ -1919,37 +1969,33 @@ static void projectToLayouts(TypedAttr &variadic) {
 /// If isMemoryOnly is null, uses BoolAttr(false).
 StructType StructType::get(MLIRContext *context, TypedAttr variadic,
                            TypedAttr isMemoryOnly, TypedAttr minAlignment,
-                           bool isParamPack, StructDomain domain) {
+                           StructDomain domain) {
   if (!isMemoryOnly)
     isMemoryOnly = BoolAttr::get(context, false);
   if (!minAlignment)
     minAlignment = IntegerAttr::get(IndexType::get(context), 1);
   if (domain == StructDomain::Layout)
     projectToLayouts(variadic);
-  return Base::get(context, variadic, isMemoryOnly, minAlignment, isParamPack,
-                   domain);
+  return Base::get(context, variadic, isMemoryOnly, minAlignment, domain);
 }
 
 StructType StructType::get(MLIRContext *context, TypedAttr variadic,
-                           TypedAttr isMemoryOnly, TypedAttr minAlignment,
-                           bool isParamPack) {
-  return get(context, variadic, isMemoryOnly, minAlignment, isParamPack,
+                           TypedAttr isMemoryOnly, TypedAttr minAlignment) {
+  return get(context, variadic, isMemoryOnly, minAlignment,
              StructDomain::Unset);
 }
 
 StructType StructType::getLayoutDomain(MLIRContext *context, TypedAttr variadic,
                                        TypedAttr isMemoryOnly,
-                                       TypedAttr minAlignment,
-                                       bool isParamPack) {
-  return get(context, variadic, isMemoryOnly, minAlignment, isParamPack,
+                                       TypedAttr minAlignment) {
+  return get(context, variadic, isMemoryOnly, minAlignment,
              StructDomain::Layout);
 }
 
 StructType StructType::getValueDomain(MLIRContext *context, TypedAttr variadic,
                                       TypedAttr isMemoryOnly,
-                                      TypedAttr minAlignment,
-                                      bool isParamPack) {
-  return get(context, variadic, isMemoryOnly, minAlignment, isParamPack,
+                                      TypedAttr minAlignment) {
+  return get(context, variadic, isMemoryOnly, minAlignment,
              StructDomain::Value);
 }
 
@@ -1990,7 +2036,7 @@ StructType StructType::getChecked(function_ref<InFlightDiagnostic()> emitError,
   TypedAttr variadic = convertTypesToVariadicAttr(context, types);
   TypedAttr isMemOnlyAttr = BoolAttr::get(context, isMemoryOnly);
   TypedAttr minAlignment = IntegerAttr::get(IndexType::get(context), 1);
-  if (failed(verify(emitError, variadic, isMemOnlyAttr, minAlignment, false,
+  if (failed(verify(emitError, variadic, isMemOnlyAttr, minAlignment,
                     StructDomain::Layout)))
     return {};
   return getLayoutDomain(context, variadic, isMemOnlyAttr, minAlignment);
@@ -1999,19 +2045,16 @@ StructType StructType::getChecked(function_ref<InFlightDiagnostic()> emitError,
 StructType StructType::getChecked(function_ref<InFlightDiagnostic()> emitError,
                                   MLIRContext *context, TypedAttr variadic,
                                   TypedAttr isMemoryOnly,
-                                  TypedAttr minAlignment, bool isParamPack,
-                                  StructDomain domain) {
+                                  TypedAttr minAlignment, StructDomain domain) {
   if (!isMemoryOnly)
     isMemoryOnly = BoolAttr::get(context, false);
   if (!minAlignment)
     minAlignment = IntegerAttr::get(IndexType::get(context), 1);
   if (domain == StructDomain::Layout)
     projectToLayouts(variadic);
-  if (failed(verify(emitError, variadic, isMemoryOnly, minAlignment,
-                    isParamPack, domain)))
+  if (failed(verify(emitError, variadic, isMemoryOnly, minAlignment, domain)))
     return {};
-  return Base::get(context, variadic, isMemoryOnly, minAlignment, isParamPack,
-                   domain);
+  return Base::get(context, variadic, isMemoryOnly, minAlignment, domain);
 }
 
 FailureOr<Type>

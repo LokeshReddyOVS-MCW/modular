@@ -26,7 +26,6 @@ from max.runtime.tracing import Trace, TraceLevel, get_safe_task_id, trace_arg
 from std.sys.info import CompilationTarget, _accelerator_arch
 
 from std.utils.coord import Coord, CoordLike, DynamicCoord
-from std.utils.index import IndexList
 from std.utils.static_tuple import StaticTuple
 
 # Re-export CPU implementations.
@@ -54,8 +53,8 @@ from .backend.gpu import (
 
 @inline(.always)
 def _get_start_indices_of_nth_subvolume[
-    rank: Int, //, subvolume_rank: Int = 1
-](n: Int, shape: IndexList[rank, element_type=_], out res: type_of(shape)):
+    element_types: TypeList[Trait=CoordLike, ...], //, subvolume_rank: Int = 1
+](n: Int, shape: Coord[*element_types]) -> DynamicCoord[DType.int, shape.rank]:
     """Converts a flat index into the starting ND indices of the nth subvolume
     with rank `subvolume_rank`.
 
@@ -76,7 +75,7 @@ def _get_start_indices_of_nth_subvolume[
         _get_start_indices_of_nth_subvolume[1](56, shape) = (5, 1, 1, 0)
 
     Parameters:
-        rank: The rank of the ND index.
+        element_types: The element types of the flat `shape` `Coord`.
         subvolume_rank: The rank of the subvolume under consideration.
 
     Args:
@@ -87,33 +86,31 @@ def _get_start_indices_of_nth_subvolume[
         Constructed ND-index.
     """
 
+    comptime rank = shape.rank
+    comptime assert shape.is_flat, "shape must be flat"
     comptime assert (
         subvolume_rank <= rank
     ), "subvolume rank cannot be greater than indices rank"
     comptime assert subvolume_rank >= 0, "subvolume rank must be non-negative"
 
-    comptime IntType = type_of(shape)._int_type
-
-    # fast impls for common cases
-    comptime if rank == 2 and subvolume_rank == 1:
-        return {n, 0}
-
-    comptime if rank - 1 == subvolume_rank:
-        res = {0}
-        res[0] = n
-        return
+    var res = DynamicCoord[DType.int, rank]()
 
     comptime if rank == subvolume_rank:
-        return {0}
+        return res
 
-    res = {}
-    # If the index type is unsigned, be sure to use unsigned div/mod operations.
-    var curr_index = IntType(n)
+    comptime if rank - 1 == subvolume_rank:
+        res.replace_dynamic[0](n)
+        return res
+
+    var curr_index = n
 
     comptime for i in reversed(range(1, rank - subvolume_rank)):
-        curr_index, res.data[i] = divmod(curr_index, IntType(shape.get[i]()))
+        var remainder: Int
+        curr_index, remainder = divmod(curr_index, Int(shape[i]))
+        res.replace_dynamic[i](remainder)
 
-    res.data[0] = curr_index
+    res.replace_dynamic[0](curr_index)
+    return res
 
 
 @inline(.always)
@@ -319,10 +316,7 @@ def _elementwise_impl[
             ](coords: Coord) {imm}:
                 func[width, alignment](coords)
 
-            _elementwise_impl_cpu[
-                simd_width=simd_width,
-                trace_description=trace_description,
-            ](
+            _elementwise_impl_cpu[simd_width](
                 func_wrap_cpu,
                 shape=shape,
                 ctx=Optional(context.assert_cpu_target()),
@@ -466,11 +460,11 @@ for regions that fail out of the input domain are handled by load_fn.
 
 
 Parameters:
-    shape_element_type: The element dtype of the shape.
-    input_shape_element_type: The element dtype of the input shape.
+    shape_types: The element types of the `shape` coordinate.
+    input_shape_types: The element types of the `input_shape` coordinate.
     rank: Input and output domain rank.
-    stencil_rank: Rank of stencil subdomain slice.
-    stencil_axis: Stencil subdomain axes.
+    stencil_rank: Rank of stencil subdomain slice. Must be 2: the stencil
+        covers the spatial axes 1 and 2.
     simd_width: The SIMD vector width to use.
     dtype: The input and output data dtype.
     map_fn: A function that a point in the output domain to the input co-domain.
@@ -495,11 +489,11 @@ comptime stencil_gpu = _stencil_impl_gpu
 """(Naive implementation) Computes stencil operation in parallel on GPU.
 
 Parameters:
-    shape_element_type: The element dtype of the shape.
-    input_shape_element_type: The element dtype of the input shape.
+    shape_types: The element types of the `shape` coordinate.
+    input_shape_types: The element types of the `input_shape` coordinate.
     rank: Input and output domain rank.
-    stencil_rank: Rank of stencil subdomain slice.
-    stencil_axis: Stencil subdomain axes.
+    stencil_rank: Rank of stencil subdomain slice. Must be 2: the stencil
+        covers the spatial axes 1 and 2.
     simd_width: The SIMD vector width to use.
     dtype: The input and output data dtype.
     MapFnType: A closure maps a point in the output domain to input co-domain bounds.

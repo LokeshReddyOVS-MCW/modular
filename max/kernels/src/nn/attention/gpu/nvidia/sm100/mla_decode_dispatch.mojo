@@ -2849,6 +2849,7 @@ def mla_decode_sm100_dispatch[
     # allowing np=2 with 2-3 pages per split instead of 1-2.
     # =========================================================================
     @inline(.always)
+    @__allow_legacy_any_origin_fields
     def launch_impl[split_page_size_param: Int]() raises {imm}:
         _mla_decode_sm100_dispatch_impl[
             q_type=q_type,
@@ -3116,6 +3117,7 @@ def _mla_decode_sm100_dispatch_impl[
             MutPointer[UInt32, origin=MutAnyOrigin]
         ](valid_length.ptr)
 
+        @__allow_legacy_any_origin_fields
         def _launch_split_k_path() raises {imm}:
             # Launch main MLA decode kernel (writes partial results to accumulators)
             mla_decode_sm100_sink_split_k[
@@ -3393,6 +3395,7 @@ def _mla_decode_sm100_dispatch_impl[
         else:
             lse_accum_split_ptr = lse_out
 
+        @__allow_legacy_any_origin_fields
         def _launch_no_split_path() raises {imm}:
             mla_decode_sm100_sink_split_k[
                 q_type=q_type,
@@ -3823,6 +3826,7 @@ def mla_decode_sm100_sink_split_k[
             # direct gather), so a launch encodes only the two it uses.
 
             @inline(.always)
+            @__allow_legacy_any_origin_fields
             def _launch_sparse_qkv_fp8[
                 _fold_shared_index_val: Bool = False,
                 _q_len_fold_val: Int = 1,
@@ -4208,6 +4212,7 @@ def mla_decode_sm100_sink_split_k[
             var valid_len: ValidLengthType = {valid_length}
 
             @inline(.always)
+            @__allow_legacy_any_origin_fields
             def _launch_r[
                 _fold_q: Bool,
                 _q_len_fold: Int,
@@ -4305,6 +4310,7 @@ def mla_decode_sm100_sink_split_k[
             var valid_len: ValidLengthType = {}
 
             @inline(.always)
+            @__allow_legacy_any_origin_fields
             def _launch_n[
                 _fold_q: Bool,
                 _q_len_fold: Int,
@@ -4623,12 +4629,6 @@ def launch_mla_sm100_decode_enqueue_kernel[
     ) else PDLLevel.OFF
 
     ctx.enqueue_function[kernel](
-        GridBlockAttributeLaunchConfig(
-            grid_dim=grid_dim,
-            block_dim=block_dim,
-            shared_mem_bytes=config.smem_used,
-            attributes=pdl_launch_attributes(pdl_level),
-        ),
         q_tma,
         k_tma,
         o_tma,
@@ -4637,6 +4637,12 @@ def launch_mla_sm100_decode_enqueue_kernel[
         mla_decode_pack,
         scales_ptr,
         scalar_args_buf,
+        execution_config=GridBlockAttributeLaunchConfig(
+            grid_dim=grid_dim,
+            block_dim=block_dim,
+            shared_mem_bytes=config.smem_used,
+            attributes=pdl_launch_attributes(pdl_level),
+        ),
     )
 
 
@@ -4730,12 +4736,6 @@ def launch_mla_sm100_decode_native_fp8[
         config.decoding_warp_split_k or _MLA_PDL_ALWAYS
     ) else PDLLevel.OFF
     ctx.enqueue_function[kernel](
-        GridBlockAttributeLaunchConfig(
-            grid_dim=grid_dim,
-            block_dim=block_dim,
-            shared_mem_bytes=config.smem_used,
-            attributes=pdl_launch_attributes(pdl_level),
-        ),
         q_tma,
         k_tma,
         o_tma,
@@ -4744,6 +4744,12 @@ def launch_mla_sm100_decode_native_fp8[
         mla_decode_pack,
         scales_ptr,
         scalar_args_buf,
+        execution_config=GridBlockAttributeLaunchConfig(
+            grid_dim=grid_dim,
+            block_dim=block_dim,
+            shared_mem_bytes=config.smem_used,
+            attributes=pdl_launch_attributes(pdl_level),
+        ),
     )
 
 
@@ -4846,12 +4852,6 @@ def launch_mla_sm100_decode_native_fp8_layout_g[
         config_g.decoding_warp_split_k or _MLA_PDL_ALWAYS
     ) else PDLLevel.OFF
     ctx.enqueue_function[kernel](
-        GridBlockAttributeLaunchConfig(
-            grid_dim=grid_dim,
-            block_dim=block_dim,
-            shared_mem_bytes=config_g.smem_used,
-            attributes=pdl_launch_attributes(pdl_level),
-        ),
         q_tma,
         k_tma,
         o_tma,
@@ -4860,6 +4860,12 @@ def launch_mla_sm100_decode_native_fp8_layout_g[
         mla_decode_pack,
         scales_ptr,
         scalar_args_buf,
+        execution_config=GridBlockAttributeLaunchConfig(
+            grid_dim=grid_dim,
+            block_dim=block_dim,
+            shared_mem_bytes=config_g.smem_used,
+            attributes=pdl_launch_attributes(pdl_level),
+        ),
     )
 
 
@@ -4957,12 +4963,6 @@ def launch_mla_sm100_decode_fp8_per_token_scale_rope_aware[
         config.decoding_warp_split_k or _MLA_PDL_ALWAYS
     ) else PDLLevel.OFF
     ctx.enqueue_function[kernel](
-        GridBlockAttributeLaunchConfig(
-            grid_dim=grid_dim,
-            block_dim=block_dim,
-            shared_mem_bytes=config.smem_used,
-            attributes=pdl_launch_attributes(pdl_level),
-        ),
         q_nope_tma,
         q_rope_tma,
         k_content_tma,
@@ -4974,6 +4974,12 @@ def launch_mla_sm100_decode_fp8_per_token_scale_rope_aware[
         mla_decode_pack,
         q_scale_ptr,
         scalar_args_buf,
+        execution_config=GridBlockAttributeLaunchConfig(
+            grid_dim=grid_dim,
+            block_dim=block_dim,
+            shared_mem_bytes=config.smem_used,
+            attributes=pdl_launch_attributes(pdl_level),
+        ),
     )
 
 
@@ -5267,16 +5273,6 @@ def launch_mla_sm100_decode_sparse_qkv_fp8[
                     packed_v_tma.descriptor
                 )
             ctx.enqueue_function[KernelType.kernel_pair](
-                ClusterAttributeLaunchConfig(
-                    grid_dim=grid_dim,
-                    block_dim=block_dim,
-                    # The two head tiles of one token are adjacent CTAs, so a
-                    # (2, 1, 1) cluster pairs exactly the CTAs that share an
-                    # index list.
-                    cluster_dim=Dim(2, 1, 1),
-                    shared_mem_bytes=sparse_smem_used,
-                    attributes=pdl_launch_attributes(pdl_level),
-                ),
                 q_tma,
                 KernelType.KTMA(k_sw64_tma.descriptor),
                 packed_v_descriptor,
@@ -5299,15 +5295,19 @@ def launch_mla_sm100_decode_sparse_qkv_fp8[
                 kernel_scalar_args,
                 Int32(selection_lag),
                 stamp_addr,
-            )
-        else:
-            ctx.enqueue_function[KernelType.kernel](
-                GridBlockAttributeLaunchConfig(
+                execution_config=ClusterAttributeLaunchConfig(
                     grid_dim=grid_dim,
                     block_dim=block_dim,
+                    # The two head tiles of one token are adjacent CTAs, so a
+                    # (2, 1, 1) cluster pairs exactly the CTAs that share an
+                    # index list.
+                    cluster_dim=Dim(2, 1, 1),
                     shared_mem_bytes=sparse_smem_used,
                     attributes=pdl_launch_attributes(pdl_level),
                 ),
+            )
+        else:
+            ctx.enqueue_function[KernelType.kernel](
                 q_tma,
                 KernelType.KTMA(k_sw64_tma.descriptor),
                 o_tma,
@@ -5329,6 +5329,12 @@ def launch_mla_sm100_decode_sparse_qkv_fp8[
                 kernel_scalar_args,
                 Int32(selection_lag),
                 stamp_addr,
+                execution_config=GridBlockAttributeLaunchConfig(
+                    grid_dim=grid_dim,
+                    block_dim=block_dim,
+                    shared_mem_bytes=sparse_smem_used,
+                    attributes=pdl_launch_attributes(pdl_level),
+                ),
             )
     else:
         # INT64, SWIZZLE_NONE, one box per 576-byte row for the linear front
@@ -5358,12 +5364,6 @@ def launch_mla_sm100_decode_sparse_qkv_fp8[
             == KernelType.kv_gather4_box_w
         ), "k_tma does not match the kernel's gather descriptor"
         ctx.enqueue_function[KernelType.kernel](
-            GridBlockAttributeLaunchConfig(
-                grid_dim=grid_dim,
-                block_dim=block_dim,
-                shared_mem_bytes=sparse_smem_used,
-                attributes=pdl_launch_attributes(pdl_level),
-            ),
             q_tma,
             KernelType.KTMA(k_tma.descriptor),
             o_tma,
@@ -5385,4 +5385,10 @@ def launch_mla_sm100_decode_sparse_qkv_fp8[
             kernel_scalar_args,
             Int32(selection_lag),
             stamp_addr,
+            execution_config=GridBlockAttributeLaunchConfig(
+                grid_dim=grid_dim,
+                block_dim=block_dim,
+                shared_mem_bytes=sparse_smem_used,
+                attributes=pdl_launch_attributes(pdl_level),
+            ),
         )

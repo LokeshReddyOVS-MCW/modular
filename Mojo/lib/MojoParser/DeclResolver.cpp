@@ -1682,8 +1682,9 @@ LogicalResult DeclResolver::resolve(ASTDecl &decl, DeclResolvedness howResolved,
       // declaration.
       if (!decl.isMatchingEndCursor(lexer.getCursor()) && !decl.isErroneous()) {
         if (lexer.getToken().isAny(Token::kw_def, Token::kw_struct,
-                                   Token::kw___enum, Token::kw_trait,
-                                   Token::kw_class, Token::kw_var)) {
+                                   Token::kw___enum, Token::kw___union,
+                                   Token::kw_trait, Token::kw_class,
+                                   Token::kw_var)) {
           lexer.emitTokenError(
               "definition isn't on its own line at the correct "
               "indentation");
@@ -2340,11 +2341,14 @@ StringAttr DeclResolver::getMangledName(StringAttr baseName, ASTDecl &container,
 
     // Add suffix to disambiguate overloadable conventions.
     switch (convention) {
+    case ArgConvention::Unresolved:
+      llvm_unreachable("unresolved convention in a resolved signature");
     case ArgConvention::OwnedReg:
+      llvm_unreachable("not used by the parser");
     case ArgConvention::PackImmMem:
     case ArgConvention::PackMut:
     case ArgConvention::PackOwnedMem:
-      llvm_unreachable("not used by the parser");
+      llvm_unreachable("pack arguments are mangled above");
     case ArgConvention::OwnedMem:
     case ArgConvention::DeinitMem:
       mangledName += '$';

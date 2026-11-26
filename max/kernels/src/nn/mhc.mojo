@@ -54,7 +54,11 @@ from std.utils.index import StaticTuple
 from layout import TensorLayout, TileTensor, row_major, stack_allocation
 from max.gpu.compute.mma import mma
 from max.gpu.sync import barrier, schedule_barrier
-from max.gpu.host import DeviceContext, default_accelerator
+from max.gpu.host import (
+    DeviceContext,
+    GridBlockLaunchConfig,
+    default_accelerator,
+)
 from max.gpu.host.info import is_gpu
 from max.gpu.primitives.grid_controls import (
     PDLLevel,
@@ -1007,12 +1011,14 @@ def mhc_pre_kernel[
         comptime width = _mhc_pre_vec[dtype]
 
         @inline(.always)
+        @__allow_legacy_any_origin_fields
         def load(i: Int, j: Int) {imm} -> SIMD[dtype, width]:
             return streams.load[width=width, alignment=16](
                 (t, j, (i * WARP_SIZE + lane) * width)
             )
 
         @inline(.always)
+        @__allow_legacy_any_origin_fields
         def gamma_at(i: Int) {imm} -> SIMD[dtype, width]:
             return gamma.load[width=width, alignment=16](
                 ((i * WARP_SIZE + lane) * width,)
@@ -1646,8 +1652,9 @@ def mhc_pre[
                 hc_eps,
                 norm_eps,
                 Int32(num_rows),
-                grid_dim=config[0],
-                block_dim=_mhc_pre_threads,
+                execution_config=GridBlockLaunchConfig(
+                    grid_dim=config[0], block_dim=_mhc_pre_threads
+                ),
             )
             return
 
@@ -1684,8 +1691,9 @@ def mhc_pre[
                         streams,
                         hc_fn,
                         Int32(num_rows),
-                        grid_dim=(config[0], ks),
-                        block_dim=_mhc_pre_threads,
+                        execution_config=GridBlockLaunchConfig(
+                            grid_dim=(config[0], ks), block_dim=_mhc_pre_threads
+                        ),
                     )
 
         var partial_in = partial.as_imm()
@@ -1719,8 +1727,9 @@ def mhc_pre[
             hc_eps,
             norm_eps,
             Int32(k_splits),
-            grid_dim=num_rows,
-            block_dim=_mhc_pre_threads,
+            execution_config=GridBlockLaunchConfig(
+                grid_dim=num_rows, block_dim=_mhc_pre_threads
+            ),
         )
 
 

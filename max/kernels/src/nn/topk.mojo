@@ -47,7 +47,6 @@ from layout import (
     TensorLayout,
     TensorEngine,
     TileTensor,
-    coord_to_index_list,
     row_major,
 )
 from layout.coord import CoordLike, DynamicCoord
@@ -420,6 +419,7 @@ def _top_k_cpu[
     var shape = input.layout.shape_coord()
     var axis_dim = Int(input.dim(axis))
 
+    @__allow_legacy_any_origin_fields
     def process_rows(start_row: Int, end_row: Int) {imm}:
         # Allocate the index list without initializing its elements.
         var idxs = List[Int64](unsafe_uninit_length=axis_dim)
@@ -518,7 +518,7 @@ def _top_k_cpu[
 
     parallelize_over_rows(
         process_rows,
-        coord_to_index_list(shape),
+        shape,
         axis,
         parallelism_grain_size,
         ctx,
@@ -804,9 +804,7 @@ def _top_k_sampling[
     )
 
     var reshaped_out_idxs = reshape(out_idxs, internal_out_idxs_shape)
-    var reshaped_out_vals = reshape(
-        out_vals, coord_to_index_list(internal_out_shape)
-    )
+    var reshaped_out_vals = reshape(out_vals, internal_out_shape)
 
     var out_idxs_tmp_alloc = alloc(
         AllocLayout[Int64](length=out_vals.num_elements())
@@ -3401,16 +3399,16 @@ def _gumbel_argmax_fused_kernel[
                 (slot_ptr.unsafe_offset(8)).unsafe_bitcast[Int64]()[0] = Int64(
                     total.p
                 )
-                var previous = Atomic[Int32].fetch_add[
-                    ordering=Ordering.RELEASE
-                ](counters.unsafe_value().unsafe_offset(batch_id), Int32(1))
+                var previous = Atomic[Int32].fetch_add[ordering=.release](
+                    counters.unsafe_value().unsafe_offset(batch_id), Int32(1)
+                )
                 is_last[0] = Int(previous) + 1 == blocks_per_row_int
             barrier()
 
             if tid == 0 and is_last[0]:
                 # This acquire pairs with the release increments that publish
                 # each partial.
-                fence[Ordering.ACQUIRE]()
+                fence[Ordering.acquire]()
                 var row_base = batch_id * blocks_per_row_int
                 var first = partials.unsafe_value().unsafe_offset(
                     row_base * _GUMBEL_PARTIAL_BYTES

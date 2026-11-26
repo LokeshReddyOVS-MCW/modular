@@ -85,19 +85,33 @@ struct TestResult(EnumLike, Equatable, ImplicitlyCopyable, Writable):
 
     var _value: Int
 
-    comptime PASS = Self(0)
+    # `pass` is a keyword, so this declaration needs backticks. Uses such as
+    # `TestResult.pass` and `.pass` do not.
+    comptime `pass` = Self(0)
     """The test passed."""
 
-    comptime FAIL = Self(1)
+    comptime fail = Self(1)
     """The test failed."""
 
-    comptime SKIP = Self(2)
+    comptime skip = Self(2)
     """The test was skipped."""
 
+    @deprecated("Use `TestResult.pass` instead.")
+    comptime PASS = Self.pass
+    """Deprecated: The former name of `pass`."""
+
+    @deprecated(use=fail)
+    comptime FAIL = Self.fail
+    """Deprecated: The former name of `fail`."""
+
+    @deprecated(use=skip)
+    comptime SKIP = Self.skip
+    """Deprecated: The former name of `skip`."""
+
     comptime _enum_case_names = ParameterList.of[
-        "PASS".value,
-        "FAIL".value,
-        "SKIP".value,
+        "pass".value,
+        "fail".value,
+        "skip".value,
     ].values
 
     comptime _enum_case_types = TypeList.splat[
@@ -134,12 +148,12 @@ struct TestResult(EnumLike, Equatable, ImplicitlyCopyable, Writable):
             writer: The writer to output the result code to.
         """
         match self:
-            case .PASS:
-                writer.write(Text[Color.GREEN]("PASS"))
-            case .FAIL:
-                writer.write(Text[Color.RED]("FAIL"))
-            case .SKIP:
-                writer.write(Text[Color.YELLOW]("SKIP"))
+            case .pass:
+                writer.write(Text[Color.GREEN]("pass"))
+            case .fail:
+                writer.write(Text[Color.RED]("fail"))
+            case .skip:
+                writer.write(Text[Color.YELLOW]("skip"))
 
     @inline(.never)
     def write_repr_to(self, mut writer: Some[Writer]):
@@ -150,12 +164,12 @@ struct TestResult(EnumLike, Equatable, ImplicitlyCopyable, Writable):
         """
         writer.write_string("TestResult.")
         match self:
-            case .PASS:
-                writer.write_string("PASS")
-            case .FAIL:
-                writer.write_string("FAIL")
-            case .SKIP:
-                writer.write_string("SKIP")
+            case .pass:
+                writer.write_string("pass")
+            case .fail:
+                writer.write_string("fail")
+            case .skip:
+                writer.write_string("skip")
 
 
 struct TestReport(Copyable, Writable):
@@ -189,7 +203,7 @@ struct TestReport(Copyable, Writable):
         return {
             name = name^,
             duration_ns = duration_ns,
-            result = TestResult.PASS,
+            result = .pass,
         }
 
     @staticmethod
@@ -207,7 +221,7 @@ struct TestReport(Copyable, Writable):
         return {
             name = name^,
             duration_ns = duration_ns,
-            result = TestResult.FAIL,
+            result = .fail,
             error = error^,
         }
 
@@ -221,7 +235,7 @@ struct TestReport(Copyable, Writable):
         Returns:
             A new skipped test report.
         """
-        return {name = name^, duration_ns = 0, result = TestResult.SKIP}
+        return {name = name^, duration_ns = 0, result = .skip}
 
     @doc_hidden
     def __init__(
@@ -254,7 +268,7 @@ struct TestReport(Copyable, Writable):
         writer.write(" [ ", _format_nsec(self.duration_ns), " ] ")
         writer.write(Text[Color.CYAN](self.name))
 
-        if self.result == TestResult.FAIL:
+        if self.result == .fail:
             writer.write(
                 "\n",
                 _Indent(
@@ -316,9 +330,9 @@ struct TestSuiteReport(Copyable, Writable):
 
         for ref report in self.reports:
             self.total_duration_ns += report.duration_ns
-            if report.result == TestResult.FAIL:
+            if report.result == .fail:
                 self.failures += 1
-            elif report.result == TestResult.SKIP:
+            elif report.result == .skip:
                 self.skipped += 1
         self.passed = len(self.reports) - self.failures - self.skipped
 
@@ -584,8 +598,8 @@ struct TestSuite(
                     " test not found in suite: ",
                     arg,
                 )
-            if self.allow_list:
-                self.allow_list[].add(arg)
+            if case .Some(ref allow_list) = self.allow_list:
+                allow_list.add(arg)
             else:
                 self.skip_list.add(arg)
 

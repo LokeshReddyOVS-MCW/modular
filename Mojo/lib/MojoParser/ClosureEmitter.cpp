@@ -142,7 +142,8 @@ static LogicalResult emitForwardingCall(ImplicitLocOpBuilder &builder,
         return SRValue(bbArg);
       // Forward the moved argument.
       if (convention == ArgConvention::OwnedMem ||
-          convention == ArgConvention::DeinitMem)
+          convention == ArgConvention::DeinitMem ||
+          convention == ArgConvention::PackOwnedMem)
         return MRValue(bbArg);
       return CValue::getMValueForRef(bbArg);
     }();
@@ -167,11 +168,17 @@ static LogicalResult emitForwardingCall(ImplicitLocOpBuilder &builder,
   if (!callResult)
     return failure();
   if (!calleeSig.isAsync()) {
-    auto regRet = callResult.getIfSRValue();
-    if (regRet && resultType != regRet.getType())
-      regRet = RebindOp::create(builder, resultType, regRet);
+    Value ret;
+    if (auto regRet = callResult.getIfSRValue()) {
+      ret = regRet;
+      if (ret.getType() != resultType)
+        ret = RebindOp::create(builder, resultType, regRet);
+    } else if (calleeSig.isRefResult()) {
+      ret = callResult.getIfMLValue();
+      assert(ret); // We must be forwarding a MLValue.
+    }
 
-    IREmitter::emitNormalReturn(builder, regRet);
+    IREmitter::emitNormalReturn(builder, ret);
     return success();
   }
 
@@ -1199,6 +1206,21 @@ static bool isOutlinedInteriorOrigin(
   return interiorOrigins.contains(cast<TypedAttr>(getCanonicalAttr(stripped)));
 }
 
+static bool namesOutlinedInteriorOrigin(
+    TypedAttr typed,
+    const llvm::MapVector<TypedAttr, ParamDeclRefAttr> &interiorOrigins) {
+  if (!typed)
+    return false;
+  bool found = false;
+  auto visit = [&](Attribute nested) {
+    if (isOutlinedInteriorOrigin(dyn_cast<TypedAttr>(nested), interiorOrigins))
+      found = true;
+  };
+  typed.walk(visit);
+  typed.getType().walk(visit);
+  return found;
+}
+
 static bool hasOutlinedInteriorOrigin(
     Type type,
     const llvm::MapVector<TypedAttr, ParamDeclRefAttr> &interiorOrigins) {
@@ -1376,7 +1398,7 @@ static LogicalResult outlineAndPromoteOrigins(
     SmallVector<TypedAttr> newParamValues;
     newParamValues.reserve(sym.getParamValues().size());
     for (TypedAttr pv : sym.getParamValues()) {
-      bindsOutlinedInterior |= isOutlinedInteriorOrigin(pv, interiorOrigins);
+      bindsOutlinedInterior |= namesOutlinedInteriorOrigin(pv, interiorOrigins);
       auto newPv = cast<TypedAttr>(originReplacer.replace(pv));
       if (newPv != pv) {
         changed = true;
@@ -1405,18 +1427,24 @@ static LogicalResult outlineAndPromoteOrigins(
       return {sym, WalkResult::skip()};
 
     mlir::AttrTypeReplacer symTypeReplacer;
-    symTypeReplacer.addReplacement(
-        [&](TypedAttr attr) -> std::optional<TypedAttr> {
-          if (!sugarIsa<OriginType>(attr.getType()))
-            return std::nullopt;
-          TypedAttr canon = cast<TypedAttr>(getCanonicalAttr(attr));
-          auto it = paramReplacements.find(canon);
-          if (it != paramReplacements.end())
-            return it->second;
-          return getPromotedOriginRef(ctx,
-                                      OriginType::stripMutCastAndRebind(attr),
-                                      promotedOriginNames);
-        });
+    symTypeReplacer.addReplacement([&](TypedAttr attr)
+                                       -> std::optional<TypedAttr> {
+      if (!sugarIsa<OriginType>(attr.getType()))
+        return std::nullopt;
+      TypedAttr canon = cast<TypedAttr>(getCanonicalAttr(attr));
+      auto it = paramReplacements.find(canon);
+      if (it != paramReplacements.end())
+        return it->second;
+      TypedAttr stripped = OriginType::stripMutCastAndRebind(attr);
+      if (sugarIsa<InteriorOriginAttr, OriginSubtreeAttr>(stripped)) {
+        auto outlined =
+            interiorOrigins.find(cast<TypedAttr>(getCanonicalAttr(stripped)));
+        if (outlined == interiorOrigins.end() || attr != stripped)
+          return std::nullopt;
+        return getOutlinedOriginRef(ctx, outlined->second, promotedOriginNames);
+      }
+      return getPromotedOriginRef(ctx, stripped, promotedOriginNames);
+    });
     auto newType = cast<FuncType>(symTypeReplacer.replace(sym.getType()));
     return {FuncSymbolAttr::get(sym.getSymbol(), newType, newParamValues),
             WalkResult::skip()};
@@ -1491,9 +1519,10 @@ static KGEN::StructType getMlirType(MLIRContext *ctx,
   return KGEN::StructType::get(ctx, mlirFieldTypes, isMemOnly);
 }
 
-bool ClosureEmitter::provenConformsToTrait(
-    ASTType type, TraitASTDecl &traitDecl, SharedState &shared,
-    ArrayRef<ConstraintAttr> callerAssumptions) {
+bool ClosureEmitter::provenConformsToTrait(ASTType type,
+                                           TraitASTDecl &traitDecl,
+                                           SharedState &shared,
+                                           TypedAttr callerAssumptions) {
   TraitDeclOp trait = traitDecl.getOp();
   return type
       .doesConformTo(TraitType::get(getFullyResolvedSymbolRef(trait)), shared,
@@ -1507,8 +1536,7 @@ static FailureOr<ASTType> getDeviceType(ASTType hostType, ASTDecl &scope,
       shared.getBuiltinDevicePassableTrait(scope.getLoc());
   assert(devicePassableDecl && "could not find device passable dependency");
 
-  SmallVector<ConstraintAttr> assumptions =
-      ASTDecl::getAssumptionsFromScope(&scope);
+  TypedAttr assumptions = scope.getScopeAssumptions();
 
   // A capture is device-encodable only if it conforms to DevicePassable;
   // resolve its device_type via GetWitness + fold attempt.
@@ -2006,8 +2034,7 @@ static TypeConvention typeConventionOf(SharedState &shared,
   // prove the conformance against its parameter bindings and the capturing
   // scope's `conforms_to` assumptions, as `isMovable`/`isCopyable` do.
   if (structDeclOp.getRegisterPassableConstraintAttr()) {
-    SmallVector<ConstraintAttr> assumptions =
-        ASTDecl::getAssumptionsFromScope(&nestedFnDecl);
+    TypedAttr assumptions = nestedFnDecl.getScopeAssumptions();
     if (ASTType(structType)
             .provenConformsToBuiltinTrait(
                 "RegisterPassable", nestedFnDecl.getLoc(), shared, assumptions))
@@ -2080,6 +2107,7 @@ Value ClosureEmitter::emitClosure(ModuleASTDecl &moduleDecl,
         meetCaptureConvention(highestCaptureConvention, captureConventionMet);
   };
   bool allCapturesEncodable = true;
+  bool allowAnyOriginCaptures = nestedFnDecl.allowsLegacyAnyOriginCaptures();
   for (const Capture &capture : captures) {
     Value value = capture.getValue().getMlirValue();
     captureValues.push_back(value);
@@ -2093,17 +2121,31 @@ Value ClosureEmitter::emitClosure(ModuleASTDecl &moduleDecl,
 
     SyntheticNode synthNode(nestedFnDecl.getLoc());
     ExprDest dest(anyType, EC_Type);
-    PValue captureTypeValue =
-        emitter
-            .emitImplicitConversionToType({value.getType(), &synthNode},
-                                          anyType, dest)
-            .getIfPValue();
+    PValue captureTypeValue = emitter
+                                  .emitImplicitConversionToType(
+                                      {value.getType(), &synthNode}, anyType,
+                                      dest, emitter.shared.noAssumptions)
+                                  .getIfPValue();
     auto captureTypeAttr = cast<TypedAttr>(captureTypeValue.get());
     auto captureName = StringAttr::get(ctx, capture.getSpelling());
     auto captureConvention = capture.getCaptureConvention();
     Type mlirType = value.getType();
     if (auto refType = sugarDynCast<LIT::RefType>(mlirType))
       mlirType = refType.getElementType();
+    // The storage struct hides the capture's origins from lifetime checking,
+    // so a captured AnyOrigin does not extend any lifetime.
+    if (!allowAnyOriginCaptures && typeHasAnyOrigin(shared, mlirType)) {
+      auto diag = shared.emitWarning(capture.getLoc())
+                  << "capture '" << capture.getSpelling() << "' of type "
+                  << ASTType(mlirType)
+                  << " has AnyOrigin, which the closure does not track; the "
+                     "value it refers to can be destroyed before the closure "
+                     "runs";
+      diag.attachNote(nestedFnDecl.getLoc())
+          << "add '@__allow_legacy_any_origin_fields' to the closure's 'def' "
+             "or to an enclosing function if the lifetime is managed "
+             "explicitly";
+    }
     switch (captureConvention) {
     case CaptureConvention::kConventionUnspecified:
     case CaptureConvention::kConventionMut:
@@ -2555,7 +2597,7 @@ ASTDecl *ClosureEmitter::addCaptureValue(DefASTDecl &closure, SMLoc location,
       signatureDecl ? signatureDecl : &closure);
   captureValueDecl.setCapturedName(captureName);
   shared.addCaptureToScope(closure, result,
-                           Capture(captureValue, convention, name));
+                           Capture(captureValue, convention, name, location));
   return &captureValueDecl;
 }
 
@@ -2580,11 +2622,11 @@ PValue ClosureEmitter::createParamClosureExtensionType(
       GetWitnessAttr::get(newSelfVal, srcClosureInst, callName, srcSig);
 
   ExprDest dest(EC_TypeParamValue);
-  TypedAttr converted =
-      emitter
-          .emitImplicitConversionToType({PValue(toConvert), srcTypeVal.expr},
-                                        tgtSig, dest)
-          .getIfPValue();
+  TypedAttr converted = emitter
+                            .emitImplicitConversionToType(
+                                {PValue(toConvert), srcTypeVal.expr}, tgtSig,
+                                dest, emitter.shared.noAssumptions)
+                            .getIfPValue();
   assert(converted && "trait convertibility must have been tested");
 
   // This is the bridging thunk generated.
@@ -2602,7 +2644,7 @@ PValue ClosureEmitter::createParamClosureExtensionType(
           // `#func.symbol[*(0, 0), *(0, 0)]`, and only the first one is unbound
           // not the second one.
           if (ref && ref.getDepth() == 0)
-            return UnboundAttr::get(adjuster.replace(ref.getType()));
+            return nullptr;
           return cast<TypedAttr>(adjuster.replace(value));
         });
   };
@@ -2612,7 +2654,7 @@ PValue ClosureEmitter::createParamClosureExtensionType(
   // Collecting all the parameter
   SmallVector<TypedAttr> thunkParams;
   for (auto param : thunkBindings) {
-    if (sugarIsa<UnboundAttr>(param))
+    if (!param)
       continue;
     thunkParams.push_back(param);
   }

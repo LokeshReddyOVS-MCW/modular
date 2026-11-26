@@ -175,6 +175,8 @@ OriginTrackable::OriginTrackable(Value v) {
 
   unsigned argIdx = bbArg.getArgNumber();
   switch (signature.getArgConvention(argIdx)) {
+  case ArgConvention::Unresolved:
+    llvm_unreachable("unresolved convention in a resolved signature");
   case ArgConvention::ImmReg:
     // This is immutable so don't need to be tracked.
     return;
@@ -183,6 +185,8 @@ OriginTrackable::OriginTrackable(Value v) {
   case ArgConvention::Mut:
   case ArgConvention::MutRef:
   case ArgConvention::Ref:
+  case ArgConvention::PackImmMem:
+  case ArgConvention::PackMut:
     isIndirect = true;
     startsUninit = false;
     endInitState = EndsInit;
@@ -195,6 +199,7 @@ OriginTrackable::OriginTrackable(Value v) {
     break;
   case ArgConvention::OwnedMem:
   case ArgConvention::DeinitMem:
+  case ArgConvention::PackOwnedMem:
     isIndirect = true;
     startsUninit = false;
     endInitState = EndsUninit;
@@ -214,10 +219,6 @@ OriginTrackable::OriginTrackable(Value v) {
     startsUninit = true;
     endInitState = InitOnError;
     break;
-  case ArgConvention::PackImmMem:
-  case ArgConvention::PackMut:
-  case ArgConvention::PackOwnedMem:
-    llvm_unreachable("pack conventions do not occur before LowerLIT");
   }
 
   name = signature.getArgName(argIdx);
@@ -305,36 +306,33 @@ void OperationEffects::analyzeCallOp(Operation &op) {
   /// Argument conventions cause a direct use of the register of pointee, and
   /// handling them specifically allows us to be field sensitive in cases where
   /// the access is directly attributable to a Value.
-  auto getOperandEffectForConvention = [&](ArgConvention conv,
-                                           Type argType) -> OperandEffect {
+  auto getOperandEffectForConvention =
+      [&](ArgConvention conv) -> OperandEffect {
     switch (conv) {
+    case ArgConvention::Unresolved:
+      llvm_unreachable("unresolved convention in a resolved signature");
     case ArgConvention::OwnedReg:
       return OperandEffect::regConsume;
     case ArgConvention::OwnedMem:
     case ArgConvention::DeinitMem:
+    case ArgConvention::PackOwnedMem:
       return OperandEffect::memConsume;
     case ArgConvention::ImmReg:
       return OperandEffect::regUse;
     case ArgConvention::ImmMem:
+    case ArgConvention::PackImmMem:
+    case ArgConvention::PackMut:
       return OperandEffect::memLoad;
     case ArgConvention::Mut:
     case ArgConvention::MutRef:
       return OperandEffect::memMut;
-    case ArgConvention::Ref: {
-      // If the reference is guaranteed immutable, then treat it as a load,
-      // otherwise it might be a mutation. If originAccessesAreReadOnly is true,
-      // then we this "ref" argument is treated as read only.
-      bool isImmut = originsAccessesAreReadOnly ||
-                     cast<RefType>(argType).isMutableKnown(false);
-      return isImmut ? OperandEffect::memLoad : OperandEffect::memMut;
-    }
+    case ArgConvention::Ref:
+      // The `ref` convention promises not to mutate the borrowed value,
+      // regardless of the mutability of its origin.
+      return OperandEffect::memLoad;
     case ArgConvention::ByRefError:
     case ArgConvention::ByRefResult:
       return OperandEffect::memStoreOwned;
-    case ArgConvention::PackImmMem:
-    case ArgConvention::PackMut:
-    case ArgConvention::PackOwnedMem:
-      llvm_unreachable("pack conventions do not occur before LowerLIT");
     }
     llvm_unreachable("invalid input convention");
   };
@@ -343,7 +341,7 @@ void OperationEffects::analyzeCallOp(Operation &op) {
                          bool noIndirect = false) {
     // Get normal argument effect.
     Type argType = arg.getType();
-    auto effect = getOperandEffectForConvention(conv, argType);
+    auto effect = getOperandEffectForConvention(conv);
 
     // If this is a normal register use, and if the value is a reference
     // (whether the argument convention is fancy or if it is an explicitly
@@ -365,8 +363,9 @@ void OperationEffects::analyzeCallOp(Operation &op) {
     argType = RefType::stripRefConvention(argType, conv);
 
     // In addition to the direct (field-sensitive) effect of loading/storing
-    // the bits, the callee may do whatever it wants with origins embedded
-    // in the type.
+    // the bits, the callee may access origins embedded in the type. A `ref`
+    // only makes the directly borrowed value read-only; mutable origins stored
+    // in that value remain mutable.
     for (TypedAttr origin : originFinder.findOriginsIn({argType})) {
       if (originsAccessesAreReadOnly)
         origin = OriginMutCastAttr::get(origin, false);
@@ -413,7 +412,10 @@ void OperationEffects::analyzeCallOp(Operation &op) {
       TypedAttr extraOrigin;
       for (auto elt : OriginTrackable::decodeIndividualVariadicArguments(
                arg, extraOrigin)) {
-        if (!isa<RefPackType>(getCanonicalType(elt.getType()))) {
+        // Check for a plain reference first: canonicalizing its type walks
+        // the origin union of every element, which is O(N^2) for N elements.
+        auto refPackType = sugarDynCast<RefPackType>(elt.getType());
+        if (!refPackType) {
           addArgument(elt, argConvention);
           continue;
         }
@@ -421,7 +423,7 @@ void OperationEffects::analyzeCallOp(Operation &op) {
         // in its type. The element convention of the callee decides if they
         // are mutated. A `mut` pack of the caller can go into a `read` pack.
         operands.push_back({elt, OperandEffect::regUse});
-        for (TypedAttr origin : originFinder.findOriginsIn({elt.getType()})) {
+        for (TypedAttr origin : originFinder.findOriginsIn({refPackType})) {
           if (originsAccessesAreReadOnly || argConvention != ArgConvention::Mut)
             origin = OriginMutCastAttr::get(origin, false);
           origins.push_back({origin, elt});
@@ -718,7 +720,7 @@ static Value findArgPassedToVariadicConstructor(Value val) {
   // available.  However, it gets passed by-ref to function calls.
   // If the operand is already a reference to a pack, then use it.  Otherwise
   // we must have a register pack.  Figure out how it is formed.
-  if (::isa<RefType>(getCanonicalType(val.getType()))) {
+  if (sugarIsa<RefType>(val.getType())) {
     loadOperand = RefImmutOp::stripRebinds(val);
   } else {
     if (auto load = val.getDefiningOp<RefLoadOp>())
@@ -756,9 +758,9 @@ static Value findArgPassedToVariadicConstructor(Value val) {
 
 /// Return the immutable origin parameter of a VariadicPack or VariadicList.
 static TypedAttr getVariadicContainerOrigin(Value value) {
-  Type type = getCanonicalType(value.getType());
-  if (auto refType = dyn_cast<RefType>(type))
-    type = getCanonicalType(refType.getElementType());
+  Type type = value.getType();
+  if (auto refType = sugarDynCast<RefType>(type))
+    type = refType.getElementType();
 
   auto structType = sugarDynCast<LIT::StructType>(type);
   if (!structType)

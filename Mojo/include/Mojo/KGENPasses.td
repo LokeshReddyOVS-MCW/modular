@@ -334,6 +334,14 @@ def LowerPOPToLLVM : Pass<"lower-pop-to-llvm"> {
   }];
 
   let dependentDialects = ["::mlir::LLVM::LLVMDialect"];
+
+  let options = [
+    Option<"inlinePrecompiledMLIR", "inline-precompiled-mlir", "bool",
+           /*default=*/"true",
+           "Mark the precompiled conversion snippets (e.g. fp8 -> f32) "
+           "`always_inline`, so LLVM folds them into the caller instead of "
+           "leaving an out-of-line call.">,
+  ];
 }
 
 //===----------------------------------------------------------------------===//
@@ -360,6 +368,39 @@ def UpdateMaterialization : Pass<"update-materialization"> {
   }];
 
   let dependentDialects = ["POP::POPDialect", "mlir::index::IndexDialect"];
+}
+
+//===----------------------------------------------------------------------===//
+// LowerVarAllocs
+//===----------------------------------------------------------------------===//
+
+def LowerVarAllocs : Pass<"lower-var-allocs"> {
+  let summary = "Give variables outside the default address space storage.";
+  let description = [{
+    Rewrites each `pop.var_alloc` op into storage for its address space.
+
+    A variable whose parametric address space resolves to the default address
+    space gets a default stack slot on every target.
+
+    A target with shared memory gives a variable in its stack address space a
+    default stack slot cast to that address space, and a variable in its shared
+    memory address space a shared-memory global variable. It diagnoses any
+    other address space.
+
+    A target without shared memory, such as the host, gives every variable a
+    stack slot in its address space.
+  }];
+
+  let options = [
+    Option<"sharedAddressSpace", "shared-address-space", "int64_t", "-1",
+           "The target's shared memory address space, or -1 if it has no "
+           "shared memory.">,
+    Option<"stackAddressSpace", "stack-address-space", "int64_t", "-1",
+           "The address space the target requires for stack slots, or -1 if "
+           "it does not constrain it.">,
+  ];
+
+  let dependentDialects = ["POP::POPDialect"];
 }
 
 //===----------------------------------------------------------------------===//
@@ -408,6 +449,14 @@ def LowerGlobalPOPToLLVM : Pass<"lower-global-pop-to-llvm", "ModuleOp"> {
   }];
 
   let dependentDialects = ["::mlir::LLVM::LLVMDialect"];
+
+  let options = [
+    Option<"inlinePrecompiledMLIR", "inline-precompiled-mlir", "bool",
+           /*default=*/"true",
+           "Mark the precompiled conversion snippets `always_inline`, so "
+           "LLVM folds them into the caller instead of leaving an "
+           "out-of-line call.">,
+  ];
 }
 
 //===----------------------------------------------------------------------===//
@@ -990,6 +1039,61 @@ def SynthesizeDebugInfo : Pass<"synth-debuginfo", "ModuleOp"> {
            "llvm::cl::values(clEnumValN(llvm::dwarf::DW_LANG_C, \"C\", \"C language.\"),"
            "clEnumValN(llvm::dwarf::DW_LANG_Mojo, \"Mojo\", \"Mojo language\"))">,
   ];
+}
+
+//===----------------------------------------------------------------------===//
+// RotateLoops
+//===----------------------------------------------------------------------===//
+
+def RotateLoops: Pass<"rotate-loops", "KGEN::FuncOp"> {
+  let summary = "move a loop's exiting test to the top of its body.";
+  let description = [{
+    Rotating a loop means moving its exiting test to the top of the body, so
+    that the test decides whether to run an iteration before any of that
+    iteration runs, instead of part way through it.
+
+    This is a canonicalization rather than an optimization: every op runs
+    exactly as many times as it did before. What it buys is one shape for
+    every loop, which `raise-for-loops` needs. An `hlcf.for` evaluates its
+    bound before the body, so raising a loop whose test follows part of its
+    body gives one iteration too few; without rotation, each shape an
+    `hlcf.loop` can take would need its own check that raising it is correct.
+
+    The ops that were ahead of the test are duplicated: one copy runs before
+    the loop, ahead of the first test, and one at the end of the body, ahead
+    of the next. What the copies define is carried from one iteration to the
+    next.
+
+    ```mlir
+    // Before: the store runs for %i = %n down to 0, one more time than the
+    // ops behind the test.
+    hlcf.loop (%i = %n : index) {
+      pop.store %i, %p : !kgen.pointer<index>
+      %c = index.cmp eq(%i, %idx0)
+      hlcf.if %c { hlcf.break } else { hlcf.yield }
+      %next = index.sub %i, %idx1
+      hlcf.continue %next : index
+    }
+
+    // After: the test leads, and the store still runs that many times.
+    pop.store %n, %p : !kgen.pointer<index>
+    hlcf.loop (%i = %n : index) {
+      %c = index.cmp eq(%i, %idx0)
+      hlcf.if %c { hlcf.break } else { hlcf.yield }
+      %next = index.sub %i, %idx1
+      pop.store %next, %p : !kgen.pointer<index>
+      hlcf.continue %next : index
+    }
+    ```
+
+    A loop does not rotate when the ops ahead of its test must not be
+    duplicated: a convergent function, an op carrying a region, a stack
+    allocation, or more ops than `kgen-rotate-loops-max-ops` allows it to
+    copy. Nor does it when the test itself reads memory, since the test stays
+    where it is while the rest of the body moves past it.
+  }];
+
+  let dependentDialects = ["HLCF::HLCFDialect"];
 }
 
 //===----------------------------------------------------------------------===//

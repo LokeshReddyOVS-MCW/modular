@@ -41,6 +41,9 @@ CoercionInfo SystemVABIInfo::classifyArgumentType(mlir::Type type,
   // (isVariadicArg is used by ARM64 AAPCS but not needed here.)
   (void)isVariadicArg;
 
+  if (isZeroSize(type))
+    return CoercionInfo::ignore();
+
   // Arrays should be passed indirectly, as per the C specification
   if (isa<mlir::LLVM::LLVMArrayType>(convertType(type)))
     return CoercionInfo::indirectArgument(/*useByval=*/false);
@@ -54,6 +57,8 @@ CoercionInfo SystemVABIInfo::classifyArgumentType(mlir::Type type,
 
 CoercionInfo SystemVABIInfo::classifyReturnType(mlir::Type type,
                                                 mlir::Location loc) const {
+  if (isZeroSize(type))
+    return CoercionInfo::ignore();
   return classifyStructType(type, loc, /*useSRet=*/true);
 }
 
@@ -81,10 +86,7 @@ CoercionInfo SystemVABIInfo::classifyStructType(mlir::Type type,
                    : CoercionInfo::indirectArgument(/*useByval=*/true);
   }
 
-  // clang passes nothing for a 0-byte struct, but CoercionInfo cannot express
-  // "nothing", so it keeps its previous integer coercion.
-  if (size == 0)
-    return CabiUtils::classifySmallIntegerStruct(size, ctx);
+  assert(size > 0 && "a struct without size is not passed");
 
   // Classify each member at its offset and merge the classes per eightbyte.
   EightbyteClass lo = EightbyteClass::NoClass; // Bytes 0-7
@@ -112,12 +114,14 @@ CoercionInfo SystemVABIInfo::classifyStructType(mlir::Type type,
 
   // One eightbyte: one register. For two floats this is f64 where clang uses
   // <2 x float>: the bytes are copied through memory, not converted, and both
-  // types use the same SSE register.
-  if (size <= 8) {
+  // types use the same SSE register. An upper eightbyte that holds only
+  // padding, as in an `@align(16)` struct with 8 bytes of members, is not
+  // passed.
+  if (size <= 8 || hi == EightbyteClass::NoClass) {
     CoercionInfo info;
     info.argClass =
         lo == EightbyteClass::SSE ? ABIArgClass::SSE : ABIArgClass::Integer;
-    info.coercedType = getEightbyteType(lo, size);
+    info.coercedType = getEightbyteType(lo, std::min<int64_t>(size, 8));
     return info;
   }
 
@@ -213,9 +217,8 @@ SystemVABIInfo::classifyMember(mlir::Type type, int64_t offset) const {
   } else if (isa<mlir::FloatType>(type)) {
     memberClass = EightbyteClass::SSE;
   } else {
-    // Integers and pointers. This includes the explicit [N x i8] padding Mojo
-    // inserts before an aligned field: after KGEN→LLVM conversion it cannot
-    // be told apart from an i8 array holding data.
+    // Integers and pointers. Padding is not a member, so it does not get a
+    // class.
     memberClass = EightbyteClass::Integer;
   }
 
@@ -244,6 +247,8 @@ SystemVABIInfo::argRegisterUsage(const CoercionInfo &info,
     return {1, 1};
   case ABIArgClass::Memory:
     // Passed in memory; consumes no argument registers.
+    return {0, 0};
+  case ABIArgClass::Ignore:
     return {0, 0};
   case ABIArgClass::NoClass:
     break; // Identity arg: derive usage from the LLVM type below.
@@ -294,21 +299,20 @@ SystemVABIInfo::classifySignature(mlir::TypeRange argTypes, mlir::Type retType,
     bool isVariadicArg = idx >= numFixedArgs;
     CoercionInfo info = classifyArgumentType(type, loc, isVariadicArg);
 
-    // Only fixed args take part in register accounting; variadic args keep
-    // their classification.
-    if (!isVariadicArg) {
-      auto [needInt, needSSE] = argRegisterUsage(info, convertType(type));
-      if (needInt <= freeInt && needSSE <= freeSSE) {
-        freeInt -= needInt;
-        freeSSE -= needSSE;
-      } else if (!info.isIdentity() && !info.useIndirect) {
-        // An in-register aggregate that does not fit rolls back to memory
-        // rather than being split across registers and stack.
-        info = CoercionInfo::indirectArgument(/*useByval=*/true);
-      }
-      // A scalar that does not fit stays direct; the backend places it on the
-      // stack.
+    // Variadic args use the same registers as fixed args, so they take part in
+    // the register accounting. va_arg reads an aggregate from registers only
+    // when all of it fits, and from memory otherwise.
+    auto [needInt, needSSE] = argRegisterUsage(info, convertType(type));
+    if (needInt <= freeInt && needSSE <= freeSSE) {
+      freeInt -= needInt;
+      freeSSE -= needSSE;
+    } else if (!info.isIdentity() && !info.useIndirect) {
+      // An in-register aggregate that does not fit rolls back to memory
+      // rather than being split across registers and stack.
+      info = CoercionInfo::indirectArgument(/*useByval=*/true);
     }
+    // A scalar that does not fit stays direct; the backend places it on the
+    // stack.
     result.args.push_back(info);
   }
   return result;

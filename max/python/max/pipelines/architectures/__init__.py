@@ -137,6 +137,9 @@ def register_all_models() -> None:
             "dflash2_qwen3_5_modulev3_draft_arch",
         ),
         _LazyArch(
+            "DFlyHYV4VLDraftModel", ".hy_v4.dfly_arch", "hy_v4_dfly_draft_arch"
+        ),
+        _LazyArch(
             "DFlashKimiK25DraftModel",
             ".dflash_kimi_k25",
             "dflash_kimi_k25_draft_arch",
@@ -214,7 +217,7 @@ def register_all_models() -> None:
         ),
         _LazyArch(
             "Gemma3ForConditionalGeneration_ModuleV3",
-            ".gemma3multimodal_modulev3",
+            ".gemma3_modulev3",
             "gemma3_multimodal_modulev3_arch",
         ),
         _LazyArch("Gemma4ForConditionalGeneration", ".gemma4", "gemma4_arch"),
@@ -279,6 +282,11 @@ def register_all_models() -> None:
         _LazyArch("HYV3ForCausalLM", ".hy_v3", "hy_v3_arch"),
         _LazyArch("HYV4ForCausalLM_ModuleV3", ".hy_v4", "hy_v4_arch"),
         _LazyArch(
+            "HYV4VLForConditionalGeneration_ModuleV3",
+            ".hy_v4",
+            "hy_v4_vl_arch",
+        ),
+        _LazyArch(
             "Idefics3ForConditionalGeneration", ".idefics3", "idefics3_arch"
         ),
         _LazyArch(
@@ -291,6 +299,16 @@ def register_all_models() -> None:
             "Inkling2ForConditionalGeneration_ModuleV3",
             ".inkling2",
             "inkling2_arch",
+        ),
+        _LazyArch(
+            "Inkling2LoopForConditionalGeneration_ModuleV3",
+            ".inkling2",
+            "inkling2_loop_arch",
+        ),
+        _LazyArch(
+            "Inkling2DSparkDraftModel_ModuleV3",
+            ".inkling2",
+            "inkling2_dspark_draft_arch",
         ),
         _LazyArch(
             "InklingForConditionalGeneration", ".inkling", "inkling_arch"
@@ -332,6 +350,11 @@ def register_all_models() -> None:
             "laguna_modulev3_arch",
         ),
         _LazyArch("Lfm2ForCausalLM", ".lfm2", "lfm2_arch"),
+        _LazyArch(
+            "Lfm2VlForConditionalGeneration",
+            ".lfm2_vl",
+            "lfm2_vl_arch",
+        ),
         _LazyArch("Lfm3ForCausalLM", ".lfm3", "lfm3_arch"),
         _LazyArch(
             "Lfm3AudioForConditionalGeneration",
@@ -529,21 +552,6 @@ def register_all_models() -> None:
     # Optional: pull in private tool parsers.
     try:
         import tool_parsers  # type: ignore[import-not-found]
-    except ModuleNotFoundError:
-        pass
-
-    # Optional: import the Kimi K3 model if available.
-    try:
-        from kimi_k3 import kimi_k3_arch  # type: ignore[import-not-found]
-
-        PIPELINE_REGISTRY.register(kimi_k3_arch)
-    except ModuleNotFoundError:
-        pass
-
-    # Optional: import the Kimi K3 DSpark draft if available.
-    try:
-        kimi_k3_dspark = importlib.import_module("kimi_k3_spec.dspark")
-        PIPELINE_REGISTRY.register(kimi_k3_dspark.dspark_kimi_k3_draft_arch)
     except ModuleNotFoundError:
         pass
 

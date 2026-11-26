@@ -10,6 +10,11 @@ This version is still a work in progress.
 
 ## Language enhancements
 
+- `if`, `comptime if`, and `__guard` now support semicolon-separated
+  condition clauses that mix Boolean conditions and `case` patterns. Clauses
+  evaluate left to right, and successful pattern bindings are available to
+  later clauses and the successful path.
+
 - Added the experimental `__guard` statement for early exits from Boolean
   conditions and `case` patterns. Its `else` body must not fall through, so
   bindings from a successful pattern remain in scope on the normal path. This
@@ -21,8 +26,39 @@ This version is still a work in progress.
   uses `Error`. It emits a compile-time error when the raised types cannot be
   unified.
 
+- Experimental support for multiple typed `except` clauses lets `try` blocks
+  handle errors where recovery differs:
+
+  ```mojo
+  try:
+      read_input()
+      parse_input()
+  except IOError __as error:
+      recover_io(error)
+  except ParseError __as error:
+      report_parse_error(error)
+  except __as error:
+      report_other_error(error)
+  ```
+
+  Mojo selects the first handler whose type accepts the raised error. A final
+  untyped handler catches remaining errors. When an untyped handler catches
+  different error types, Mojo selects a common type when one exists; otherwise,
+  it uses `Error`. Mojo reports a compile-time error for unhandled error types
+  and warns about unreachable `except` clauses.
+
 - `with` statements now no longer copy when passed a reference to a context
   manager like in `with foo: pass`.
+
+- The `ref` argument convention with a parametrically-mutable origin now
+  promises read-only access to the referenced value. Previously, Mojo assumed
+  that such a `ref` could mutate whenever it was instantiated with a mutable
+  origin. In practice though, function bodies were disallowed from mutating such
+  a reference, even when a compile-time condition proved that the instantiated
+  origin was mutable. Call analysis now reflects that existing restriction, so
+  these calls no longer unnecessarily invalidate references derived from the
+  borrowed value. Mutable origins embedded in the value remain mutable and can
+  still invalidate references into the storage they describe.
 
 - `__exit__(self, error: E)` now additionally supports `var self` and
   `deinit self`, similar to the non-error `__exit__`.
@@ -43,6 +79,11 @@ This version is still a work in progress.
 
 - `match` now warns when literal cases do not include a catch-all pattern,
   helping identify unmatched values.
+
+- A closure that captures a value with an `UnsafeAnyOrigin` in its type, such
+  as a `Pointer[Int, MutUnsafeAnyOrigin]`, now produces a warning. A closure
+  does not keep the value behind such a capture alive, so Mojo can destroy that
+  value before the closure runs. Capture a value with a tracked origin instead.
 
 - Auto-parameterization now reaches `_` holes nested inside other parameterized
   types, so an unbound parameter at any depth of an argument's type becomes an
@@ -105,6 +146,23 @@ This version is still a work in progress.
           return 42  # an `Int` converts to the return type
       else:
           return None
+  ```
+
+- The error for converting a function to an invalid function type now explains
+  why the conversion cannot be made, such as a mismatch in argument counts,
+  argument conventions, effects, etc:
+
+  ```mojo
+  def takes_read(f: def(Int) thin -> None):
+      pass
+
+  def mut_arg(mut x: Int):
+      pass
+
+  # error: ... cannot be converted from 'def mut_arg(mut x: Int) thin -> None'
+  # to 'def(Int) thin -> None', argument 'x': expected 'imm' convention,
+  # found 'mut'
+  takes_read(mut_arg)
   ```
 
 ## Language changes
@@ -199,12 +257,28 @@ This version is still a work in progress.
 
 ## Library changes
 
+- The following enum-like types now use `snake_case` member names. The
+  uppercase names remain as deprecated aliases:
+
+  - `Ordering`: `not_atomic`, `unordered`, `relaxed`, `acquire`, `release`,
+    `acquire_release`, and `sequential`.
+  - `FastMathFlag`: `none`, `nnan`, `ninf`, `nsz`, `arcp`, `contract`,
+    `afn`, `reassoc`, and `fast`. Match patterns, `String()`, and `repr()`
+    use the new names too, so a pattern such as `case .CONTRACT:` must
+    become `case .contract:`.
+  - `Level` in `std.logger`: `notset`, `trace`, `debug`, `info`, `warning`,
+    `error`, and `critical`.
+  - `TestResult` in `std.testing.suite`: `pass`, `fail`, and `skip`.
+
 - An optional mutable pointer now implicitly converts to an optional
   immutable pointer, as `Pointer` does.
 
 - Added `normpath()` to `std.os.path`, matching Python's `os.path.normpath()`.
   Contributed by [@BlueDestination](https://github.com/BlueDestination) in
   [#7342](https://github.com/modular/modular/pull/7342).
+
+- Added `Path.devnull()`, which returns the path to the platform's null device
+  (`/dev/null` on Linux and macOS), so code doesn't need to hardcode it.
 
 - Added a builtin `filter()`, which takes an iterable and a predicate closure
   and yields the elements the predicate accepts:
@@ -214,6 +288,14 @@ This version is still a work in progress.
   as an argument instead of a compile-time parameter, so it can be a closure
   that captures values. Write `take_while(items, pred)` instead of
   `take_while[pred](items)`.
+
+- `Iterator` has a new `count()` method that consumes the iterator and returns
+  how many elements it yielded, e.g. `iter(my_list).count()`. It is O(n); an
+  iterator that knows its remaining length can override it.
+
+- `List(length=, fill_with=)` and `Array(fill_with=)` now accept a function
+  that raises. If it raises, the initializer destroys the elements it already
+  wrote and propagates the error.
 
 - `Span.binary_search_by()` no longer takes the comparator as a compile-time
   parameter. Pass it as an argument, `span.binary_search_by(cmp)`, which also
@@ -298,6 +380,22 @@ This version is still a work in progress.
   match on the error's `kind()`. Code in a plain `raises` function still
   compiles unchanged.
 
+- File and directory functions in `std.os`, such as `mkdir()`, `remove()`,
+  and `listdir()`, now raise `IOError`, so you can check what went wrong
+  with `e.kind()`:
+
+  ```mojo
+  try:
+      os.remove(path)
+  except e:
+      if e.kind() != .not_found:
+          raise e
+  ```
+
+- `open()`, `FileHandle`, and the `Path` methods that read, write, or list
+  files now raise `IOError` too. `FileHandle.read()` and `Path.read_text()`
+  still raise `Error`, because decoding UTF-8 can fail.
+
 - Added `BorrowedFileDescriptor` to `std.io`, a copyable, non-owning view
   of a `FileDescriptor` that carries the owner's origin, so it can be
   passed around without closing the descriptor or outliving its owner.
@@ -339,48 +437,6 @@ This version is still a work in progress.
   the `Imm` variants are redundant.
 
 - `Span` now conforms to `Equatable` when its element type does.
-
-- `Optional.value()`, `Optional.unsafe_value()`, and `Optional.__getitem__()`
-  now return a reference with an interior origin of the `Optional`.
-  Reassigning the `Optional`, or calling a `mut self` method on it
-  invalidates outstanding references to its value. Reading through
-  such a reference afterward used to compile and read a destroyed value; it is
-  now a compile error:
-
-  ```mojo
-  var opt = Optional(5)
-  ref i = opt.value()
-  opt = None
-  print(i)  # error: use of invalidated interior reference 'opt["value"]'
-  ```
-
-- `String`'s iterators, `split_at_grapheme()`, and `as_c_string_span()` now
-  carry the string's interior origin, as `as_bytes()` and slicing already did.
-  Mutating or reassigning a string while an iterator from one of these is still
-  in use is now a compile-time error instead of a read of freed memory.
-
-- `OwnedPointer.ptr()` and `Variant.unsafe_get()` now carry an interior
-  origin. Using the result after reassignment or mutation is now a
-  compile-time error.
-
-- The pointers and spans that `Allocation`, `ManagedAllocation`, and
-  `ThinAllocation` return now carry an interior origin of the allocation.
-
-  ```mojo
-  var a = alloc(Layout[Int].single())
-  ref first = a.storage()[0]
-  first.write(42)
-  dealloc(a^)
-  a = alloc(Layout[Int].single())
-  # error: use of invalidated interior reference 'a["element"]'
-  print(first.unsafe_assume_init())
-  ```
-
-- `List.unsafe_ptr()` now returns a pointer with the list's interior origin.
-
-- `String.unsafe_ptr()` and `String.unsafe_ptr_mut()` now carry an interior
-  origin. Using the pointer after the string is mutated or reassigned is now a
-  compile-time error instead of a read of freed memory.
 
 - `stdin`, `stdout`, and `stderr` are now `BorrowedFileDescriptor` values,
   and the `file` argument of `print()` takes a `BorrowedFileDescriptor`
@@ -424,12 +480,61 @@ This version is still a work in progress.
   - `if s.find(x):` is now `True` only when `x` is found. Before, it was
     `True` when `x` was missing and `False` when `x` was at offset 0.
 
+### Interior origins
+
+More standard library APIs now return references, pointers, spans, and
+iterators that carry an *interior origin* of the value they point into,
+instead of the value's own origin. Reassigning the value, or calling a
+`mut self` method on it, invalidates them. Code that uses one afterward is now
+a compile-time error; before, it compiled and read freed or destroyed memory.
+These APIs now return interior origins:
+
+- `List.unsafe_ptr()`.
+- `String.unsafe_ptr()`, `String.unsafe_ptr_mut()`, `as_c_string_span()`,
+  `split_at_grapheme()`, and the `String` iterators, such as `codepoints()`
+  and `bytes()`.
+- `Optional.value()`, `Optional.unsafe_value()`, and `Optional.__getitem__()`.
+- `OwnedPointer.ptr()` and `Variant.unsafe_get()`.
+- The pointers and spans that `Allocation`, `ManagedAllocation`, and
+  `ThinAllocation` return.
+
+Most code that no longer compiles matches one of these patterns:
+
+- A pointer held across a mutation, such as `append()`, that can reallocate.
+
+  ```mojo
+  var p = list.unsafe_ptr()
+  list.append(4)
+  print(p[])  # error: use of invalidated interior reference 'list["element"]'
+  ```
+
+- A reference used after its owner is reassigned.
+
+  ```mojo
+  ref i = opt.value()
+  opt = None
+  print(i)  # error: use of invalidated interior reference 'opt["value"]'
+  ```
+
+- A string mutated while one of its iterators is in use.
+
+  ```mojo
+  # error: use of invalidated interior reference 's["bytes"]'
+  for c in s.codepoints():
+      s += String(c)
+  ```
+
 ## GPU programming
 
 - Added the `apple-m6` and `apple-m6-metal4` accelerator targets, and
   `CompilationTarget.is_apple_m6()` to `std.sys`. Apple M6 GPUs are now
   detected automatically, so you no longer need to pass
   `--target-accelerator=apple-m5` on M6 hardware.
+
+- `compile_options` now reports an error for LLVM codegen flags such as
+  `frame-pointer=all`, which it accepted before without effect. The only
+  codegen flag that had an effect, `denormal-fp-math-f32=<mode>`, still sets
+  the f32 denormal mode of NVIDIA GPU kernels, and other targets now reject it.
 
 - `Bool`, `Scalar` (including `Int`), `String`, `StringSpan`, and
   `StringLiteral` now conform to `ConvertibleToPython`, so they can be passed
@@ -476,6 +581,14 @@ This version is still a work in progress.
   While precompiling, the package may refer to itself both by `pkg` and by
   `foo.bar.pkg`. Both paths resolve to the source being compiled.
 
+- On macOS, a Mojo program that crashes, whether built with `mojo build` or
+  run with `mojo run`, no longer leaves a system crash report in
+  `~/Library/Logs/DiagnosticReports`. Under `mojo run` the report named
+  `mojo` and held none of the program's frames. To get reports back, set the
+  `max-debug.macos-crash-report` config key, for example with
+  `MODULAR_DEBUG=macos-crash-report` or
+  `MODULAR_MAX_DEBUG_MACOS_CRASH_REPORT=true`.
+
 ## Removed
 
 - Legacy closures are removed. The `capturing` function effect and the
@@ -496,6 +609,22 @@ This version is still a work in progress.
 
   A function passed as a compile-time parameter must now be `thin`, for
   example `[f: def(Int) thin -> Int]`.
+
+- `SIMD.shuffle()` no longer takes its mask as an `IndexList`. Pass the lane
+  indices as parameters, as in `v.shuffle[3, 2, 1, 0]()`, or pass a mask
+  computed at compile time as an `Array[SIMDLength, N]`:
+
+  ```mojo
+  def reverse_mask[n: Int]() -> Array[SIMDLength, n]:
+      var mask = Array[SIMDLength, n](fill=0)
+      for i in range(n):
+          mask[i] = n - 1 - i
+      return mask^
+
+  def main():
+      var v = SIMD[DType.int32, 4](1, 2, 3, 4)
+      print(v.shuffle[reverse_mask[4]()]())  # [4, 3, 2, 1]
+  ```
 
 - `CompiledFunctionInfo` no longer has `num_captures`, `capture_sizes`, or
   `populate` members. Kernels can no longer capture implicitly, so these
@@ -558,7 +687,42 @@ This version is still a work in progress.
     `std.builtin.value`. These traits live in `std.traits` and are still
     exported from the prelude.
 
+- Removed APIs that were deprecated in Mojo 1.2. Use the replacement in each
+  case:
+
+  - The `std.sys.info` functions `is_triple()`, `is_little_endian()`, and
+    `is_big_endian()`. Use `CompilationTarget.is_triple()`, and compare
+    `Endian.native()` with `.little` or `.big`.
+
+  - The pointer-and-length `hash()` overload. Use `hash_bytes()`, which takes
+    an `ImmSpan[Byte]`.
+
+  - `String.isspace()` and `StringSpan.isspace()`. Use
+    `is_ascii_whitespace()`.
+
 ## Fixed
+
+- The compiler now rejects a call that passes a container immutably along with
+  one of its elements mutably, such as `f(items, items[0])` where the second
+  argument is `mut`. This was unsound and could be used to read dangling data.
+
+- A `@deprecated` method that satisfies a trait requirement no longer emits a
+  deprecation warning at the struct's conformance list. The warning now fires
+  only where the method is called directly.
+
+- `VariadicPack` now conforms to `Writable` when all of its element types do,
+  so a pack can be passed to `print()`, `String()` and `repr()`.
+
+- `find()` and `rfind()` on `String`, `StringSpan` and `StringLiteral` now
+  honor `start` when the substring is empty. `"abc".find("", 2)` returns `2`
+  instead of `0`, and both methods return `None` when `start` is past the end
+  of the string. Contributed by [@dhruvilmehta](https://github.com/dhruvilmehta)
+  in [#7451](https://github.com/modular/modular/pull/7451) and
+  [@Antony-mcw](https://github.com/Antony-mcw) in
+  [#7668](https://github.com/modular/modular/pull/7668).
+
+- A bare `raise` in an `except` block no longer crashes the compiler when
+  building with debug info.
 
 - `std.ffi.c_pid_t` is now `c_int` instead of `Int`, matching the 32-bit C
   `pid_t` on Linux and macOS. As an `Int`, a `-1` returned by a function such
@@ -624,3 +788,19 @@ This version is still a work in progress.
   elements whose type names a mutable origin, such as
   `Pointer[Int, origin_of(x)]`, as `List.append()` already did. Inserting one
   was rejected as aliasing the collection.
+
+- `FileHandle` can now read and write more than 2 GiB at once on macOS,
+  instead of raising `Invalid argument` or aborting.
+
+- [#7669](https://github.com/modular/modular/issues/7669) - At compile time,
+  `unsafe_memmove()` is fixed. `List.insert()` evaluated at compile time no
+  longer repeats the element at the insertion point, and `List.insert()` and
+  `List.pop(i)` now work on lists such as `List[String]`.
+
+- A NUL byte (`\0`) in the literal text of a t-string is now kept as text.
+  Previously it ended the literal segment early, so `t"a\0b{x}"` with
+  `x = "ls"` produced `alsb` instead of `a\0bls`.
+
+- Fixed the lifetime checker to now invalidate uses of an interior reference
+  after its owner was mutated through a type holding the origin as a parameter.
+  This includes closures which capture `mut` data.

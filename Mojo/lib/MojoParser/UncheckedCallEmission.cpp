@@ -311,10 +311,11 @@ AnyValue CallEmitter::emitOneArgVal(ASTExprAnd<AnyValue> operand,
 
   switch (convention) {
   case ArgConvention::OwnedReg:
+    llvm_unreachable("not used by the mojo parser");
   case ArgConvention::PackImmMem:
   case ArgConvention::PackMut:
   case ArgConvention::PackOwnedMem:
-    llvm_unreachable("not used by the mojo parser");
+    llvm_unreachable("pack elements use the element convention");
   case ArgConvention::Mut:
   case ArgConvention::ByRefResult:
   case ArgConvention::ByRefError:
@@ -378,7 +379,10 @@ AnyValue CallEmitter::emitOneArgVal(ASTExprAnd<AnyValue> operand,
     [[fallthrough]];
   case ArgConvention::ImmReg:
     return emitter.emitBValue(operand, EC_CallArgValue, expectedType);
+  case ArgConvention::Unresolved:
+    llvm_unreachable("unknown argument convention");
   }
+
   llvm_unreachable("unknown argument convention");
 }
 
@@ -738,6 +742,12 @@ CallEmitter::emitArgValues(const CallOperands &operands) {
       assert(calleeSig.hasMemoryOnlyResult() ||
              (calleeSig.isThrows() &&
               pogAttr.getPassingKind() == PassingKind::Implicit));
+      // Overload resolution can already have made the result temporary. It is
+      // new, so it cannot alias an argument.
+      if (convention == ArgConvention::ByRefResult && operands.resultSlot) {
+        argumentValues.push_back({operands.resultSlot, callExpr});
+        continue;
+      }
       argumentValues.push_back({AnyValue(), callExpr});
       continue;
 
@@ -1060,23 +1070,11 @@ Value CallEmitter::emitPreemittedArgumentAsDynamicValue(
 
     if (!refType.isDefaultAddrSpace()) {
       auto *expr = argValAndExpr.expr;
-      // Non-trivially copyable types cannot be copied from a non-default
-      // address space, because copyinit doesn't allow 'ref'.
-      if (!ASTType(refType.getElementType())
-               .isProvablyImplicitlyTriviallyCopyable(
-                   expr->getLoc(), emitter.shared, emitter.declScope)) {
-        emitter.emitError(
-            expr->getLoc(),
-            "non-implicitly trivially copyable value cannot be copied from a "
-            "non-default address space")
-            << expr->getRange();
+      RValue copy =
+          emitter.emitCopyFromNonDefaultAddressSpace({someMValue, expr}, ctx);
+      if (!copy)
         return {};
-      }
-
-      // If this is a trivially copyable value, then we can do a copy by doing a
-      // load.
-      auto srVal = emitter.emitSRValue({someMValue, expr}, ctx);
-      someMValue = emitter.emitMRValue({srVal, expr}, ctx);
+      someMValue = emitter.emitMRValue({copy, expr}, ctx);
       if (!someMValue)
         return {};
     }
@@ -1084,13 +1082,13 @@ Value CallEmitter::emitPreemittedArgumentAsDynamicValue(
   };
 
   switch (convention) {
+  case ArgConvention::Unresolved:
+    llvm_unreachable("unresolved convention in a resolved signature");
   case ArgConvention::OwnedReg:
-  case ArgConvention::PackImmMem:
-  case ArgConvention::PackMut:
-  case ArgConvention::PackOwnedMem:
     llvm_unreachable("not used by the mojo parser");
   case ArgConvention::OwnedMem:
   case ArgConvention::DeinitMem:
+  case ArgConvention::PackOwnedMem:
     // Promote PValue's if needed.
     return checkMValueAddrSpace(emitter.emitMRValue(argValAndExpr, ctx));
   case ArgConvention::ImmReg:
@@ -1101,7 +1099,9 @@ Value CallEmitter::emitPreemittedArgumentAsDynamicValue(
     // Otherwise, materialize or load the value.
     return emitter.emitSRValue(argValAndExpr, ctx);
 
-  case ArgConvention::ImmMem: {
+  case ArgConvention::ImmMem:
+  case ArgConvention::PackImmMem:
+  case ArgConvention::PackMut: {
     // Promote PValue's if needed.
     Value result =
         checkMValueAddrSpace(emitter.emitMBValue(argValAndExpr, ctx));
@@ -1218,8 +1218,10 @@ Value CallEmitter::emitPreemittedArgumentAsDynamicValue(
     } else {
       loadVal = emitter.emitRValue({lv, argValAndExpr.expr}, tmpValueDest);
     }
-    if (!loadVal)
+    if (!loadVal) {
+      tmpValueDest.resetForError(emitter);
       return {};
+    }
 
     // One interesting case to watch for are types like Dict.  These types have
     // both a getter and a setter, but the getter will return a mutable
@@ -1543,7 +1545,6 @@ bool ExclusivityChecker::mayAccessCallerStack() const {
   // local references. When an access to "x.y" happens we'll see both "x" and
   // "x.y" here.
   for (const auto &[origin, info] : originAccesses) {
-    assert(!isa<UnboundAttr>(origin)); // should not see any unbound origin
     // Static origins and subfields are ignorable.  Fields will have their bases
     // included.
     if (isa<StaticOriginAttr, OriginFieldAttr, ComptimeOriginAttr,
@@ -1658,17 +1659,13 @@ void ExclusivityChecker::checkOriginAccess(Value val,
       continue;
     }
 
-    // If this is derived from an interior origin, process the base as an
-    // immutable access.
+    // If this is derived from an interior origin, process the base next.
     if (auto interior = dyn_cast<InteriorOriginAttr>(origin)) {
       origin = interior.getBase();
-      // This is going to read the base.
-      isImmut = true;
       continue;
     }
 
-    // If this is derived from an subtree origin, process the base as an
-    // immutable access.
+    // If this is derived from a subtree origin, process the base.
     if (auto subtree = dyn_cast<OriginSubtreeAttr>(origin)) {
       origin = subtree.getBase();
       // Don't set isImmut; this could mutate the base if it's a mutable origin.
@@ -1763,6 +1760,14 @@ void ExclusivityChecker::checkArgument(Value argVal, unsigned argIdx,
   for (auto elt :
        OriginTrackable::decodeIndividualVariadicArguments(argVal, extraOrigin))
     checkArg(elt);
+
+  // The elements are checked above, but the container is passed too. A locally
+  // built container has a mutable origin yet reaches the callee through an
+  // immutable view, so casting its origin is equivalent to that view.
+  if (auto refType =
+          dyn_cast<RefType>(RefImmutOp::stripRebinds(argVal).getType()))
+    checkOriginAccess(argVal, argIdx,
+                      OriginMutCastAttr::get(refType.getOrigin(), false));
 }
 
 /// Emit an error about an access to a conflicting origin after a previous

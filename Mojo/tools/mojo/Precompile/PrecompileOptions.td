@@ -19,6 +19,10 @@ include "Common/DiagnosticFormatOptions.td"
 include "Common/DiagnosticOptions.td"
 include "Common/FixItOptions.td"
 include "Common/IncludeOptions.td"
+include "Common/ParserStatsOptions.td"
+include "Common/MLIRTimingOptions.td"
+include "Common/TimingReportOptions.td"
+include "Common/RunParameterVerifierOptions.td"
 include "Support/Driver/CommonOptions.td"
 
 //===----------------------------------------------------------------------===//

@@ -21,6 +21,7 @@ test never reaches and a real checkpoint does.
 from __future__ import annotations
 
 import functools
+from collections.abc import Sequence
 from typing import ClassVar
 
 from max import functional as F
@@ -28,15 +29,20 @@ from max.driver import accelerator_architecture_name, accelerator_count
 from max.dtype import DType
 from max.graph import StaticDim
 from max.nn import Module
-from max.nn._graph_ops import _is_sm10x_gpu
+from max.nn._graph_ops import _is_sm10x_gpu, moe_sigmoid_gemv_router_supports
 from max.nn.common_layers import quant_ops
 from max.nn.common_layers.moe import MoEGate
 from max.nn.common_layers.quant_linear import QuantizedMLP
 from max.nn.common_layers.quant_moe import ExpertParallelMoE, TensorParallelMoE
-from max.nn.kernels import moe_router_group_limited, router_gate_mixed_gemv
-from max.nn.legacy.comm.ep import EPBatchManager
+from max.nn.ep_config import EPConfig
+from max.nn.kernels import (
+    moe_router_group_limited,
+    moe_sigmoid_gemv_router,
+    router_gate_mixed_gemv,
+)
 from max.tensor import Tensor
 from max.tensor.sharding import DeviceMapping
+from typing_extensions import override
 
 from ..model_config import Glm5NextConfig
 
@@ -53,27 +59,71 @@ __all__ = [
 _BF16_GEMV_K_TILE = 1024
 
 
+def _bf16_gate_on_gpu(hidden_states: Tensor, weight: Tensor) -> bool:
+    """Returns whether a GPU kernel can read the router's bf16 operands.
+
+    The bf16 gate kernels are GPU-only, so a host-device graph, another
+    dtype or a host with no accelerator keeps the float32 matmul. The
+    placement comes from ``hidden_states.mesh`` because ``Tensor.device``
+    raises on the multi-device mesh a tensor-parallel router input lives on.
+    The caller queries the architecture only after this check, because the
+    query raises when there is no accelerator.
+    """
+    return (
+        not any(device.is_host for device in hidden_states.mesh.devices)
+        and hidden_states.dtype == DType.bfloat16
+        and weight.dtype == DType.bfloat16
+        and accelerator_count() > 0
+    )
+
+
 def _mixed_gemv_applies(hidden_states: Tensor, weight: Tensor) -> bool:
     """Returns whether the mixed bf16 router GEMV can produce the logits.
 
-    The op is GPU-only and has launch tables for gfx950 and SM100, so a
-    host-device graph, another accelerator, or a missing one keeps the
-    float32 matmul. The placement comes from ``hidden_states.mesh`` because
-    ``Tensor.device`` raises on the multi-device mesh a tensor-parallel
-    router input lives on.
+    The op has launch tables for gfx950 and SM100.
     """
-    if any(device.is_host for device in hidden_states.mesh.devices):
-        return False
-    if accelerator_count() == 0 or not (
+    if not _bf16_gate_on_gpu(hidden_states, weight) or not (
         accelerator_architecture_name() == "gfx950" or _is_sm10x_gpu()
     ):
         return False
     k_dim = weight.shape[1]
+    return isinstance(k_dim, StaticDim) and int(k_dim) % _BF16_GEMV_K_TILE == 0
+
+
+def _fused_router_applies(
+    hidden_states: Tensor,
+    weight: Tensor,
+    num_experts_per_token: int,
+    n_group: int,
+) -> bool:
+    """Returns whether one fused op can compute the gate and route on SM100.
+
+    ``moe.sigmoid.gemv.single.group.router`` computes the gate GEMV on
+    tensor cores from the checkpoint's bf16 operands, accumulating in
+    float32, then the sigmoid, the correction bias and the top-k, in place
+    of the mixed GEMV op, the sigmoid and the router op. It routes one
+    expert group. The router takes it only where its GEMV runs on tensor
+    cores: its CUDA-core split-K GEMV is slower than the separate ops at
+    Flash's gate shape. The gate takes every SM10x GPU, but the gain is
+    measured on B200 only.
+    """
+    if n_group != 1 or not _bf16_gate_on_gpu(hidden_states, weight):
+        return False
+    if not _is_sm10x_gpu():
+        return False
+    num_experts, k_dim = weight.shape
     return (
-        hidden_states.dtype == DType.bfloat16
-        and weight.dtype == DType.bfloat16
+        isinstance(num_experts, StaticDim)
         and isinstance(k_dim, StaticDim)
-        and int(k_dim) % _BF16_GEMV_K_TILE == 0
+        and moe_sigmoid_gemv_router_supports(
+            int(num_experts),
+            num_experts_per_token,
+            int(k_dim),
+            hidden_dtype=DType.bfloat16,
+            weight_dtype=DType.bfloat16,
+            scores_dtype=DType.float32,
+            tensor_cores=True,
+        )
     )
 
 
@@ -112,6 +162,17 @@ class Glm5NextExpertParallelMoE(ExpertParallelMoE):
     unfused shared expert keep float32.
     """
 
+    @override
+    def _dispatched_rows(self, x_shards: Sequence[Tensor]) -> Tensor:
+        if not self.ep_config.use_allreduce:
+            return super()._dispatched_rows(x_shards)
+        # Every device holds every row under allreduce, so the rows count
+        # once. The base's sum would estimate each device's expert rows at
+        # the device count times their number, and the grouped matmuls pick
+        # their tiles from that. The base keeps the sum so that no other
+        # model's kernel choice changes with this one.
+        return F.shape_to_tensor(x_shards[0].shape)[0]
+
 
 class Glm5NextTopKRouter(MoEGate):
     """DeepSeek-V3.2's group-limited top-k router, scored in float32.
@@ -122,8 +183,11 @@ class Glm5NextTopKRouter(MoEGate):
     checkpoint's bf16 operands in one launch (``moe.router.gate.mixed.gemv``)
     instead of casting both to float32 first, which costs two cast launches
     (the weight's every step, since the graph does not fold weight-only ops)
-    and a GEMV over a float32 copy of the weight. bf16 products are exact in
-    float32, so only the summation order differs from the float32 matmul.
+    and a GEMV over a float32 copy of the weight. On SM100, one op
+    (``moe.sigmoid.gemv.single.group.router``) instead computes Flash's gate
+    GEMV on tensor cores, then the sigmoid, the bias and the top-k. bf16
+    products are exact in float32, so only the summation order differs from
+    the float32 matmul.
     """
 
     def __init__(
@@ -203,6 +267,22 @@ class Glm5NextTopKRouter(MoEGate):
             their routing weights, each of shape
             ``(seq_len, num_experts_per_token)``.
         """
+        bias = self.e_score_correction_bias.cast(DType.float32)
+        if _fused_router_applies(
+            hidden_states,
+            self.gate_score.weight,
+            self.num_experts_per_token,
+            self.n_group,
+        ):
+            return moe_sigmoid_gemv_router(
+                hidden_states,
+                self.gate_score.weight,
+                bias,
+                self.num_experts_per_token,
+                self.norm_topk_prob,
+                self.routed_scaling_factor,
+                scores_dtype=DType.float32,
+            )
         if _mixed_gemv_applies(hidden_states, self.gate_score.weight):
             logits = router_gate_mixed_gemv(
                 hidden_states, self.gate_score.weight
@@ -214,7 +294,7 @@ class Glm5NextTopKRouter(MoEGate):
         scores = F.sigmoid(logits)
         topk_idx, topk_weight = moe_router_group_limited(
             scores,
-            self.e_score_correction_bias.cast(DType.float32),
+            bias,
             self.num_experts,
             self.num_experts_per_token,
             self.n_group,
@@ -240,9 +320,11 @@ class Glm5NextMLP(QuantizedMLP):
         gate_up_weight = quant_ops.concat_weights(
             self.gate_proj.weight, self.up_proj.weight, axis=0
         )
-        gate, up = quant_ops.matmul(x, gate_up_weight).split(
-            [self.feed_forward_length, self.feed_forward_length], axis=-1
-        )
+        gate_up = quant_ops.matmul(x, gate_up_weight)
+        # Half the output's own width: one device's copy of a column-split
+        # shared expert holds only its slice of ``feed_forward_length``.
+        width = int(gate_up.shape[-1]) // 2
+        gate, up = gate_up.split([width, width], axis=-1)
         limit = self.swiglu_limit
         gate = F.min(gate.cast(DType.float32), limit)
         up = F.max(F.min(up.cast(DType.float32), limit), -limit)
@@ -252,15 +334,17 @@ class Glm5NextMLP(QuantizedMLP):
 def build_mlp(
     config: Glm5NextConfig,
     layer_idx: int,
-    ep_batch_manager: EPBatchManager | None,
+    ep_config: EPConfig | None,
 ) -> Module[..., Tensor]:
     """Returns layer ``layer_idx``'s feed-forward block.
 
-    Dense below ``first_k_dense_replace``, MoE from there on. Every MLP in
-    this checkpoint is FP8. The dense blocks are replicated: the decoder layer
-    runs them on each device's share of the tokens.
+    Dense below ``first_k_dense_replace``, MoE from there on, quantized as
+    the checkpoint stores the layer: the NVFP4 checkpoint's MTP layer is
+    bf16. The dense blocks are replicated: the decoder layer runs them on
+    each device's share of the tokens.
     """
-    quant_config = config.quant_config
+    scheme = config.quant_scheme
+    quant_config = scheme.mlp_config(layer_idx) if scheme else None
     mlp_cls = functools.partial(Glm5NextMLP, swiglu_limit=config.swiglu_limit)
     if layer_idx < config.first_k_dense_replace:
         return mlp_cls(
@@ -290,8 +374,12 @@ def build_mlp(
         mlp_cls=mlp_cls,
         swiglu_limit=config.swiglu_limit,
     )
-    if ep_batch_manager is not None:
+    if ep_config is not None:
+        # Under the all-reduce exchange, each rank runs its share of the
+        # shared expert instead of rank 0 all of it while the others wait.
         return Glm5NextExpertParallelMoE(
-            **moe_kwargs, ep_batch_manager=ep_batch_manager
+            **moe_kwargs,
+            ep_config=ep_config,
+            shard_shared_expert=True,
         )
     return Glm5NextTensorParallelMoE(**moe_kwargs)
